@@ -1,0 +1,46 @@
+{
+  "name": "rijo",
+  "version": "0.1.0",
+  "description": "Context and autonomous execution framework for freelance developers: closed scope in, verified code and readiness evidence out.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "rijo": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "templates",
+    "schemas",
+    "skills",
+    "adapters",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "yaml": "^2.8.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  },
+  "keywords": [
+    "agents",
+    "context-engineering",
+    "cli",
+    "autonomous",
+    "workflow"
+  ]
+}
