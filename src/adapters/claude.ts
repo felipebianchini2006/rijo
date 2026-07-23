@@ -109,11 +109,8 @@ export function generateClaudeAdapter(projectRoot: string): AdapterReport {
 }
 
 export function detectClaude(projectRoot: string): boolean {
-  return (
-    exists(path.join(projectRoot, '.claude')) ||
-    readTextIfExists(path.join(projectRoot, 'CLAUDE.md')) !== null ||
-    process.env['CLAUDECODE'] === '1'
-  );
+  // filesystem-based only: deterministic across environments
+  return exists(path.join(projectRoot, '.claude')) || readTextIfExists(path.join(projectRoot, 'CLAUDE.md')) !== null;
 }
 
 const STATUSLINE_SCRIPT = `#!/usr/bin/env node

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rijo.dev/schemas/config.schema.json",
+  "title": "RIJO project config (.rijo/config.yml)",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "integer", "default": 1 },
+    "models": {
+      "type": "object",
+      "properties": {
+        "lead": { "type": "string", "default": "strongest" },
+        "reviewer": { "type": "string", "default": "strongest-independent" },
+        "planner": { "type": "string", "default": "balanced-reasoning" },
+        "worker": { "type": "string", "default": "economical-coding" },
+        "researcher": { "type": "string", "default": "economical-research" },
+        "qa": { "type": "string", "default": "economical-browser" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "plan_revisions": { "type": "integer", "default": 2 },
+        "review_loops": { "type": "integer", "default": 2 },
+        "qa_fix_loops": { "type": "integer", "default": 2 },
+        "fix_attempts": { "type": "integer", "default": 2 },
+        "max_parallel_agents": { "type": "integer", "default": 4 }
+      }
+    },
+    "context_budget_bytes": { "type": "integer", "default": 24576 },
+    "git": {
+      "type": "object",
+      "properties": {
+        "tag_milestones": { "type": "boolean", "default": true },
+        "commit": { "type": "boolean", "default": true }
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-pack:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm run typecheck
+      # unit + integration + golden + CLI E2E with fake agent runner,
+      # including tests/pack.e2e.test.ts which packs the tarball, installs it
+      # into an empty fixture and executes the packaged CLI.
+      - run: npm test
+      - run: npm pack

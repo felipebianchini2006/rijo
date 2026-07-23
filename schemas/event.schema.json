@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rijo.dev/schemas/event.schema.json",
+  "title": "RIJO event (one line of .rijo/events.jsonl)",
+  "type": "object",
+  "required": ["ts", "run_id", "type"],
+  "properties": {
+    "ts": { "type": "string", "format": "date-time" },
+    "run_id": { "type": "string" },
+    "type": { "type": "string" },
+    "data": { "type": "object" }
+  }
+}

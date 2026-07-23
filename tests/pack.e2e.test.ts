@@ -1,0 +1,78 @@
+import { execSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, test } from 'vitest';
+import { cleanup, tmpProject } from './helpers.js';
+
+const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+interface PackFileEntry {
+  path: string;
+}
+interface PackEntry {
+  filename: string;
+  files: PackFileEntry[];
+}
+
+/** npm pack --json may be preceded by lifecycle noise; parse from the first '['. */
+function parsePackJson(stdout: string): PackEntry[] {
+  const start = stdout.indexOf('[');
+  expect(start).toBeGreaterThanOrEqual(0);
+  return JSON.parse(stdout.slice(start)) as PackEntry[];
+}
+
+describe('distribution E2E (npm pack + install)', () => {
+  test('tarball installs and the CLI works from dist', () => {
+    // ---- pack (prepack runs the tsc build)
+    const packOut = execSync('npm pack --json', { cwd: packageRoot, encoding: 'utf8' });
+    const [entry] = parsePackJson(packOut);
+    expect(entry).toBeDefined();
+    const tarball = path.join(packageRoot, entry!.filename);
+    expect(fs.existsSync(tarball)).toBe(true);
+
+    const fixture = tmpProject('rijo-pack-e2e-');
+    try {
+      // ---- tarball contents: no sources or tests shipped
+      const shippedPaths = entry!.files.map((f) => f.path.replace(/\\/g, '/'));
+      expect(shippedPaths.some((p) => p === 'src' || p.startsWith('src/'))).toBe(false);
+      expect(shippedPaths.some((p) => p === 'tests' || p.startsWith('tests/'))).toBe(false);
+      expect(shippedPaths.some((p) => p.startsWith('dist/'))).toBe(true);
+      expect(shippedPaths.some((p) => p.startsWith('skills/'))).toBe(true);
+      expect(shippedPaths).toContain('dist/cli/index.js');
+      expect(shippedPaths).toContain('skills/rijo-new.md');
+
+      // ---- install the tarball into a fresh fixture project
+      execSync('npm init -y', { cwd: fixture, encoding: 'utf8' });
+      execSync(`npm install "${tarball}" --no-audit --no-fund`, { cwd: fixture, encoding: 'utf8' });
+
+      const installed = path.join(fixture, 'node_modules', 'rijo');
+      expect(fs.existsSync(path.join(installed, 'dist', 'cli', 'index.js'))).toBe(true);
+      expect(fs.existsSync(path.join(installed, 'skills', 'rijo-new.md'))).toBe(true);
+
+      // package.json "files" also lists templates/, schemas/, adapters/ — only
+      // assert what actually exists in the repo (npm skips missing entries).
+      for (const optional of ['templates', 'schemas', 'adapters']) {
+        if (fs.existsSync(path.join(packageRoot, optional))) {
+          expect(fs.existsSync(path.join(installed, optional))).toBe(true);
+        }
+      }
+
+      const cliEntry = path.join('node_modules', 'rijo', 'dist', 'cli', 'index.js');
+
+      // ---- rijo --version
+      const version = execSync(`node "${cliEntry}" --version`, { cwd: fixture, encoding: 'utf8' });
+      expect(version.trim()).toBe('0.1.0');
+
+      // ---- rijo --status --json on the uninitialized fixture
+      const statusOut = execSync(`node "${cliEntry}" --status --json`, { cwd: fixture, encoding: 'utf8' });
+      const status = JSON.parse(statusOut);
+      expect(status.initialized).toBe(false);
+      expect(status.rijo_version).toBe('0.1.0');
+      expect(status.schema_version).toBe(1);
+    } finally {
+      fs.rmSync(tarball, { force: true });
+      cleanup(fixture);
+    }
+  }, 300000);
+});

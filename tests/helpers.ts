@@ -1,0 +1,189 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { FakeAgentRunner, type RunnerCapabilities } from '../src/agents/runner.js';
+import { FakeShellRunner } from '../src/core/commands.js';
+import { FakeGit } from '../src/core/git.js';
+import { silentSink } from '../src/core/progress.js';
+import type { WorkflowDeps } from '../src/workflows/shared.js';
+import type { AgentTask, AgentResult } from '../src/agents/protocol.js';
+
+export function tmpProject(prefix = 'rijo-test-'): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+export function cleanup(dir: string): void {
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+}
+
+export function writePlanFile(root: string, name = 'PLANO.md', content?: string): string {
+  const p = path.join(root, name);
+  fs.writeFileSync(
+    p,
+    content ??
+      [
+        '# Plano — Loja simples',
+        '',
+        'Uma loja online mínima com catálogo e checkout.',
+        '',
+        '## Requisitos',
+        '- Catálogo de produtos com listagem e busca',
+        '- Checkout com pagamento por cartão',
+        '',
+        '## Fora de escopo',
+        '- Programa de fidelidade',
+      ].join('\n'),
+    'utf8',
+  );
+  return p;
+}
+
+export function ok(task: AgentTask, extra: Partial<AgentResult> = {}): AgentResult {
+  return {
+    task_id: task.id,
+    ok: true,
+    summary: `done ${task.id}`,
+    files_written: [],
+    payload: null,
+    scope_requests: [],
+    ...extra,
+  };
+}
+
+export const EXTRACTION_PAYLOAD = {
+  project_name: 'Loja Simples',
+  project_summary: 'Loja online mínima com catálogo e checkout.',
+  stack_summary: 'Node.js 24 + TypeScript (verificado).',
+  rules: ['Sem dados de cartão em logs.'],
+  out_of_scope: ['Programa de fidelidade'],
+  acceptance: ['Compra completa funciona de ponta a ponta'],
+  requirements: [
+    { description: 'Catálogo de produtos com listagem e busca', acceptance: 'Usuário vê lista e busca por nome', non_functional: false, classification: 'NEW' },
+    { description: 'Checkout com pagamento por cartão', acceptance: 'Usuário conclui compra com cartão de teste', non_functional: false, classification: 'NEW' },
+  ],
+  phases: [
+    { name: 'Catálogo', requirement_indexes: [0], depends_on_indexes: [], ui_surface: true },
+    { name: 'Checkout', requirement_indexes: [1], depends_on_indexes: [0], ui_surface: true },
+  ],
+  research_topics: [{ key: 'node-lts', topic: 'Node.js LTS recomendado', volatile: true }],
+};
+
+export function planPayloadFor(phaseId: string) {
+  return {
+    phase: phaseId,
+    tasks: [
+      {
+        id: 'T01',
+        name: 'Implementar módulo',
+        requirement_ids: [],
+        technical_justification: 'infra da fase',
+        files: ['src/a.ts'],
+        write_scope: ['src/a.ts'],
+        depends_on: [],
+        parallel: false,
+        tdd: true,
+        tests: ['echo test-a'],
+        evidence_expected: 'testes passam',
+        done: false,
+      },
+      {
+        id: 'T02',
+        name: 'Integrar módulo',
+        requirement_ids: [],
+        technical_justification: 'integração',
+        files: ['src/b.ts'],
+        write_scope: ['src/b.ts'],
+        depends_on: ['T01'],
+        parallel: false,
+        tdd: false,
+        tests: [],
+        evidence_expected: 'build passa',
+        done: false,
+      },
+    ],
+  };
+}
+
+export interface StandardRunnerOpts {
+  capabilities?: Partial<RunnerCapabilities>;
+  reviewApproved?: boolean;
+  planPayload?: (phaseId: string) => unknown;
+  extraction?: unknown;
+}
+
+/**
+ * A FakeAgentRunner wired with the standard happy-path handlers:
+ * planner extraction, spec writer, plan payload, approving reviewer,
+ * succeeding workers, researcher with sources.
+ */
+export function standardRunner(root: string, opts: StandardRunnerOpts = {}): FakeAgentRunner {
+  const caps: RunnerCapabilities = { subagents: true, parallelism: true, browser: false, ...opts.capabilities };
+  const runner = new FakeAgentRunner(caps);
+  runner
+    .on(
+      (t) => t.id === 'new-extract',
+      (t) => ok(t, { payload: opts.extraction ?? EXTRACTION_PAYLOAD }),
+    )
+    .on(
+      (t) => t.id.startsWith('new-research'),
+      (t) =>
+        ok(t, {
+          payload: {
+            summary: 'Node 24 é o Active LTS.',
+            sources: [
+              {
+                claim: 'Node.js 24 é Active LTS',
+                source: 'nodejs.org previous releases',
+                url: 'https://nodejs.org/en/about/previous-releases',
+                checked_at: '2026-07-23T00:00:00.000Z',
+                version: '24.x',
+                confidence: 'high',
+              },
+            ],
+          },
+        }),
+    )
+    .on(
+      (t) => t.id.startsWith('spec-'),
+      (t) => {
+        const specPath = t.write_scope[0]!;
+        fs.mkdirSync(path.dirname(specPath), { recursive: true });
+        fs.writeFileSync(specPath, `# Spec\n\nCenários observáveis de aceite.\n`, 'utf8');
+        return ok(t, { files_written: [specPath] });
+      },
+    )
+    .on(
+      (t) => t.id.startsWith('plan-') && !t.id.startsWith('plan-review'),
+      (t) => {
+        const phaseId = t.id.match(/plan-(\d{2})/)?.[1] ?? '01';
+        return ok(t, { payload: (opts.planPayload ?? planPayloadFor)(phaseId) });
+      },
+    )
+    .on(
+      (t) => t.role === 'reviewer',
+      (t) => ok(t, { payload: { approved: opts.reviewApproved ?? true, findings: [] } }),
+    )
+    .on(
+      (t) => t.role === 'worker' && t.id.startsWith('exec-'),
+      (t) => {
+        // simulate the worker touching its write scope inside the project
+        const written: string[] = [];
+        for (const scope of t.write_scope) {
+          if (scope.includes('*')) continue;
+          const target = path.join(root, scope);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, `// ${t.id}\n`, 'utf8');
+          written.push(scope);
+        }
+        return ok(t, { files_written: written, payload: { done: true, notes: 'implemented' } });
+      },
+    );
+  return runner;
+}
+
+export function deps(root: string, opts: StandardRunnerOpts = {}): WorkflowDeps & { git: FakeGit; shell: FakeShellRunner; runner: FakeAgentRunner } {
+  const git = new FakeGit();
+  const shell = new FakeShellRunner();
+  const runner = standardRunner(root, opts);
+  return { runner, shell, git, sink: silentSink, now: () => new Date('2026-07-23T12:00:00.000Z') };
+}

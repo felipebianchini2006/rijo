@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rijo.dev/schemas/status.schema.json",
+  "title": "RIJO runtime status (.rijo/runtime/status.json)",
+  "type": "object",
+  "required": ["schema_version", "run_id", "status", "started_at", "updated_at", "message", "completed_units", "total_units"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string" },
+    "status": { "enum": ["idle", "running", "waiting", "blocked", "failed", "completed"] },
+    "milestone": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
+    "phase": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "index": { "type": "integer" }, "total": { "type": "integer" }, "name": { "type": "string" } } },
+    "stage": { "type": ["string", "null"] },
+    "task": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "index": { "type": "integer" }, "total": { "type": "integer" }, "name": { "type": "string" } } },
+    "agent": { "type": ["object", "null"], "properties": { "role": { "enum": ["lead", "reviewer", "planner", "worker", "researcher", "qa"] }, "id": { "type": "string" } } },
+    "completed_units": { "type": "integer" },
+    "total_units": { "type": "integer" },
+    "last_checkpoint": { "type": ["string", "null"] },
+    "started_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "message": { "type": "string" }
+  }
+}

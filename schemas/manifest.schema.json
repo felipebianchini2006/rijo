@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rijo.dev/schemas/manifest.schema.json",
+  "title": "RIJO manifest (.rijo/manifest.json)",
+  "type": "object",
+  "required": ["rijo_version", "schema_version", "active_milestone", "milestones", "hashes", "updated_at"],
+  "properties": {
+    "rijo_version": { "type": "string" },
+    "schema_version": { "type": "integer" },
+    "active_milestone": { "type": ["string", "null"], "pattern": "^M\\d{3}$" },
+    "milestones": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "slug", "status"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^M\\d{3}$" },
+          "slug": { "type": "string" },
+          "status": { "enum": ["ACTIVE", "COMPLETE", "PARTIAL", "SUPERSEDED", "CANCELLED"] }
+        }
+      }
+    },
+    "hashes": { "type": "object", "additionalProperties": { "type": "string" } },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}

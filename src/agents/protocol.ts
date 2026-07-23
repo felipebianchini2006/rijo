@@ -50,6 +50,7 @@ export class ScopeViolationError extends Error {
 export function enforceWriteScope(task: AgentTask, result: AgentResult): void {
   const norm = (s: string) => s.replace(/\\/g, '/');
   const allowed = task.write_scope.map(norm);
+  if (allowed.includes('**')) return;
   const violations = result.files_written
     .map(norm)
     .filter((f) => !allowed.some((a) => f === a || (a.endsWith('/**') && f.startsWith(a.slice(0, -2))) || (a.endsWith('/') && f.startsWith(a))));

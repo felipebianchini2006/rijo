@@ -1,0 +1,205 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { newWorkflow } from '../src/workflows/new.js';
+import { runWorkflow } from '../src/workflows/run.js';
+import { RijoPaths } from '../src/core/paths.js';
+import { readManifest } from '../src/core/manifest.js';
+import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
+import { readState } from '../src/core/state.js';
+import { readPlan } from '../src/core/plan.js';
+import { FakeShellRunner } from '../src/core/commands.js';
+import { tmpProject, cleanup, writePlanFile, deps, ok } from './helpers.js';
+
+function milestoneDir(root: string): string {
+  const paths = new RijoPaths(root);
+  const manifest = readManifest(paths)!;
+  const m = manifest.milestones.find((x) => x.id === manifest.active_milestone)!;
+  return paths.milestoneDir(m.id, m.slug);
+}
+
+describe('rijo run', () => {
+  let root: string;
+  beforeEach(async () => {
+    root = tmpProject();
+    writePlanFile(root);
+  });
+  afterEach(() => cleanup(root));
+
+  it('runs a full phase through the state machine with evidence and commit', async () => {
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.ok, outcome.message).toBe(true);
+
+    const mdir = milestoneDir(root);
+    const phaseDir = path.join(mdir, 'phases', '01-catalogo');
+    for (const f of ['SPEC.md', 'PLAN.md', 'SUMMARY.md', 'REVIEW.md', 'VERIFICATION.md']) {
+      expect(fs.existsSync(path.join(phaseDir, f)), f).toBe(true);
+    }
+    // evidence: commands with exit codes recorded
+    const verification = fs.readFileSync(path.join(phaseDir, 'VERIFICATION.md'), 'utf8');
+    expect(verification).toContain('echo test-a');
+    expect(verification).toContain('exit 0');
+    // roadmap updated with commit
+    const roadmap = readRoadmap(path.join(mdir, 'ROADMAP.md'));
+    expect(roadmap.phases[0]!.status).toBe('DONE');
+    expect(roadmap.phases[0]!.commit).toBe(d.git.headCommit());
+    // requirements of phase 01 done with evidence
+    const reqs = readRequirements(path.join(mdir, 'REQUIREMENTS.md'));
+    const r1 = reqs.requirements.find((r) => r.phase === '01')!;
+    expect(r1.status).toBe('DONE');
+    expect(r1.evidence).toBeTruthy();
+    // state checkpoint advanced
+    const state = readState(new RijoPaths(root))!;
+    expect(state.stage).toBe('DONE');
+    expect(state.last_commit).toBe(d.git.headCommit());
+    // workers ran with fresh briefs and strict scopes
+    const workers = d.runner.executed.filter((t) => t.id.startsWith('exec-01-'));
+    expect(workers).toHaveLength(2);
+    expect(workers[0]!.write_scope).toEqual(['src/a.ts']);
+  });
+
+  it('run all completes every phase respecting dependencies', async () => {
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await runWorkflow(root, { target: 'all' }, d);
+    expect(outcome.ok).toBe(true);
+    const roadmap = readRoadmap(path.join(milestoneDir(root), 'ROADMAP.md'));
+    expect(roadmap.phases.every((p) => p.status === 'DONE')).toBe(true);
+    // one commit per verified phase
+    expect(d.git.commits.filter((c) => c.message.includes('verified'))).toHaveLength(2);
+  });
+
+  it('rejects an inconsistent plan (lint) and blocks after the revision limit', async () => {
+    const d = deps(root, {
+      planPayload: (phaseId) => ({
+        phase: phaseId,
+        tasks: [
+          {
+            id: 'T01', name: 'bad', requirement_ids: [], technical_justification: null,
+            files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: ['T99'],
+            parallel: false, tdd: false, tests: [], evidence_expected: 'x', done: false,
+          },
+          {
+            id: 'T02', name: 'bad2', requirement_ids: ['M001-REQ-999'], technical_justification: null,
+            files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: [],
+            parallel: false, tdd: false, tests: [], evidence_expected: 'x', done: false,
+          },
+        ],
+      }),
+    });
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.details?.join('\n')).toMatch(/MISSING_DEP|TASK_WITHOUT_REQ|UNKNOWN_REQ/);
+  });
+
+  it('blocks when the independent reviewer keeps rejecting the plan (bounded loop)', async () => {
+    const d = deps(root, { reviewApproved: false });
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('not approved after 2 revisions');
+    // planner called initial + 2 revisions, never more
+    const planners = d.runner.executed.filter((t) => t.id.startsWith('plan-01') && !t.id.startsWith('plan-review'));
+    expect(planners.length).toBe(3);
+  });
+
+  it('rejects a diff that violates the spec (code review findings) and returns to spec on spec_gap', async () => {
+    const d = deps(root);
+    // override reviewer: approve plan reviews, flag spec_gap on code review
+    d.runner.on(
+      (t) => t.id.startsWith('code-review-'),
+      (t) => ok(t, { payload: { approved: false, findings: [{ type: 'spec_gap', severity: 'high', description: 'endpoint diverges from spec', file: null }] } }),
+    );
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('returning to specification');
+    // phase must NOT be marked done
+    const roadmap = readRoadmap(path.join(milestoneDir(root), 'ROADMAP.md'));
+    expect(roadmap.phases[0]!.status).not.toBe('DONE');
+  });
+
+  it('verification failure does not advance state (atomicity) and bounded repair applies', async () => {
+    const d = deps(root);
+    // shell always fails for the plan's test command
+    const failingShell = new FakeShellRunner([{ match: /echo test-a/, exitCode: 1, output: 'FAIL' }]);
+    const d2 = { ...d, shell: failingShell };
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d2);
+    const outcome = await runWorkflow(root, {}, d2);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('verification still failing');
+    // repair workers were attempted exactly qa_fix_loops times
+    const repairs = d.runner.executed.filter((t) => t.id.startsWith('verify-fix-'));
+    expect(repairs).toHaveLength(2);
+    // state not corrupted: no phase done, no requirement done
+    const roadmap = readRoadmap(path.join(milestoneDir(root), 'ROADMAP.md'));
+    expect(roadmap.phases[0]!.status).not.toBe('DONE');
+    const reqs = readRequirements(path.join(milestoneDir(root), 'REQUIREMENTS.md'));
+    expect(reqs.requirements.every((r) => r.status !== 'DONE')).toBe(true);
+  });
+
+  it('TDD task records the RED-GREEN discipline in the worker brief', async () => {
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await runWorkflow(root, {}, d);
+    const tddWorker = d.runner.executed.find((t) => t.id === 'exec-01-T01')!;
+    expect(tddWorker.objective).toContain('TDD');
+    expect(tddWorker.objective).toContain('RED');
+  });
+
+  it('resumes from the last verified checkpoint without repeating work', async () => {
+    const d = deps(root);
+    // T02 worker fails on the first run
+    let failT02 = true;
+    d.runner.on(
+      (t) => t.id === 'exec-01-T02' && failT02,
+      (t) => ({ task_id: t.id, ok: false, summary: 'interrupted', files_written: [], payload: null, scope_requests: [] }),
+    );
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const first = await runWorkflow(root, {}, d);
+    expect(first.status).toBe('blocked');
+    // T01 is checkpointed as done in the plan
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalogo', 'PLAN.md');
+    expect(readPlan(planPath).tasks.find((t) => t.id === 'T01')!.done).toBe(true);
+
+    const execCountAfterFirst = d.runner.executed.filter((t) => t.id === 'exec-01-T01').length;
+    failT02 = false;
+    const second = await runWorkflow(root, {}, d);
+    expect(second.ok, second.message).toBe(true);
+    // T01 was NOT re-executed on resume
+    expect(d.runner.executed.filter((t) => t.id === 'exec-01-T01').length).toBe(execCountAfterFirst);
+    // spec/plan not regenerated
+    expect(d.runner.executed.filter((t) => t.id === 'spec-01').length).toBe(1);
+  });
+
+  it('parallel tasks with disjoint write scopes run in one batch; overlapping are serialized', async () => {
+    const d = deps(root, {
+      planPayload: (phaseId) => ({
+        phase: phaseId,
+        tasks: [
+          { id: 'T01', name: 'a', requirement_ids: [], technical_justification: 'x', files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
+          { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
+        ],
+      }),
+    });
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.ok).toBe(true);
+    // both parallel workers were dispatched (single group of 2)
+    const workers = d.runner.executed.filter((t) => t.id.startsWith('exec-01-'));
+    expect(workers).toHaveLength(2);
+  });
+
+  it('scope violation by a worker is rejected', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (t) => t.id === 'exec-01-T01',
+      (t) => ok(t, { files_written: ['src/OUTSIDE.ts'], payload: { done: true, notes: '' } }),
+    );
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await expect(runWorkflow(root, {}, d)).rejects.toThrow(/outside its declared scope/);
+  });
+});

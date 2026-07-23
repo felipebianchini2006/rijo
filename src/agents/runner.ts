@@ -59,8 +59,9 @@ export class FakeAgentRunner implements AgentRunner {
     private readonly handlers: Array<{ match: (t: AgentTask) => boolean; handle: FakeHandler }> = [],
   ) {}
 
+  /** Later registrations take precedence (useful to override defaults in tests). */
   on(match: (t: AgentTask) => boolean, handle: FakeHandler): this {
-    this.handlers.push({ match, handle });
+    this.handlers.unshift({ match, handle });
     return this;
   }
 
