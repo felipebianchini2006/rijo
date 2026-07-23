@@ -5,6 +5,7 @@ import { activeMilestone } from '../core/milestones.js';
 import { readRequirements } from '../core/roadmap.js';
 import type { CommandEvidence } from '../core/commands.js';
 import { deriveJourneys, JourneyResultSchema, type Journey, type JourneyResult } from '../qa/journeys.js';
+import { generatePlaywrightSpecs } from '../qa/playwright.js';
 import { decideReadiness } from '../qa/readiness.js';
 import { runBatch, runValidated } from '../agents/runner.js';
 import type { AgentTask } from '../agents/protocol.js';
@@ -59,6 +60,9 @@ export async function checkWorkflow(
     const reqDoc = readRequirements(milestone.paths.requirements);
     const journeys = deriveJourneys(reqDoc.requirements);
     writeJourneysDoc(milestone.paths.qaDir, journeys, now);
+    // Playwright specs: deterministic codegen, one per journey, run by QA agents or CI
+    const specs = generatePlaywrightSpecs(journeys, path.join(milestone.paths.qaDir, 'journeys'));
+    bus.emit('check.playwright', { message: `${specs.length} specs Playwright gerados em qa/journeys/` });
 
     // ---- 7-9: browser journeys (isolated agents), honest about capability
     const missingCapabilities: string[] = [];
