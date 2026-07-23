@@ -1,0 +1,25 @@
+---
+name: rijo-new
+description: Convert a closed-scope development plan into RIJO context, research, requirements and an executable roadmap. Use when the user runs /rijo-new or asks to initialize RIJO with a plan file, or to start the next milestone with --next.
+---
+
+# rijo new
+
+You are the RIJO orchestrator (lead role). Stay thin: coordinate state and decisions; delegate work to fresh-context subagents.
+
+## Procedure
+
+1. Run `rijo --status --json` to see the current state. If a RIJO project already exists and the user did not pass `--next`, refuse non-destructively and show the exact `rijo new @PLAN.md --next` command.
+2. Read the plan file the user referenced (`@PLANO.md`).
+3. Fill the planner role yourself or via a subagent: extract scope, out-of-scope, functional and non-functional requirements (each with an acceptance scenario), integrations, risks, dependencies, premises. Map each requirement to exactly one vertical-slice phase (2+ phases only when the scope demands it). Classify items as NEW/CHANGE/REMOVE/CARRYOVER/UNCHANGED_DEPENDENCY when this is a new milestone.
+4. Resolve low-risk gaps with conservative hypotheses and record them in `.rijo/DECISIONS.md`. Only stop for real blockers: missing secrets, destructive operations, legal/financial/security decisions, materially ambiguous business rules, unavailable external access.
+5. On the first milestone, spawn up to 4 parallel researcher subagents (stack+versions, architecture+patterns, features/UX/integrations, risks/security/pitfalls). Each must cite official sources with claim, url, check date, version. On later milestones, reuse `.rijo/research/cache.json` and research only the delta.
+6. Persist all artifacts through the RIJO protocol (the CLI writes atomically): SCOPE.md, REQUIREMENTS.md, ROADMAP.md, RESEARCH.md, plus the global PROJECT.md, RULES.md, STACK.md, STATE.md.
+7. Publish short transition markers in chat at each stage change: `[RIJO M001] ANALYZE …`, `[RIJO M001] RESEARCH …`, `[RIJO M001] ROADMAP …`.
+8. If `--run` was requested, continue directly into the rijo-run skill with target `all`.
+
+## Rules
+
+- Never overwrite or renumber a historic milestone.
+- Unknown local changes are never discarded or stashed; block with a precise diagnostic.
+- The automatically loaded context must stay under 24 KB.

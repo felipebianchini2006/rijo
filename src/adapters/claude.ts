@@ -1,0 +1,150 @@
+import * as path from 'node:path';
+import { ensureDir, exists, readTextIfExists, readJsonIfExists, writeFileAtomic, writeJsonAtomic } from '../core/fsx.js';
+import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
+
+const SKILLS = ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
+
+const AGENT_DEFS: Array<{ name: string; description: string; body: string }> = [
+  {
+    name: 'rijo-worker',
+    description: 'Economical implementation worker for one RIJO task with a strict write scope.',
+    body: 'Implement exactly one RIJO task. Read only the files listed in your brief. Never write outside your declared write scope; if you need to, stop and request a new allocation. Follow TDD when the task says so (RED, GREEN, REFACTOR). Return a one-line summary plus the JSON payload the brief demands — never your private reasoning.',
+  },
+  {
+    name: 'rijo-reviewer',
+    description: 'Independent reviewer: receives spec, diff and evidence, never the author reasoning.',
+    body: 'Review the artifact against the spec and rules. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject. Evidence beats claims: an agent summary is not evidence. Return the JSON verdict payload only.',
+  },
+  {
+    name: 'rijo-researcher',
+    description: 'Economical researcher: official sources only, claim+url+date for every volatile fact.',
+    body: 'Research the given topic using official documentation, release/LTS pages, changelogs, advisories and registries. Never assume newest is best. Separate fact, inference and recommendation. Return the JSON payload with summary and sources (claim, source, url, checked_at, version, confidence).',
+  },
+  {
+    name: 'rijo-qa',
+    description: 'Browser QA agent: executes one journey as a real user and reports structured results.',
+    body: 'Execute the journey end-to-end as a real user. Observe console, network, error states, keyboard navigation. Capture screenshots into your write scope on failure. Return the JSON journey result payload only.',
+  },
+];
+
+/**
+ * Claude Code adapter: project skills, specialized agents, idempotent
+ * CLAUDE.md block, statusline script. Never destroys an existing statusline.
+ */
+export function generateClaudeAdapter(projectRoot: string): AdapterReport {
+  const report: AdapterReport = { generated: [], skipped: [], notes: [] };
+
+  // skills
+  for (const skill of SKILLS) {
+    const source = loadSkillSource(skill);
+    if (!source) {
+      report.skipped.push(`skill ${skill} (source missing in package)`);
+      continue;
+    }
+    const dir = path.join(projectRoot, '.claude', 'skills', skill);
+    ensureDir(dir);
+    writeFileAtomic(path.join(dir, 'SKILL.md'), source);
+    report.generated.push(`.claude/skills/${skill}/SKILL.md`);
+  }
+
+  // specialized agents
+  for (const agent of AGENT_DEFS) {
+    const dir = path.join(projectRoot, '.claude', 'agents');
+    ensureDir(dir);
+    writeFileAtomic(
+      path.join(dir, `${agent.name}.md`),
+      `---\nname: ${agent.name}\ndescription: ${agent.description}\n---\n\n${agent.body}\n`,
+    );
+    report.generated.push(`.claude/agents/${agent.name}.md`);
+  }
+
+  // CLAUDE.md idempotent block
+  upsertMarkerFile(path.join(projectRoot, 'CLAUDE.md'), rijoInstructionBlock());
+  report.generated.push('CLAUDE.md (RIJO block)');
+
+  // statusline script (reads runtime/status.json; zero model calls)
+  const adapterDir = path.join(projectRoot, '.rijo', 'adapters', 'claude');
+  ensureDir(adapterDir);
+  const scriptPath = path.join(adapterDir, 'statusline.cjs');
+  writeFileAtomic(scriptPath, STATUSLINE_SCRIPT);
+  report.generated.push('.rijo/adapters/claude/statusline.cjs');
+
+  // settings: only set statusLine when it can be done without destroying config
+  const settingsPath = path.join(projectRoot, '.claude', 'settings.json');
+  const settings = readJsonIfExists<Record<string, unknown>>(settingsPath);
+  const command = 'node .rijo/adapters/claude/statusline.cjs';
+  if (!settings) {
+    ensureDir(path.dirname(settingsPath));
+    writeJsonAtomic(settingsPath, { statusLine: { type: 'command', command, refreshInterval: 1000 } });
+    report.generated.push('.claude/settings.json (statusLine)');
+  } else if (!settings['statusLine']) {
+    writeJsonAtomic(settingsPath, { ...settings, statusLine: { type: 'command', command, refreshInterval: 1000 } });
+    report.generated.push('.claude/settings.json (statusLine added, existing keys preserved)');
+  } else {
+    const existing = JSON.stringify(settings['statusLine']);
+    if (existing.includes('statusline.cjs')) {
+      report.skipped.push('statusLine (already RIJO)');
+    } else {
+      writeFileAtomic(
+        path.join(adapterDir, 'STATUSLINE.md'),
+        [
+          '# Composing the RIJO status line',
+          '',
+          'An existing statusLine was found in `.claude/settings.json`; RIJO did not overwrite it.',
+          'To compose both, chain the commands in your existing script or wrap them:',
+          '',
+          '```json',
+          `{ "statusLine": { "type": "command", "command": "<your-script> && ${command}", "refreshInterval": 1000 } }`,
+          '```',
+          '',
+          'The RIJO segment prints: `[RIJO M002 F03/05] EXECUTE T02/04  message`.',
+          'Progress updates keep flowing in chat and in `.rijo/runtime/status.json` regardless.',
+        ].join('\n'),
+      );
+      report.skipped.push('statusLine (existing preserved; see .rijo/adapters/claude/STATUSLINE.md)');
+      report.notes.push('Existing statusLine preserved; composition instructions generated.');
+    }
+  }
+  return report;
+}
+
+export function detectClaude(projectRoot: string): boolean {
+  return (
+    exists(path.join(projectRoot, '.claude')) ||
+    readTextIfExists(path.join(projectRoot, 'CLAUDE.md')) !== null ||
+    process.env['CLAUDECODE'] === '1'
+  );
+}
+
+const STATUSLINE_SCRIPT = `#!/usr/bin/env node
+// RIJO status line for Claude Code. Reads .rijo/runtime/status.json only —
+// no model calls, no network. Prints one short line.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+function findStatus(dir) {
+  for (let i = 0; i < 10; i++) {
+    const p = path.join(dir, '.rijo', 'runtime', 'status.json');
+    if (fs.existsSync(p)) return p;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+try {
+  const p = findStatus(process.cwd());
+  if (!p) { console.log('[RIJO] idle'); process.exit(0); }
+  const s = JSON.parse(fs.readFileSync(p, 'utf8'));
+  const parts = ['[RIJO'];
+  if (s.milestone) parts.push(s.milestone.id);
+  if (s.phase) parts.push('F' + s.phase.id + '/' + String(s.phase.total).padStart(2, '0'));
+  let line = parts.join(' ') + ']';
+  if (s.stage) line += ' ' + s.stage;
+  if (s.task) line += ' T' + String(s.task.id).replace(/^T/, '') + '/' + String(s.task.total).padStart(2, '0');
+  if (s.message) line += '  ' + s.message;
+  console.log(line);
+} catch (e) {
+  console.log('[RIJO] status unavailable');
+}
+`;
