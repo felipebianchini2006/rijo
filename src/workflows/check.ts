@@ -127,7 +127,7 @@ export async function checkWorkflow(
               ...failingJourneys.map((f) => `${f.journey_id}: ${f.findings.map((x) => `${x.severity} ${x.description}`).join('; ')}`),
             ].join('\n'),
           };
-          const fixRes = await dispatch(ctx, fixTask);
+          const fixRes = await dispatch(ctx, fixTask, { stage: 'EXECUTE' });
           if (!fixRes.ok) break;
           fixesApplied.push(`round ${round}: ${fixRes.summary}`);
           // re-run the entire deterministic matrix, not only the failing subset
@@ -152,7 +152,7 @@ export async function checkWorkflow(
         return_format: 'JSON payload: {findings: [{severity, description, evidence}]}',
         notes: '',
       };
-      const visualRes = await dispatch(ctx, visualTask);
+      const visualRes = await dispatch(ctx, visualTask, { stage: 'CODE_REVIEW', authorProfiles: ['senior-software-engineer'] });
       if (visualRes.ok && visualRes.payload) {
         const parsed = JourneyResultSchema.pick({ findings: true }).safeParse(visualRes.payload);
         if (parsed.success && journeyResults.length > 0) {
@@ -299,7 +299,7 @@ async function productionCheck(
     const attempt = prepareAttempt(ctx, fixTask);
     let appliedPaths: string[] = [];
     try {
-      const res = await dispatch(ctx, attempt.task);
+      const res = await dispatch(ctx, attempt.task, { stage: 'EXECUTE' });
       if (!res.ok) {
         bus.emit('check.fix_failed', { message: `reparo falhou: ${res.summary}` });
         break;
@@ -499,7 +499,7 @@ async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journe
       'JSON payload: {journey_id, passed, steps[], console_errors[], network_errors[], findings[{severity,description,evidence}], screenshots[]}',
     notes: `Requirements covered: ${j.requirement_ids.join(', ')}`,
   }));
-  const results = await dispatchBatch(ctx, tasks);
+  const results = await dispatchBatch(ctx, tasks, undefined, () => ({ stage: 'JOURNEYS' }));
   const out: JourneyResult[] = [];
   for (let i = 0; i < results.length; i++) {
     const r = results[i]!;

@@ -150,7 +150,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         'JSON payload: {mappings:[{from,to,kind:component|route|asset|api|state|style|test|config,notes}], routes:[{from,to}], divergences[], states_covered:[loading|empty|error|success]}',
       notes: `Target stack hints: ${targetHints.join(', ') || 'see STACK.md'}\n${stackNote.slice(0, 1500)}`,
     };
-    const { result: mapRes, violation: mapViolation } = await dispatchReadOnly(ctx, mapTask);
+    const { result: mapRes, violation: mapViolation } = await dispatchReadOnly(ctx, mapTask, { stage: 'UI_SMOKE' });
     if (mapViolation.length > 0) {
       return blocked(ctx, 'UI mapping agent (read-only) modified the checkout.', mapViolation);
     }
@@ -221,7 +221,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     const attempt = prepareAttempt(ctx, convertTask);
     let deltaFiles: string[] = [];
     try {
-      const res = await dispatch(ctx, attempt.task);
+      const res = await dispatch(ctx, attempt.task, { stage: 'UI_SMOKE' });
       const conv = z.object({ converted: z.boolean(), components_created: z.array(z.string()).default([]), notes: z.string().default('') }).safeParse(res.payload);
       if (!res.ok || !conv.success || !conv.data.converted) {
         return blocked(ctx, 'UI conversion failed.', [res.summary]);
@@ -286,7 +286,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
           return_format: 'JSON payload: {passed: boolean, routes_checked[], states_checked[], notes}',
           notes: `Routes to validate: ${mapping.data.routes.map((r) => r.to).join(', ') || 'from MAPPING.md'}`,
         };
-        const vres = await dispatch(ctx, { ...validateTask, workspace: { id: attempt.workspace.id, root: attempt.workspace.root } });
+        const vres = await dispatch(ctx, { ...validateTask, workspace: { id: attempt.workspace.id, root: attempt.workspace.root } }, { stage: 'UI_SMOKE' });
         const vparsed = z
           .object({ passed: z.boolean(), routes_checked: z.array(z.string()).default([]), states_checked: z.array(z.string()).default([]), notes: z.string().default('') })
           .safeParse(vres.payload);

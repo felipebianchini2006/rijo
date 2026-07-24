@@ -86,6 +86,13 @@ function okResult(task: AgentTask, extra: Partial<AgentResult> = {}): AgentResul
     files_written: [],
     payload: null,
     scope_requests: [],
+    // A compliant supervised host echoes the attempt identity so the core can
+    // match the reply to the current attempt (the RPC runner drops any reply
+    // whose attempt_id does not echo). Now that every dispatch is supervised,
+    // the task always carries an attempt.
+    attempt_id: task.attempt?.attempt_id ?? null,
+    generation: task.attempt?.generation ?? null,
+    lease_id: task.attempt?.lease_id ?? null,
     ...extra,
   });
 }

@@ -191,7 +191,7 @@ export async function newWorkflow(
         'JSON payload matching the PlanExtraction schema: {project_name, project_summary, stack_summary, rules[], out_of_scope[], acceptance[], requirements[{description, acceptance, non_functional, classification}], phases[{name, requirement_indexes[], depends_on_indexes[], ui_surface}], research_topics[{key, topic, volatile}]}',
       notes: [previousContext, brown.stackNotes.join('\n')].filter(Boolean).join('\n\n') + `\n\nPLAN CONTENT:\n${planContent}`,
     };
-    const extractResult = await dispatch(ctx, extractTask);
+    const extractResult = await dispatch(ctx, extractTask, { stage: 'PLAN' });
     if (!extractResult.ok || !extractResult.payload) {
       return blocked(ctx, 'Plan extraction failed.', [extractResult.summary, `Brief was:\n${renderBrief(AgentTaskSchema.parse(extractTask)).slice(0, 400)}…`]);
     }
@@ -311,7 +311,7 @@ export async function newWorkflow(
           'JSON payload: {summary: string, sources: [{claim, source, url, checked_at, version, confidence, tier: official|advisory|secondary}]}. tier=official for official docs/registries, advisory for primary security advisories.',
         notes: '',
       }));
-      const results = await dispatchBatch(ctx, tasks);
+      const results = await dispatchBatch(ctx, tasks, undefined, () => ({ stage: 'RESEARCH' }));
       const waivers = new Map(config.research.waivers.map((w) => [w.key, w.reason]));
       for (let i = 0; i < results.length; i++) {
         const r = results[i]!;

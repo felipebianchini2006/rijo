@@ -40,6 +40,7 @@ import {
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
+import { inferSecurityTag, inferHighRisk } from './routing.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -247,7 +248,7 @@ async function executePhase(
     // The spec is a canonical artifact: this is an explicitly core-authorized
     // canonical write, isolated in a workspace and applied only after validation.
     const attempt = prepareAttempt(ctx, specTask, { canonicalWriteScope: [specRel] });
-    const res = await dispatch(ctx, attempt.task);
+    const res = await dispatch(ctx, attempt.task, { stage: 'SPEC_READY' });
     try {
       if (!res.ok || !exists(path.join(attempt.workspace.root, specRel))) {
         return blocked(ctx, `Phase ${phase.id}: spec generation failed.`, [res.summary]);
@@ -287,7 +288,7 @@ async function executePhase(
         workspace: null,
         canonical_baseline: null,
       };
-      const { result: res, violation } = await dispatchReadOnly(ctx, planTask);
+      const { result: res, violation } = await dispatchReadOnly(ctx, planTask, { stage: 'PLAN' });
       if (violation.length > 0) {
         return blocked(ctx, `Phase ${phase.id}: planner (read-only) modified the checkout.`, violation);
       }
@@ -331,7 +332,10 @@ async function executePhase(
       workspace: null,
       canonical_baseline: null,
     };
-    const { result: reviewRes, violation: reviewViolation } = await dispatchReadOnly(ctx, reviewTask);
+    const { result: reviewRes, violation: reviewViolation } = await dispatchReadOnly(ctx, reviewTask, {
+      stage: 'PLAN_REVIEW',
+      authorProfiles: ['product-manager', 'system-architect'],
+    });
     if (reviewViolation.length > 0) {
       return blocked(ctx, `Phase ${phase.id}: plan reviewer (read-only) modified the checkout.`, reviewViolation);
     }
@@ -418,7 +422,15 @@ async function executePhase(
     const discardAll = () => attempts.forEach((a) => a.workspace.discard());
     let results: AgentResult[];
     try {
-      results = await dispatchBatch(ctx, attempts.map((a) => a.task));
+      results = await dispatchBatch(ctx, attempts.map((a) => a.task), undefined, (task) => {
+        const scopePaths = [...(task.write_scope ?? []), ...(task.code_files ?? [])];
+        return {
+          stage: 'EXECUTE',
+          requirementTags: inferSecurityTag(scopePaths),
+          paths: scopePaths,
+          highRisk: inferHighRisk(scopePaths),
+        };
+      });
     } catch (err) {
       discardAll();
       pending.forEach((t) => transition(t.id, 'FAILED', 'dispatch error'));
@@ -585,7 +597,12 @@ async function executePhase(
       workspace: null,
       canonical_baseline: null,
     };
-    const { result: crRes, violation: crViolation } = await dispatchReadOnly(ctx, crTask);
+    const reviewedPaths = plan.tasks.flatMap((t) => [...t.files, ...t.write_scope]);
+    const { result: crRes, violation: crViolation } = await dispatchReadOnly(ctx, crTask, {
+      stage: 'CODE_REVIEW',
+      requirementTags: inferSecurityTag(reviewedPaths),
+      authorProfiles: ['senior-software-engineer'],
+    });
     if (crViolation.length > 0) {
       return blocked(ctx, `Phase ${phase.id}: code reviewer (read-only) modified the checkout.`, crViolation);
     }
@@ -647,7 +664,7 @@ async function executePhase(
         canonical_baseline: null,
       };
       const smokeAttempt = prepareAttempt(ctx, smokeTask, { canonicalWriteScope: [screenshotScope] });
-      const smokeRes = await dispatch(ctx, smokeAttempt.task);
+      const smokeRes = await dispatch(ctx, smokeAttempt.task, { stage: 'UI_SMOKE' });
       const smoke = UiSmokePayloadSchema.safeParse(smokeRes.payload);
       try {
         if (!smokeRes.ok || !smoke.success || !smoke.data.passed) {
@@ -870,7 +887,7 @@ async function runRepairAttempt(
   };
   const attempt = prepareAttempt(ctx, repairTask);
   try {
-    const res = await dispatch(ctx, attempt.task);
+    const res = await dispatch(ctx, attempt.task, { stage: 'EXECUTE' });
     if (!res.ok) {
       return blocked(ctx, `Phase ${phaseId}: repair worker failed.`, [res.summary]);
     }

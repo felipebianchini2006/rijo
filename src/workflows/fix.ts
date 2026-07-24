@@ -97,7 +97,7 @@ export async function fixWorkflow(
           'JSON payload: {reproduced, reproduction_steps, hypothesis, root_cause, escalate, escalate_reason}',
         notes: '',
       };
-      const { result: res, violation } = await dispatchReadOnly(ctx, diagTask);
+      const { result: res, violation } = await dispatchReadOnly(ctx, diagTask, { stage: 'DIAGNOSE' });
       if (violation.length > 0) {
         return blocked(ctx, 'Fix diagnosis (read-only) modified the checkout.', violation);
       }
@@ -148,7 +148,7 @@ export async function fixWorkflow(
       const attemptWs = prepareAttempt(ctx, repairTask);
       let applied = false;
       try {
-        const res = await dispatch(ctx, attemptWs.task);
+        const res = await dispatch(ctx, attemptWs.task, { stage: 'REPAIR' });
         const parsed = RepairSchema.safeParse(res.payload);
         if (!res.ok || !parsed.success || !parsed.data.fixed) {
           appendLog(`repair attempt ${attempt} failed: ${res.summary}`);

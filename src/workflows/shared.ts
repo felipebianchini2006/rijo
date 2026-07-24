@@ -11,15 +11,19 @@ import { readState, writeState } from '../core/state.js';
 import { SchemaMismatchError, touchManifest } from '../core/manifest.js';
 import { ensureSchemaCompatible, MigrationError } from '../core/migrate.js';
 import { exists } from '../core/fsx.js';
-import type { RijoConfig } from '../core/schemas/index.js';
+import type { RijoConfig, SupervisorConfig } from '../core/schemas/index.js';
 import type { AgentRunner } from '../agents/runner.js';
-import { UnboundAgentRunner, runBatch, runValidated } from '../agents/runner.js';
-import { tierFor } from '../agents/roles.js';
+import { UnboundAgentRunner } from '../agents/runner.js';
 import { AgentTaskSchema, type AgentTask, type AgentTaskDraft, type AgentResult } from '../agents/protocol.js';
 import type { ShellRunner } from '../core/commands.js';
 import { SystemShellRunner } from '../core/commands.js';
 import type { GitOps } from '../core/git.js';
 import { SystemGit } from '../core/git.js';
+import type { Clock } from '../supervisor/clock.js';
+import { defaultExecutor, type TaskExecutor, type SupervisedDispatch } from './executor.js';
+import { prepareDispatchedTask, type DispatchRouting } from './routing.js';
+
+export type { DispatchRouting } from './routing.js';
 
 export interface WorkflowContext {
   projectRoot: string;
@@ -27,6 +31,8 @@ export interface WorkflowContext {
   config: RijoConfig;
   bus: ProgressBus;
   runner: AgentRunner;
+  /** Sole execution authority: every dispatch is supervised through this. */
+  executor: TaskExecutor;
   shell: ShellRunner;
   git: GitOps;
   now: () => Date;
@@ -34,6 +40,12 @@ export interface WorkflowContext {
 
 export interface WorkflowDeps {
   runner?: AgentRunner;
+  /** Pluggable execution authority (P0.9 injects a real host controller here). */
+  executor?: TaskExecutor;
+  /** Override the supervisor policy (test seam: short deadlines / replacements). */
+  supervisorConfig?: SupervisorConfig;
+  /** Injectable clock for deterministic supervision timing in tests. */
+  clock?: Clock;
   shell?: ShellRunner;
   git?: GitOps;
   sink?: ProgressSink;
@@ -46,16 +58,44 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
   const paths = new RijoPaths(projectRoot);
   const now = deps.now ?? (() => new Date());
   const config = loadConfig(paths);
+  const runner = deps.runner ?? new UnboundAgentRunner();
+  // The executor is the ONLY path to an agent: dispatch/dispatchBatch never
+  // touch the runner directly. The default supervises the in-process runner;
+  // a real host controller can be injected (deps.executor) unchanged.
+  //
+  // A genuinely in-process function call cannot be usefully "replaced" (a
+  // deterministic runner returns the same result on retry and a stuck call
+  // cannot be interrupted), so the implicit default disables replacement
+  // generations — the supervisor still fences a stuck attempt and yields a
+  // BLOCKED diagnostic instead of looping. An EXPLICIT supervisorConfig (a
+  // test seam exercising replacements / short deadlines) is honored verbatim.
+  const supervisorConfig: SupervisorConfig = deps.supervisorConfig ?? {
+    ...config.supervisor,
+    max_replacements_per_task: 0,
+    replacement_backoff_ms: [],
+  };
+  const executor = deps.executor ?? defaultExecutorFor(runner, supervisorConfig, paths, deps.clock);
   return {
     projectRoot,
     paths,
     config,
     bus: new ProgressBus(paths, newRunId(now), deps.sink ?? consoleSink, now),
-    runner: deps.runner ?? new UnboundAgentRunner(),
+    runner,
+    executor,
     shell: deps.shell ?? new SystemShellRunner(config.execution),
     git: deps.git ?? new SystemGit(),
     now,
   };
+}
+
+/** Build the default in-process executor, honoring an optional injected clock. */
+function defaultExecutorFor(
+  runner: AgentRunner,
+  supervisorConfig: SupervisorConfig,
+  paths: RijoPaths,
+  clock?: Clock,
+): TaskExecutor {
+  return defaultExecutor(runner, supervisorConfig, paths, clock);
 }
 
 export class BlockedError extends Error {
@@ -164,18 +204,40 @@ export interface WorkflowOutcome {
 }
 
 /**
- * Inject the role's configured model tier into a task and run it. This is how
- * model routing becomes operational: the deterministic core resolves tier from
- * config.yml and the runner (or host bridge) receives it on every task.
+ * Route a draft through the deterministic model-tier + expert-profile router,
+ * then supervise it. NO draft reaches the executor without routing: the tier
+ * is resolved from config.yml and the expert lenses are stamped on the task
+ * (embedded into the rendered brief). Every dispatch is supervised — a durable
+ * TaskRecord is created before any host starts and no stale/duplicate/fenced
+ * result can ever be applied.
  */
-export async function dispatch(ctx: WorkflowContext, task: AgentTaskDraft): Promise<AgentResult> {
-  const full: AgentTask = AgentTaskSchema.parse({ ...task, tier: task.tier ?? tierFor(ctx.config, task.role) });
-  return runValidated(ctx.runner, full);
+export async function dispatch(
+  ctx: WorkflowContext,
+  task: AgentTaskDraft,
+  routing: DispatchRouting = {},
+): Promise<AgentResult> {
+  const routed = prepareDispatchedTask(ctx.config, task, routing);
+  const full: AgentTask = AgentTaskSchema.parse(routed);
+  return ctx.executor.run({ task: full, role: full.role });
 }
 
-export async function dispatchBatch(ctx: WorkflowContext, tasks: AgentTaskDraft[], max?: number): Promise<AgentResult[]> {
-  const withTier = tasks.map((t) => AgentTaskSchema.parse({ ...t, tier: t.tier ?? tierFor(ctx.config, t.role) }));
-  return runBatch(ctx.runner, withTier, max ?? ctx.config.limits.max_parallel_agents);
+/**
+ * Supervise a batch with independent per-task supervision. A per-item routing
+ * factory lets each draft carry its own stage/tags; omit it to route every
+ * draft by role default.
+ */
+export async function dispatchBatch(
+  ctx: WorkflowContext,
+  tasks: AgentTaskDraft[],
+  max?: number,
+  routing?: (task: AgentTaskDraft, index: number) => DispatchRouting,
+): Promise<AgentResult[]> {
+  const reqs: SupervisedDispatch[] = tasks.map((t, i) => {
+    const routed = prepareDispatchedTask(ctx.config, t, routing ? routing(t, i) : {});
+    const full: AgentTask = AgentTaskSchema.parse(routed);
+    return { task: full, role: full.role };
+  });
+  return ctx.executor.runBatch(reqs, max ?? ctx.config.limits.max_parallel_agents);
 }
 
 /** Attempt bundle: the dispatched task plus its isolated workspace. */
@@ -227,9 +289,14 @@ export function prepareAttempt(
 export async function dispatchReadOnly(
   ctx: WorkflowContext,
   task: AgentTaskDraft,
+  routing: DispatchRouting = {},
 ): Promise<{ result: AgentResult; violation: string[] }> {
   const before = snapshotTree(ctx.projectRoot);
-  const result = await dispatch(ctx, { ...task, write_scope: [], workspace: null, canonical_baseline: canonicalBaselineHash(ctx.paths) });
+  const result = await dispatch(
+    ctx,
+    { ...task, write_scope: [], workspace: null, canonical_baseline: canonicalBaselineHash(ctx.paths) },
+    routing,
+  );
   const delta = diffTrees(before, snapshotTree(ctx.projectRoot));
   return { result, violation: delta.changed };
 }
