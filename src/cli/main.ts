@@ -1,8 +1,11 @@
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { parseArgs } from 'node:util';
 import { RijoPaths } from '../core/paths.js';
+import { TaskRecordSchema, type TaskRecord } from '../core/schemas/index.js';
 import { readStatus, renderStatusLine } from '../core/progress.js';
 import { readState } from '../core/state.js';
+import { loadConfig } from '../core/config.js';
 import { readManifest, RIJO_VERSION } from '../core/manifest.js';
 import { newWorkflow } from '../workflows/new.js';
 import { runWorkflow } from '../workflows/run.js';
@@ -150,18 +153,36 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   const manifest = fs.existsSync(paths.manifest) ? readManifest(paths) : null;
   const status = readStatus(paths);
   const state = readState(paths);
+  const supervised = readSupervisedTasks(paths);
 
   if (values.json) {
     console.log(
       JSON.stringify(
         {
-          schema_version: 1,
+          // v2 is additive over v1: the original fields are unchanged and the
+          // supervisor block is new — older consumers keep working.
+          schema_version: 2,
           rijo_version: RIJO_VERSION,
           initialized: manifest !== null,
           active_milestone: manifest?.active_milestone ?? null,
           milestones: manifest?.milestones ?? [],
           runtime: status,
           checkpoint: state,
+          supervisor: {
+            tasks: supervised.map((t) => ({
+              logical_task_id: t.logical_task_id,
+              role: t.role,
+              state: t.state,
+              attempt_id: t.attempt_id,
+              generation: t.generation,
+              replacements: t.replacement_count,
+              host: t.host,
+              last_heartbeat_at: t.last_heartbeat_at,
+              last_progress_at: t.last_progress_at,
+              hard_deadline_at: t.hard_deadline_at,
+              last_error: t.last_error,
+            })),
+          },
         },
         null,
         2,
@@ -183,7 +204,40 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
     );
     if (state.next_step) console.log(`próximo passo: ${state.next_step}`);
   }
+  // supervisor panel: one block per non-terminal supervised attempt
+  const active = readSupervisedTasks(paths).filter(
+    (t) => !['SUCCEEDED', 'FAILED', 'EXHAUSTED', 'CANCELLED'].includes(t.state),
+  );
+  if (active.length > 0) {
+    const maxReplacements = loadConfig(paths).supervisor.max_replacements_per_task;
+    const age = (iso: string | null) => (iso ? `${Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000))}s` : '—');
+    for (const t of active) {
+      console.log(
+        `${t.role}: attempt ${t.generation}, generation ${t.generation}\n` +
+          `last heartbeat: ${age(t.last_heartbeat_at)}\n` +
+          `last progress: ${age(t.last_progress_at)}\n` +
+          `replacements: ${t.replacement_count}/${maxReplacements}\n` +
+          `state: ${t.state}`,
+      );
+    }
+  }
   return 0;
+}
+
+/** Non-terminal supervised task records from .rijo/runtime/tasks (tolerant read). */
+function readSupervisedTasks(paths: RijoPaths): TaskRecord[] {
+  const dir = path.join(paths.runtimeDir, 'tasks');
+  if (!fs.existsSync(dir)) return [];
+  const out: TaskRecord[] = [];
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.json'))) {
+    try {
+      const parsed = TaskRecordSchema.safeParse(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')));
+      if (parsed.success) out.push(parsed.data);
+    } catch {
+      /* unreadable record: ignored in the read-only panel */
+    }
+  }
+  return out;
 }
 
 const HELP = `rijo — context and autonomous execution framework

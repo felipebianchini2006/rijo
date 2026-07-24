@@ -3,7 +3,9 @@ import { ensureDir, exists, readTextIfExists, readJsonIfExists, writeFileAtomic,
 import { loadConfig } from '../core/config.js';
 import { RijoPaths } from '../core/paths.js';
 import type { ModelRole } from '../core/schemas/index.js';
-import { claudeTierForRole } from '../agents/roles.js';
+import { claudeTierForRole, resolveClaudeTier } from '../agents/roles.js';
+import { EXPERT_PROFILES } from '../experts/catalog.js';
+import { renderProfileBrief } from '../experts/embed.js';
 import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
 
 const SKILLS = ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
@@ -79,6 +81,42 @@ export function generateClaudeAdapter(projectRoot: string): AdapterReport {
       `---\nname: ${agent.name}\ndescription: ${agent.description}\nrole: ${agent.role}\ntier: ${tier}\nmodel: ${resolved.model}\n---\n\n${agent.body}\n`,
     );
     report.generated.push(`.claude/agents/${agent.name}.md`);
+  }
+
+  // expert profiles — .claude/agents/rijo-expert-<id>.md, one file per
+  // catalog entry, generated from the SAME source as router.ts/embed.ts
+  // (src/experts/catalog.ts). Writers (task-scope) map to the economical
+  // coding tier and get edit access; advisors (none) map to the strongest
+  // independent tier and stay read-only.
+  const agentsDir = path.join(projectRoot, '.claude', 'agents');
+  ensureDir(agentsDir);
+  for (const profile of EXPERT_PROFILES) {
+    const isWriter = profile.default_write_policy === 'task-scope';
+    const tierName = isWriter ? 'economical-coding' : 'strongest-independent';
+    const resolvedRole: ModelRole = isWriter ? 'worker' : 'reviewer';
+    const resolved = resolveClaudeTier(config, tierName, resolvedRole);
+    const maxTurns = isWriter ? 30 : 10;
+    const permissionMode = isWriter ? 'acceptEdits' : 'plan';
+    const disallowedTools = isWriter
+      ? profile.denied_tools
+      : Array.from(new Set([...profile.denied_tools, 'Write', 'Edit', 'Bash']));
+    const body = renderProfileBrief([profile.id]);
+    const frontmatter = [
+      '---',
+      `name: rijo-expert-${profile.id}`,
+      `description: ${JSON.stringify(profile.mission)}`,
+      `expert_profile: ${profile.id}`,
+      `tier: ${tierName}`,
+      `model: ${resolved.model}`,
+      `maxTurns: ${maxTurns}`,
+      `tools: [${profile.default_tools.join(', ')}]`,
+      `disallowedTools: [${disallowedTools.join(', ')}]`,
+      `permissionMode: ${permissionMode}`,
+      '---',
+      '',
+    ].join('\n');
+    writeFileAtomic(path.join(agentsDir, `rijo-expert-${profile.id}.md`), `${frontmatter}${body}\n`);
+    report.generated.push(`.claude/agents/rijo-expert-${profile.id}.md`);
   }
 
   // CLAUDE.md idempotent block

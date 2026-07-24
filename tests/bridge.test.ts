@@ -156,18 +156,29 @@ interface Host {
   callWorkflow: (id: number, method: string, params: Record<string, unknown>) => Promise<any>;
   seenTasks: string[];
   progress: string[];
+  /** v2 host.capabilities payloads the core announced (tolerated by a v1 host). */
+  capabilities: Array<{ protocol_version: number; methods: string[] }>;
 }
 
 function startHost(dir: string): Host {
   const transport = new LoopbackTransport();
   const seenTasks: string[] = [];
   const progress: string[] = [];
+  const capabilities: Array<{ protocol_version: number; methods: string[] }> = [];
   const pending = new Map<number, (msg: any) => void>();
 
   transport.onCore = (msg: any) => {
     if (msg.type === 'notification' && msg.method === 'progress') {
       progress.push(msg.params.line);
       return;
+    }
+    if (msg.type === 'notification' && msg.method === 'host.capabilities') {
+      // v2 handshake announced on start; a v1 host would simply ignore it.
+      capabilities.push(msg.params);
+      return;
+    }
+    if (msg.type === 'notification' && msg.method === 'host.shutdown') {
+      return; // coordinated-teardown announcement; nothing to do in-memory
     }
     if (msg.type === 'response' && pending.has(msg.id)) {
       const resolve = pending.get(msg.id)!;
@@ -194,7 +205,7 @@ function startHost(dir: string): Host {
       transport.deliver({ type: 'request', method, id, params });
     });
 
-  return { transport, callWorkflow, seenTasks, progress };
+  return { transport, callWorkflow, seenTasks, progress, capabilities };
 }
 
 describe('host↔core JSON-RPC bridge', () => {
@@ -219,6 +230,11 @@ describe('host↔core JSON-RPC bridge', () => {
     expect(host.seenTasks.some((id) => id.startsWith('new-research'))).toBe(true);
     // progress notifications streamed as JSON over the same pipe
     expect(host.progress.length).toBeGreaterThan(0);
+
+    // v2: the core announced host.capabilities on start (protocol_version 2)
+    expect(host.capabilities.length).toBeGreaterThan(0);
+    expect(host.capabilities[0]!.protocol_version).toBe(2);
+    expect(host.capabilities[0]!.methods).toContain('agent.runTask');
 
     // M001 was created on disk
     const paths = new RijoPaths(root);

@@ -204,8 +204,63 @@ class ChildHost {
     await this.exited;
   }
 
+  /** Close stdin without awaiting — the caller awaits `waitExit()` under a bound. */
+  endStdin(): void {
+    this.child.stdin.end();
+  }
+
+  /** SIGKILL the child and wait for the OS to reap it. */
+  async killAndWait(): Promise<void> {
+    if (this.exitCode === null && this.exitSignal === null) this.child.kill('SIGKILL');
+    await this.exited;
+  }
+
+  waitExit(): Promise<void> {
+    return this.exited;
+  }
+
+  get pid(): number | undefined {
+    return this.child.pid;
+  }
+
+  get alive(): boolean {
+    return this.exitCode === null && this.exitSignal === null;
+  }
+
+  /** Hold a workflow request open: never answers agent.runTask, so the child
+   *  stays mid-workflow until we kill it or close its stdin. */
+  beginWorkflowNoAnswer(id: number, method: string, params: Record<string, unknown>): void {
+    // Deliberately do NOT register a pending resolver — we never expect a reply.
+    this.send({ type: 'request', method, id, params });
+  }
+
+  /** True once at least one agent.runTask has crossed the wire (workflow underway). */
+  get sawAgentTask(): boolean {
+    return this.seenTasks.length > 0;
+  }
+
   kill(): void {
     if (this.exitCode === null) this.child.kill('SIGKILL');
+  }
+}
+
+/** Poll a predicate under a real-time bound (child-process timing is not fake-able). */
+async function waitUntil(pred: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const start = Date.now();
+  while (!pred()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitUntil timed out');
+    await new Promise((res) => setTimeout(res, 10));
+  }
+}
+
+/** True while a pid is still a live process (ESRCH once reaped). */
+function pidAlive(pid: number | undefined): boolean {
+  if (pid === undefined) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -261,6 +316,62 @@ describe('host↔core JSON-RPC bridge (real child process)', () => {
         await host.endAndWait();
         expect(host.exitCode, host.stderr).toBe(0);
         expect(host.exitSignal).toBeNull();
+      } finally {
+        host.kill();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'killing the child mid-workflow surfaces termination to the host',
+    async () => {
+      const host = new ChildHost(root);
+      try {
+        // Start a workflow but never answer its agent.runTask calls: the child
+        // is now blocked mid-workflow with an in-flight agent task.
+        host.beginWorkflowNoAnswer(1, 'workflow.new', { planFile: '@PLANO.md' });
+        await waitUntil(() => host.sawAgentTask);
+        expect(host.alive).toBe(true);
+        const pid = host.pid;
+
+        // Kill it hard. The host observes the pipe closing (child terminated).
+        await host.killAndWait();
+        expect(host.alive).toBe(false);
+        expect(host.exitSignal).toBe('SIGKILL');
+        // The OS reaped it: no orphaned child process remains.
+        await waitUntil(() => !pidAlive(pid));
+        expect(pidAlive(pid)).toBe(false);
+      } finally {
+        host.kill();
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'closing stdin mid-workflow shuts the child down cleanly within the grace window',
+    async () => {
+      const host = new ChildHost(root);
+      try {
+        // Block the child mid-workflow (no agent answers), then close its stdin.
+        host.beginWorkflowNoAnswer(1, 'workflow.new', { planFile: '@PLANO.md' });
+        await waitUntil(() => host.sawAgentTask);
+        const pid = host.pid;
+
+        host.endStdin();
+        // Coordinated shutdown resolves serve() → the process exits 0, well
+        // within the 5s grace (plus generous CI slack), never left hanging.
+        await Promise.race([
+          host.waitExit(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('child did not exit after stdin close')), 30_000)),
+        ]);
+        expect(host.alive).toBe(false);
+        expect(host.exitCode, host.stderr).toBe(0);
+        expect(host.exitSignal).toBeNull();
+        // Nothing left alive.
+        await waitUntil(() => !pidAlive(pid));
+        expect(pidAlive(pid)).toBe(false);
       } finally {
         host.kill();
       }

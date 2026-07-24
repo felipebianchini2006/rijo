@@ -61,9 +61,9 @@ describe('runCli', () => {
 
     const parsed = JSON.parse(logged());
     expect(Object.keys(parsed).sort()).toEqual(
-      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'milestones', 'runtime', 'checkpoint'].sort(),
+      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'milestones', 'runtime', 'checkpoint', 'supervisor'].sort(),
     );
-    expect(parsed.schema_version).toBe(1);
+    expect(parsed.schema_version).toBe(2);
     expect(parsed.rijo_version).toBe('0.1.0-alpha.1');
     expect(parsed.initialized).toBe(true);
     expect(parsed.active_milestone).toBe('M001');

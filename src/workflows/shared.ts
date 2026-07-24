@@ -5,7 +5,7 @@ import { canonicalBaselineHash } from '../core/manifest.js';
 import { reconcileTransactions, type TxnHooks } from '../core/txn.js';
 import { loadConfig } from '../core/config.js';
 import { ProgressBus, consoleSink, newRunId, type ProgressSink } from '../core/progress.js';
-import { acquireLock, releaseLock } from '../core/locks.js';
+import { acquireLock, RECOMMENDED_RENEW_MS } from '../core/locks.js';
 import { readState, writeState } from '../core/state.js';
 import { SchemaMismatchError, touchManifest } from '../core/manifest.js';
 import { ensureSchemaCompatible, MigrationError } from '../core/migrate.js';
@@ -90,9 +90,33 @@ export function guardSchema(ctx: WorkflowContext): WorkflowOutcome | null {
   }
 }
 
-/** Run a workflow body under the runtime lock; always releases. */
-export async function withLock<T>(ctx: WorkflowContext, body: () => Promise<T>): Promise<T> {
-  acquireLock(ctx.paths.lock, ctx.bus.runId, ctx.now);
+/**
+ * Run a workflow body under the runtime lock; renews the lease periodically; always releases.
+ * ttlMs/renewMs are test seams (production callers rely on the library defaults).
+ */
+export async function withLock<T>(
+  ctx: WorkflowContext,
+  body: () => Promise<T>,
+  opts: { ttlMs?: number; renewMs?: number } = {},
+): Promise<T> {
+  const handle = acquireLock(ctx.paths.lock, ctx.bus.runId, ctx.now, { ttlMs: opts.ttlMs });
+  if (handle.reclaimedAttempts.length > 0) {
+    ctx.bus.emit(
+      'lock.reclaimed',
+      { message: `lock reciclado; ${handle.reclaimedAttempts.length} attempt(s) órfão(s) para recovery` },
+      { attempts: handle.reclaimedAttempts },
+    );
+  }
+  // Real (non-injected) timers: the lease must keep renewing on wall-clock
+  // time regardless of ctx.now, and unref() so it never keeps the process alive.
+  const renewTimer = setInterval(() => {
+    try {
+      handle.renew();
+    } catch {
+      /* best-effort renewal; a missed tick is recovered by the next one */
+    }
+  }, opts.renewMs ?? RECOMMENDED_RENEW_MS);
+  renewTimer.unref();
   try {
     // Startup reconciliation: an interrupted milestone transaction is rolled
     // back (no commit marker) or deterministically rolled forward (marker
@@ -106,7 +130,8 @@ export async function withLock<T>(ctx: WorkflowContext, body: () => Promise<T>):
     }
     return await body();
   } finally {
-    releaseLock(ctx.paths.lock, ctx.bus.runId);
+    clearInterval(renewTimer);
+    handle.release();
   }
 }
 

@@ -69,7 +69,7 @@ describe('distribution E2E (npm pack + install)', () => {
       const status = JSON.parse(statusOut);
       expect(status.initialized).toBe(false);
       expect(status.rijo_version).toBe('0.1.0-alpha.1');
-      expect(status.schema_version).toBe(1);
+      expect(status.schema_version).toBe(2);
 
       // ---- P0.2: the published programmatic API is importable from the tarball.
       // The audit reproduced ERR_MODULE_NOT_FOUND here before package "exports"
