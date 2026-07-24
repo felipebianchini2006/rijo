@@ -61,6 +61,10 @@ export class RijoPaths {
   get lock(): string {
     return path.join(this.runtimeDir, 'lock.json');
   }
+  /** Durable phase-finalization marker (crash-safe, resumable). */
+  get finalize(): string {
+    return path.join(this.runtimeDir, 'finalize.json');
+  }
   get archiveDir(): string {
     return path.join(this.root, 'archive');
   }

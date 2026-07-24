@@ -9,6 +9,8 @@ export interface GitStatus {
 export interface GitOps {
   status(cwd: string): GitStatus;
   headCommit(cwd: string): string | null;
+  /** Subject line of HEAD's commit message. Null outside a repo / no commits. */
+  headSubject(cwd: string): string | null;
   /** Commit only the given paths (staged individually). Never `git add -A`. */
   commitPaths(cwd: string, message: string, paths: string[]): string | null;
   tag(cwd: string, name: string, message: string): boolean;
@@ -46,6 +48,11 @@ export class SystemGit implements GitOps {
 
   headCommit(cwd: string): string | null {
     const r = git(cwd, ['rev-parse', 'HEAD']);
+    return r.code === 0 ? r.out : null;
+  }
+
+  headSubject(cwd: string): string | null {
+    const r = git(cwd, ['log', '-1', '--pretty=%s']);
     return r.code === 0 ? r.out : null;
   }
 
@@ -110,6 +117,9 @@ export class FakeGit implements GitOps {
   }
   headCommit(): string | null {
     return this.commits.length ? this.commits[this.commits.length - 1]!.hash : null;
+  }
+  headSubject(): string | null {
+    return this.commits.length ? this.commits[this.commits.length - 1]!.message : null;
   }
   commitPaths(_cwd: string, message: string, paths: string[]): string | null {
     if (!this.repo || paths.length === 0) return null;
