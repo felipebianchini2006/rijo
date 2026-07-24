@@ -21,7 +21,7 @@ import {
   PatchConflictError,
 } from '../core/workspace.js';
 import { redact } from '../security/redact.js';
-import { PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
+import { PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, looseBool, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
 import type { CommandEvidence } from '../core/commands.js';
 import type { AgentTask, AgentTaskDraft, AgentResult } from '../agents/protocol.js';
 import {
@@ -35,6 +35,7 @@ import {
   guardSchema,
   replaceableAttempt,
   dispatchReadOnly,
+  isWorkflowCancellation,
   type ReplaceableAttempt,
   type WorkflowContext,
   type WorkflowDeps,
@@ -49,7 +50,7 @@ export interface RunOptions {
 }
 
 const ReviewPayloadSchema = z.object({
-  approved: z.boolean(),
+  approved: looseBool(false),
   findings: z
     .array(
       z.object({
@@ -64,7 +65,7 @@ const ReviewPayloadSchema = z.object({
 type ReviewPayload = z.infer<typeof ReviewPayloadSchema>;
 
 const UiSmokePayloadSchema = z.object({
-  passed: z.boolean(),
+  passed: looseBool(false),
   console_errors: z.array(z.string()).default([]),
   network_errors: z.array(z.string()).default([]),
   screenshot: z.string().nullable().default(null),
@@ -260,14 +261,14 @@ async function executePhase(
       const planTask: AgentTaskDraft = {
         id: `plan-${phase.id}-r${revisions}`,
         role: 'planner',
-        objective: `Produce the execution plan for phase ${phase.id}: between 2 and 4 tasks, exact files or code regions, dependencies, per-worker write scope, tests and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Set tdd=true for testable behavior.`,
+        objective: `Produce the execution plan for phase ${phase.id}: between 2 and 4 tasks, exact files or code regions, dependencies, per-worker write scope, tests and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
         canonical_files: [paths.rules, pp.spec, milestone.paths.requirements].filter(exists),
         code_files: [],
         write_scope: [],
-        acceptance_criteria: ['2-4 tasks', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
+        acceptance_criteria: ['2-4 tasks', 'every task writes at least one concrete file (non-empty files[] and write_scope[])', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
         verification_commands: [],
         return_format:
-          'JSON payload matching PhasePlan: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[], write_scope[], depends_on[], parallel, tdd, tests[], evidence_expected}]}',
+          'JSON payload matching PhasePlan: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 real path*/], write_scope[/*>=1 real path*/], depends_on[], parallel, tdd, tests[], evidence_expected}]}. Never leave files[] or write_scope[] empty.',
         notes: reviewNotes.length ? `Previous review issues to address:\n${reviewNotes.join('\n')}` : '',
         workspace: null,
         canonical_baseline: null,
@@ -276,9 +277,40 @@ async function executePhase(
       if (violation.length > 0) {
         return blocked(ctx, `Phase ${phase.id}: planner (read-only) modified the checkout.`, violation);
       }
+      // A planner dispatch that the host could not deliver (ok:false — e.g. an
+      // intermittent headless read-only glitch where the model produced no
+      // parseable result) is RECOVERABLE, not fatal: re-plan within the same
+      // plan_revisions budget rather than abandoning the phase on a transient
+      // host blip. Only an exhausted budget blocks.
+      if (!res.ok) {
+        if (isWorkflowCancellation(res) || revisions >= config.limits.plan_revisions) {
+          return blocked(ctx, `Phase ${phase.id}: planning failed after ${revisions} revisions.`, [res.summary]);
+        }
+        revisions++;
+        reviewNotes = [
+          `The previous planning attempt returned no usable plan (${res.summary.slice(0, 200)}). Return the plan ONLY as the JSON payload described in the return format — do not write any file.`,
+        ];
+        plan = null;
+        continue;
+      }
       const parsed = PhasePlanSchema.safeParse(res.payload);
-      if (!res.ok || !parsed.success) {
-        return blocked(ctx, `Phase ${phase.id}: planning failed.`, [res.summary, ...(parsed.success ? [] : [parsed.error.message])]);
+      if (!parsed.success) {
+        // A schema-invalid plan (e.g. a task missing files/write_scope) is a
+        // RECOVERABLE planner error, not a fatal one: feed the precise shape
+        // violations back and re-plan within the same plan_revisions budget the
+        // lint loop uses — a hard block here would abandon a phase on a mistake
+        // the planner can trivially correct on the next turn.
+        if (revisions >= config.limits.plan_revisions) {
+          return blocked(ctx, `Phase ${phase.id}: planner returned an invalid plan after ${revisions} revisions.`, [
+            parsed.error.message,
+          ]);
+        }
+        revisions++;
+        reviewNotes = parsed.error.issues.map(
+          (i) => `Invalid plan payload at ${i.path.join('.') || '(root)'}: ${i.message}. Every task needs a non-empty files[] and write_scope[]; ids must be T01..T04; return a payload matching the PhasePlan schema exactly.`,
+        );
+        plan = null;
+        continue;
       }
       plan = parsed.data;
       plan.phase = phase.id;
@@ -323,20 +355,42 @@ async function executePhase(
     if (reviewViolation.length > 0) {
       return blocked(ctx, `Phase ${phase.id}: plan reviewer (read-only) modified the checkout.`, reviewViolation);
     }
-    const review = ReviewPayloadSchema.safeParse(reviewRes.payload);
-    if (!reviewRes.ok || !review.success) {
-      return blocked(ctx, `Phase ${phase.id}: plan review failed to produce a verdict.`, [reviewRes.summary]);
+    // An ATTEMPT failure (ok:false — e.g. an intermittent headless read-only
+    // glitch) is RECOVERABLE: re-run the plan/review cycle within the
+    // plan_revisions budget rather than abandoning the phase on a transient blip.
+    if (!reviewRes.ok) {
+      if (isWorkflowCancellation(reviewRes) || revisions >= config.limits.plan_revisions) {
+        return blocked(ctx, `Phase ${phase.id}: plan review failed to produce a verdict after ${revisions} revisions.`, [reviewRes.summary]);
+      }
+      revisions++;
+      reviewNotes = [`The previous review returned no usable verdict (${reviewRes.summary.slice(0, 200)}).`];
+      plan = null;
+      continue;
     }
-    if (review.data.approved) break;
+    const review = ReviewPayloadSchema.safeParse(reviewRes.payload);
+    // Accept the plan when the reviewer approves OR (verdict parsed) raised no
+    // structurally-BLOCKING finding. Only blocker/critical findings hold a plan:
+    // a mere `high` nitpick (a missing dependency note, an under-specified
+    // acceptance line) is routinely over-rated by the reviewer and is caught
+    // anyway downstream by the deterministic lint, the verification commands and
+    // the independent code review — it must not deadlock the phase. A COMPLETED
+    // but unparseable verdict is treated as "revise" (never silent approval).
+    // Everything is bounded by the plan_revisions budget.
+    const blockingFindings = review.success
+      ? review.data.findings.filter((f) => f.severity === 'blocker' || f.severity === 'critical')
+      : [];
+    if (review.success && (review.data.approved || blockingFindings.length === 0)) break;
     if (revisions >= config.limits.plan_revisions) {
       return blocked(
         ctx,
         `Phase ${phase.id}: plan not approved after ${config.limits.plan_revisions} revisions.`,
-        review.data.findings.map((f) => `${f.type}/${f.severity}: ${f.description}`),
+        review.success ? blockingFindings.map((f) => `${f.type}/${f.severity}: ${f.description}`) : [reviewRes.summary],
       );
     }
     revisions++;
-    reviewNotes = review.data.findings.map((f) => `${f.type}: ${f.description}`);
+    reviewNotes = review.success
+      ? blockingFindings.map((f) => `${f.type}/${f.severity}: ${f.description}`)
+      : [`Reviewer verdict (unstructured): ${reviewRes.summary}`];
     plan = null;
   }
   bus.emit('run.plan_approved', { message: 'plano aprovado' });
@@ -389,7 +443,7 @@ async function executePhase(
       const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
-        objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation.`,
+        objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You have NO shell — do NOT run the verification commands, tests, npm, git or any other process yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
         canonical_files: [ctx.paths.rules, pp.spec, pp.plan].filter(exists),
         code_files: t.files.map((f) => path.resolve(ctx.projectRoot, f)),
         write_scope: t.write_scope,
@@ -597,9 +651,36 @@ async function executePhase(
     if (crViolation.length > 0) {
       return blocked(ctx, `Phase ${phase.id}: code reviewer (read-only) modified the checkout.`, crViolation);
     }
+    // An ATTEMPT failure (ok:false — e.g. an intermittent headless read-only
+    // glitch) is RECOVERABLE: the code is already implemented and verified, so
+    // simply re-run the verify+review cycle within the review_loops budget
+    // rather than discarding a green phase on a transient review blip.
+    // A COMPLETED review whose verdict is not in schema is NOT auto-approval
+    // (that would silently drop the gate): treat it as an unresolved review with
+    // the reviewer's summary as the finding, and run the bounded repair loop
+    // below — it only blocks once the review_loops budget is exhausted.
+    if (!crRes.ok) {
+      if (isWorkflowCancellation(crRes) || reviewLoops >= config.limits.review_loops) {
+        return blocked(ctx, `Phase ${phase.id}: code review failed to produce a verdict after ${config.limits.review_loops} cycles.`, [crRes.summary]);
+      }
+      reviewLoops++;
+      continue;
+    }
     const cr = ReviewPayloadSchema.safeParse(crRes.payload);
-    if (!crRes.ok || !cr.success) {
-      return blocked(ctx, `Phase ${phase.id}: code review failed to produce a verdict.`, [crRes.summary]);
+    if (!cr.success) {
+      if (reviewLoops >= config.limits.review_loops) {
+        return blocked(ctx, `Phase ${phase.id}: code review produced no usable verdict after ${config.limits.review_loops} cycles.`, [crRes.summary]);
+      }
+      reviewLoops++;
+      const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
+        id: `review-fix-${phase.id}-l${reviewLoops}`,
+        objective: 'Address the reviewer feedback below with minimal coherent changes; keep all verification commands passing.',
+        acceptance: ['Reviewer feedback addressed', 'Verification commands still pass'],
+        commands: [],
+        notes: `Reviewer verdict (unstructured): ${crRes.summary}`,
+      });
+      if (repairOutcome) return repairOutcome;
+      continue;
     }
     writeReviewDoc(pp, cr.data, reviewLoops, now);
     touchManifest(paths, () => {}, now);
@@ -710,7 +791,7 @@ async function runRepairAttempt(
   const repairTask: AgentTaskDraft = {
     id: spec.id,
     role: 'worker',
-    objective: spec.objective,
+    objective: `${spec.objective} You have NO shell — do NOT run the verification commands, tests, npm, git or any other process yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
     canonical_files: [pp.spec, pp.plan].filter(exists),
     code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
     write_scope: plan.tasks.flatMap((t) => t.write_scope),

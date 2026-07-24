@@ -64,9 +64,37 @@ export function claudeDenySettings(extra: readonly string[] = []): string {
   return JSON.stringify({ permissions: { deny: sensitiveDenyRules(extra) } });
 }
 
-/** Permission posture for a task: workers accept edits (workspace only), everyone else is read-only. */
+/** Permission posture for a role, absent any task-specific write authorization. */
 export function permissionModeForRole(role: ModelRole): string {
   return WRITER_ROLES.has(role) ? 'acceptEdits' : 'plan';
+}
+
+/** True when the task writes into its own isolated workspace (worker / artifact author). */
+export function taskIsWriter(task: AgentTask): boolean {
+  return Boolean(task.workspace) && task.write_scope.length > 0;
+}
+
+/**
+ * Permission posture for a concrete task. A task authorized to write into its
+ * OWN isolated workspace — a non-empty write scope plus an allocated workspace —
+ * runs `acceptEdits`. This covers the worker AND canonical-artifact writers
+ * (e.g. the SPEC.md author, whose role is `planner` yet legitimately produces a
+ * file inside its workspace): without this, such a writer is launched read-only
+ * and the real host cannot write its artifact at all. The write is still fully
+ * fenced — cwd is the workspace, the project root is never added, deny rules
+ * block credentials, and the real filesystem delta is validated against the
+ * write scope afterward.
+ *
+ * A read-only, payload-returning task (reviewer/researcher/planner with no
+ * workspace) stays read-only in `plan` mode. (Headless `plan` mode is not
+ * perfectly reliable — the model can occasionally reach for an unavailable
+ * ExitPlanMode — but `default` mode is worse: the model tries to WRITE its
+ * output file and either stalls on a permission prompt or fails when the write
+ * is denied. The workflow re-dispatches an occasional non-parseable read-only
+ * result instead.)
+ */
+export function permissionModeForTask(task: AgentTask): string {
+  return taskIsWriter(task) ? 'acceptEdits' : permissionModeForRole(task.role);
 }
 
 export interface ClaudeLaunchOptions {
@@ -131,7 +159,7 @@ export function buildClaudeLaunch(task: AgentTask, config: RijoConfig, opts: Cla
   validateClaudeModel(tier.model);
 
   const cwd = task.workspace?.root ?? opts.projectRoot ?? process.cwd();
-  const permissionMode = opts.permissionMode ?? permissionModeForRole(task.role);
+  const permissionMode = opts.permissionMode ?? permissionModeForTask(task);
 
   const args = [
     '-p',
@@ -148,6 +176,11 @@ export function buildClaudeLaunch(task: AgentTask, config: RijoConfig, opts: Cla
     '--settings',
     claudeDenySettings(opts.extraDenyRules),
   ];
+  // A read-only, payload-returning task runs in `default` mode: auto-allow the
+  // non-mutating context tools so it can read the canonical files named in its
+  // brief without a permission prompt (which headless `-p` would auto-deny),
+  // then emit its JSON. Writers get their tools from `default`/acceptEdits and
+  // an explicit override still wins.
   if (opts.allowedTools && opts.allowedTools.length) args.push('--allowedTools', opts.allowedTools.join(','));
 
   return { command: opts.bin ?? 'claude', args, cwd };

@@ -283,6 +283,16 @@ export class Supervisor {
     this.active.set(logicalId, st);
     opts.onProgress?.(() => this.notifyProgress(logicalId));
 
+    // Keep the Node event loop alive for the ENTIRE duration of this supervised
+    // task. Between attempts — notably the replacement backoff — the failed host
+    // child has already exited and every Clock timer is deliberately unref'd, so
+    // without one explicit ref'd handle the process would drain its loop and
+    // exit 0 mid-supervision, silently abandoning an in-flight turnkey workflow
+    // (phase left IN_PROGRESS, no result). This handle is ref'd on purpose and
+    // cleared the instant the task reaches a terminal outcome (finally below),
+    // so a settled supervisor never keeps the process alive.
+    const keepAlive: NodeJS.Timeout = setInterval(() => {}, 60_000);
+
     const failures: string[] = [];
     let currentTask = task;
     let currentDispose: (() => void | Promise<void>) | null = null;
@@ -420,6 +430,8 @@ export class Supervisor {
         generation: cur?.generation ?? null,
         lease_id: cur?.lease_id ?? null,
       };
+    } finally {
+      clearInterval(keepAlive);
     }
   }
 

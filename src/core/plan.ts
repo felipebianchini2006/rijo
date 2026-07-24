@@ -118,6 +118,43 @@ export function lintPlan(
         fix: 'Declare the exact files or globs the worker may write',
       });
     }
+    // A worker task may NEVER write inside `.rijo/`: those are canonical framework
+    // artifacts (spec, plan, evidence, roadmap, state) written by the core itself,
+    // and any worker write there is rejected at execution as a boundary violation.
+    // A planner sometimes invents an "evidence"/"verify" task pointed at
+    // `.rijo/.../EVIDENCE.md`; catch it here so it is revised into a real source
+    // task (or dropped) instead of hard-failing mid execution.
+    for (const scope of t.write_scope) {
+      const normalized = scope.replace(/^\.\//, '');
+      if (normalized === '.rijo' || normalized.startsWith('.rijo/')) {
+        issues.push({
+          code: 'RIJO_WRITE_SCOPE',
+          message: `Task ${t.id} declares a write scope inside .rijo/ ("${scope}")`,
+          fix: 'Worker tasks write source/test files only; the framework owns every .rijo/ artifact (spec, plan, evidence). Remove the .rijo/ path from the write scope.',
+        });
+      }
+    }
+    // A task's tests are RUN verbatim as verification commands under the safe
+    // execution policy, which rejects two things a planner commonly emits and
+    // that would hard-block the phase mid verification: (a) a PATH-QUALIFIED
+    // executable (a bare test file such as "test/add.test.js" where a command
+    // belongs), and (b) shell METACHARACTERS (e.g. an inline `node -e "...( )..."`
+    // script, or a piped `cat ... | curl ...`). Catch both at plan time so the
+    // planner revises them into a plain command (e.g. `node --test`). A bare
+    // non-path, metacharacter-free command (even a non-allowlisted one) is left
+    // to the execution policy at run time.
+    for (const cmd of t.tests) {
+      const executable = cmd.trim().split(/\s+/)[0] ?? '';
+      const pathQualified = executable.includes('/') || executable.includes('\\');
+      const hasMetachar = /[|&;<>`$()\n\r*?~!\\]/.test(cmd);
+      if (pathQualified || hasMetachar) {
+        issues.push({
+          code: 'INVALID_TEST_COMMAND',
+          message: `Task ${t.id} test "${cmd}" is not a plain runnable command (${pathQualified ? 'file path' : 'shell metacharacters'})`,
+          fix: 'Use a plain command with a bare executable and no shell operators, e.g. `node --test` or `node --test test/add.test.js` — never a bare file path or an inline shell/`node -e` script',
+        });
+      }
+    }
   }
   // cycle detection via wave computation
   try {

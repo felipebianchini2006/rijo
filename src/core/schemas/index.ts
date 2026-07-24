@@ -2,6 +2,27 @@ import { z } from 'zod';
 
 export const SCHEMA_VERSION = 2;
 
+/**
+ * A boolean field an LLM fills that may arrive as a string ("true"/"false"/
+ * "yes"/"1"/"0"): coerce the common textual forms so a correctly-INTENDED value
+ * in a slightly off-type shape is honored instead of failing a whole payload,
+ * and fall back (via `.catch`) to `fallback` for anything unrecognizable. Used
+ * only for model-authored booleans — never for core-managed state.
+ */
+export function looseBool(fallback: boolean): z.ZodType<boolean> {
+  return z
+    .preprocess((v) => {
+      if (typeof v === 'boolean') return v;
+      if (typeof v === 'string') {
+        const s = v.trim().toLowerCase();
+        if (['true', '1', 'yes'].includes(s)) return true;
+        if (['false', '0', 'no'].includes(s)) return false;
+      }
+      return v;
+    }, z.boolean())
+    .catch(fallback) as unknown as z.ZodType<boolean>;
+}
+
 /** Model roles are abstract tiers; adapters map them to concrete models. */
 export const ModelRoleSchema = z.enum(['lead', 'reviewer', 'planner', 'worker', 'researcher', 'qa']);
 export type ModelRole = z.infer<typeof ModelRoleSchema>;
@@ -432,8 +453,8 @@ export const PlanTaskSchema = z.object({
   files: z.array(z.string()).min(1),
   write_scope: z.array(z.string()).min(1),
   depends_on: z.array(z.string()).default([]),
-  parallel: z.boolean().default(false),
-  tdd: z.boolean().default(false),
+  parallel: looseBool(false),
+  tdd: looseBool(false),
   tests: z.array(z.string()).default([]),
   evidence_expected: z.string().min(1),
   /**

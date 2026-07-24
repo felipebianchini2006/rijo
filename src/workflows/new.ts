@@ -30,7 +30,7 @@ import {
 import { MilestoneTransaction } from '../core/txn.js';
 import { renderRequirements, renderRoadmap, readRequirements, readRoadmap } from '../core/roadmap.js';
 import { validateTraceability } from '../core/traceability.js';
-import { ManifestSchema, RequirementSchema, RoadmapPhaseSchema } from '../core/schemas/index.js';
+import { ManifestSchema, RequirementSchema, RoadmapPhaseSchema, looseBool } from '../core/schemas/index.js';
 import { ResearchStore } from '../research/cache.js';
 import { renderBrief } from '../agents/prompts.js';
 import { AgentTaskSchema, type AgentTaskDraft } from '../agents/protocol.js';
@@ -43,6 +43,7 @@ import {
   failed,
   dispatch,
   dispatchBatch,
+  isWorkflowCancellation,
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
@@ -68,10 +69,11 @@ export const PlanExtractionSchema = z.object({
     z.object({
       description: z.string(),
       acceptance: z.string(),
-      non_functional: z.boolean().default(false),
-      classification: z
-        .enum(['NEW', 'CHANGE', 'REMOVE', 'CARRYOVER', 'UNCHANGED_DEPENDENCY'])
-        .default('NEW'),
+      non_functional: looseBool(false),
+      // Out-of-vocabulary classifications (a model confusing this field with,
+      // e.g., "functional") fall back to NEW — the only correct value on a
+      // greenfield first milestone anyway; a real CHANGE/REMOVE is still honored.
+      classification: z.enum(['NEW', 'CHANGE', 'REMOVE', 'CARRYOVER', 'UNCHANGED_DEPENDENCY']).catch('NEW'),
     }),
   ),
   phases: z.array(
@@ -79,11 +81,11 @@ export const PlanExtractionSchema = z.object({
       name: z.string(),
       requirement_indexes: z.array(z.number().int()),
       depends_on_indexes: z.array(z.number().int()).default([]),
-      ui_surface: z.boolean().default(false),
+      ui_surface: looseBool(false),
     }),
   ),
   research_topics: z
-    .array(z.object({ key: z.string(), topic: z.string(), volatile: z.boolean().default(true) }))
+    .array(z.object({ key: z.string(), topic: z.string(), volatile: looseBool(true) }))
     .default([]),
 });
 export type PlanExtraction = z.infer<typeof PlanExtractionSchema>;
@@ -191,15 +193,47 @@ export async function newWorkflow(
         'JSON payload matching the PlanExtraction schema: {project_name, project_summary, stack_summary, rules[], out_of_scope[], acceptance[], requirements[{description, acceptance, non_functional, classification}], phases[{name, requirement_indexes[], depends_on_indexes[], ui_surface}], research_topics[{key, topic, volatile}]}',
       notes: [previousContext, brown.stackNotes.join('\n')].filter(Boolean).join('\n\n') + `\n\nPLAN CONTENT:\n${planContent}`,
     };
-    const extractResult = await dispatch(ctx, extractTask, { stage: 'PLAN' });
-    if (!extractResult.ok || !extractResult.payload) {
-      return blocked(ctx, 'Plan extraction failed.', [extractResult.summary, `Brief was:\n${renderBrief(AgentTaskSchema.parse(extractTask)).slice(0, 400)}…`]);
+    // Extraction is a payload-returning dispatch: a model occasionally answers
+    // ok:true but leaves the structured data in prose (payload null) or emits a
+    // slightly off-shape payload. Neither is a fatal planner failure — re-dispatch
+    // with a sharpened reminder, bounded by plan_revisions, before giving up.
+    let extraction: PlanExtraction | null = null;
+    let lastExtractSummary = '';
+    const extractAttempts = ctx.config.limits.plan_revisions + 1;
+    for (let attempt = 0; attempt < extractAttempts; attempt++) {
+      const task: AgentTaskDraft =
+        attempt === 0
+          ? extractTask
+          : {
+              ...extractTask,
+              id: `new-extract-r${attempt}`,
+              notes:
+                `${extractTask.notes}\n\nIMPORTANT: put the extraction JSON in the AgentResult "payload" field (not prose), ` +
+                'matching the PlanExtraction schema exactly: classification is one of NEW|CHANGE|REMOVE|CARRYOVER|UNCHANGED_DEPENDENCY and every boolean is a real JSON boolean.',
+            };
+      const extractResult = await dispatch(ctx, task, { stage: 'PLAN' });
+      lastExtractSummary = extractResult.summary;
+      if (extractResult.ok && extractResult.payload) {
+        const parsed = PlanExtractionSchema.safeParse(extractResult.payload);
+        if (parsed.success) {
+          extraction = parsed.data;
+          break;
+        }
+      }
+      // The workflow is being torn down (deadline/host disconnect): stop retrying
+      // so the unwind is not blocked by a fresh dispatch to a dead host.
+      if (isWorkflowCancellation(extractResult)) break;
     }
-    const parsed = PlanExtractionSchema.safeParse(extractResult.payload);
-    if (!parsed.success) {
-      return failed(ctx, 'Planner returned an invalid extraction payload.', [parsed.error.message]);
+    if (!extraction) {
+      // A planner that cannot produce a valid extraction payload is a planner
+      // FAILURE, not a workflow block: use failed() so a --next transition stays
+      // fully non-destructive (blocked() would persist STATE.md/manifest when a
+      // previous phase exists, corrupting the "untouched on failure" guarantee).
+      return failed(ctx, 'Plan extraction failed.', [
+        lastExtractSummary,
+        `Brief was:\n${renderBrief(AgentTaskSchema.parse(extractTask)).slice(0, 400)}…`,
+      ]);
     }
-    const extraction = parsed.data;
 
     // ---- STAGING: build the new milestone entirely in memory and validate it
     // BEFORE any durable mutation. The prospective ID is deterministic; sealing

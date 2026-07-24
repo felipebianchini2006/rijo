@@ -323,9 +323,19 @@ export function replaceableAttempt(
   const handle: ReplaceableAttempt = {
     attempt: prepareAttempt(ctx, draft, opts),
     prepareReplacement: (_generation, _previousFailure) => {
-      // A fenced generation's workspace is never reused. Re-route the ORIGINAL
-      // draft (same deterministic profile routing as the first dispatch) and
-      // isolate it in a brand-new workspace against the current baseline.
+      // The generation being replaced is abandoned (fenced/terminated): discard
+      // ITS workspace now so no orphan copy of a failed attempt survives on disk
+      // — the supervisor only disposes replacement (gen>1) resources it created,
+      // so the ORIGINAL (gen-1) workspace would otherwise leak until the next
+      // run's orphan sweep. A fenced generation's workspace is never reused.
+      try {
+        handle.attempt.workspace.discard();
+      } catch {
+        /* already discarded */
+      }
+      // Re-route the ORIGINAL draft (same deterministic profile routing as the
+      // first dispatch) and isolate it in a brand-new workspace against the
+      // current baseline.
       const routed = prepareDispatchedTask(ctx.config, draft, routing);
       const fresh = prepareAttempt(ctx, routed, opts);
       handle.attempt = fresh;
@@ -365,6 +375,21 @@ export async function dispatchReadOnly(
   );
   const delta = diffTrees(before, snapshotTree(ctx.projectRoot));
   return { result, violation: delta.changed };
+}
+
+/**
+ * True when a failed dispatch reflects a WORKFLOW-LEVEL teardown (a deadline
+ * cancel, host disconnect, or supervisor disposal) rather than an agent-quality
+ * failure. Workflow-level retry loops MUST NOT re-dispatch on this: the workflow
+ * is being unwound, and a fresh dispatch would wedge on a host that will never
+ * answer (blocking the deadline unwind). An ordinary bad/unparseable agent
+ * result carries a descriptive summary and is not matched here, so genuine
+ * agent-quality retries still proceed.
+ */
+export function isWorkflowCancellation(result: AgentResult): boolean {
+  return /CANCELLED|WORKFLOW_DEADLINE|WORKFLOW_UNWIND|HOST_DISCONNECTED|supervisor disposed|external abort/i.test(
+    result.summary,
+  );
 }
 
 export function blocked(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
