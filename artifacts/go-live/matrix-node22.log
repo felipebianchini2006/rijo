@@ -1,0 +1,24 @@
+=== npm ci (node22) ===
+
+found 0 vulnerabilities
+exit:0
+=== typecheck (node22) ===
+> tsc -p tsconfig.json --noEmit
+exit:0
+=== test (node22) ===
+   ✓ milestone transaction crash safety (fault injection after every durable write) > crashing at EVERY injection point leaves no observable intermediate state  14547ms
+ ✓ tests/gate.e2e.test.ts (4 tests) 51189ms
+   ✓ production gate E2E (real app, real server, real Playwright) > READY: clean checkout of the exact commit, real server, real Playwright on desktop+mobile  13474ms
+   ✓ production gate E2E (real app, real server, real Playwright) > BLOCKED: a dirty tree stops the gate before anything runs  413ms
+   ✓ production gate E2E (real app, real server, real Playwright) > NOT_READY with failure evidence: Playwright fails when the real flow is broken  10996ms
+   ✓ production gate E2E (real app, real server, real Playwright) > check --fix repairs in an isolated workspace, commits, and re-runs the ENTIRE matrix to READY  14627ms
+
+ Test Files  43 passed (43)
+      Tests  333 passed | 3 skipped (336)
+   Start at  09:27:22
+   Duration  51.98s (transform 1.97s, setup 0ms, collect 7.67s, tests 246.07s, environment 7ms, prepare 2.95s)
+
+exit:0
+=== build (node22) ===
+> tsc -p tsconfig.json
+exit:0

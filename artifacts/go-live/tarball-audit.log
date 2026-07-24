@@ -1,0 +1,16 @@
+=== tarball fixture ===
+
+found 0 vulnerabilities
+exit:0
+version: 0.1.0-alpha.1
+{
+  "schema_version": 2,
+  "rijo_version": "0.1.0-alpha.1",
+exports: 53
+exit:0
+=== audit ===
+found 0 vulnerabilities
+exit:0
+=== sbom ===
+exit:0
+sbom components: 58 format: CycloneDX 1.5

@@ -1,0 +1,7 @@
+Certification date: 2026-07-24
+Certified commit: e7232471932762595a52d8ae917bddbdb04153e6 (origin/main)
+Clone source: https://github.com/felipebianchini2006/rijo.git (fresh clone, branch main)
+Host: macOS 26.5.2 (Darwin 25.5.0, arm64)
+Node (primary): v24.18.0 | Node (matrix): v22.23.1 | npm: 11.16.0 | git: 2.55.0
+Claude Code CLI: 2.1.202 (Claude Code)
+Codex CLI: codex-cli 0.146.0-alpha.3.1

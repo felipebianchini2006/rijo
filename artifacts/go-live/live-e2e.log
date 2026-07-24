@@ -1,0 +1,26 @@
+=== live host E2E (claude + codex probe) ===
+
+ RUN  v3.2.7 /private/tmp/claude-501/-Users-felipebianchini-Developer-rijo--claude-worktrees-rijo-alpha-release-candidate-77c9eb/3d1e0b8f-3030-4622-aac2-a238d35e82fa/scratchpad/golive-cert/clone
+
+ ✓ tests/live-e2e.test.ts (3 tests | 2 skipped) 12136ms
+   ✓ LIVE: Claude Code CLI > returns a parsed AgentResult for a trivial task  8230ms
+   ↓ LIVE: Codex CLI > returns a parsed AgentResult for a trivial task [BLOCKED (host capacity): Codex CLI returned no parseable AgentResult (exit 1). Host error: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 28th, 2026 2:04 PM.. Reading additional input from stdin...]
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 2 skipped (3)
+   Start at  09:28:16
+   Duration  12.83s (transform 85ms, setup 0ms, collect 528ms, tests 12.14s, environment 0ms, prepare 52ms)
+
+exit:0
+=== live supervisor Part-M E2E (real claude processes) ===
+ RUN  v3.2.7 /private/tmp/claude-501/-Users-felipebianchini-Developer-rijo--claude-worktrees-rijo-alpha-release-candidate-77c9eb/3d1e0b8f-3030-4622-aac2-a238d35e82fa/scratchpad/golive-cert/clone
+
+ ✓ tests/supervisor-live.e2e.test.ts (2 tests | 1 skipped) 11679ms
+   ✓ LIVE: supervisor terminates and replaces a real Claude Code attempt (bounded) > kills a real stalled turn, fences it, replaces once, and ends BLOCKED within budget  11678ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 1 skipped (2)
+   Start at  09:28:30
+   Duration  12.11s (transform 127ms, setup 0ms, collect 233ms, tests 11.68s, environment 0ms, prepare 55ms)
+
+exit:0
