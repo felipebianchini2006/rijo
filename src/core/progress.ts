@@ -24,6 +24,17 @@ export const consoleSink: ProgressSink = {
 
 export const silentSink: ProgressSink = { render() {} };
 
+/**
+ * Progress sink that writes to stderr, keeping stdout clean for the command's
+ * own result. Used by the turnkey host mode so live progress/heartbeat lines
+ * stay legible without corrupting a machine-readable stdout.
+ */
+export const stderrSink: ProgressSink = {
+  render(line: string) {
+    process.stderr.write(`${line}\n`);
+  },
+};
+
 export interface ProgressUpdate {
   status?: RunStatus;
   milestone?: { id: string; name: string } | null;

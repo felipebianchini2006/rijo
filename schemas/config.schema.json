@@ -390,6 +390,20 @@
           ]
         }
       }
+    },
+    "host": {
+      "type": "object",
+      "description": "Host runtime binding. `provider` names the CLI host RIJO drives turnkey (`rijo run --host <provider>`). `none` (default) leaves RIJO host-agnostic. Additive over schema v2; an absent block means provider 'none'.",
+      "properties": {
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "none"
+          ],
+          "default": "none"
+        }
+      }
     }
   }
 }

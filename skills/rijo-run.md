@@ -27,6 +27,16 @@ Emit one short line per stage change, task start/finish, blocker, phase completi
 `[RIJO M002 F03/05] EXECUTE T02/04  integrando gateway de pagamento`
 No heartbeats, no percentages the state machine cannot compute, no private reasoning.
 
-## Host bridge
+## Turnkey host mode (preferred)
 
-To run phases autonomously, spawn `npx rijo serve --stdio` and speak JSON-RPC over stdio: send `{"type":"request","method":"workflow.run","id":1,"params":{"target":"all"}}`. Answer each `{"type":"request","method":"agent.runTask",...}` by executing the described subagent and replying `{"type":"response","id":<same>,"result":{...AgentResult...}}`. Progress arrives as `progress` notifications.
+To run phases autonomously against your own CLI, do NOT hand-roll a protocol loop. Invoke the turnkey command and let RIJO detect the host, supervise every attempt and stream progress:
+
+```
+rijo run all --host claude      # or: --host codex
+```
+
+RIJO resolves the host from `--host` (or `config.host.provider`), detects the CLI (a missing binary BLOCKS — nothing is simulated), and drives each supervised attempt end-to-end. Progress and heartbeat lines print to stderr; the final `[rijo …]` outcome is on stdout with a coherent exit code (0 done, 3 blocked, 1 failed).
+
+## Host bridge (advanced API for external hosts)
+
+An external host that embeds RIJO directly can instead spawn `npx rijo serve --stdio` and speak JSON-RPC over stdio: send `{"type":"request","method":"workflow.run","id":1,"params":{"target":"all"}}`. Answer each `{"type":"request","method":"agent.runTask",...}` by executing the described subagent and replying `{"type":"response","id":<same>,"result":{...AgentResult...}}`. Progress arrives as `progress` notifications. Prefer the turnkey command above unless you are building such a host.

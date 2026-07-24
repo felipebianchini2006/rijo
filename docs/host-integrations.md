@@ -22,6 +22,52 @@ unparseable, or a call times out, the driver returns an explicit `ok:false`
 
 ---
 
+## Turnkey mode (`--host`)
+
+You do not have to write a JSON-RPC loop or bind an `AgentRunner` yourself. Pass
+`--host claude` or `--host codex` to `rijo new`, `rijo run`, `rijo check`,
+`rijo ui` or `rijo fix` (or set `host.provider` in `.rijo/config.yml`) and RIJO
+runs the whole workflow against that CLI:
+
+```bash
+rijo run all --host claude
+rijo new @PLANO.md --host codex --run     # new + run chained under one lock
+rijo check --host claude
+```
+
+What happens under the hood (`src/cli/host.ts` → `buildHostExecutor`):
+
+1. **Resolve the provider.** `resolveHostProvider(flag, config)` — the `--host`
+   flag wins over `config.host.provider`, which defaults to `none`. An
+   unrecognized flag is a usage error (exit code **2**).
+2. **Detect the CLI** with `detectClaudeCli` / `detectCodexCli` (`<bin>
+   --version`). A missing or failing binary returns a BLOCKED outcome with a
+   clear message (exit code **3**) — nothing is simulated.
+3. **Build the real controller** (`ClaudeProcessController` /
+   `CodexProcessController`) with the project config. Each attempt is a real
+   child process (PID-owning), whose `cwd` is that attempt's workspace root — so
+   the same write fence as the drivers applies.
+4. **Wrap it in a `SupervisedExecutor`** driven by the **full**
+   `config.supervisor` policy (real heartbeat, per-role deadlines, and
+   replacement budget — not the neutered in-process default), and inject it into
+   `WorkflowDeps.executor`.
+5. **Run the normal workflow.** Crash recovery still happens under the runtime
+   lock; progress and per-attempt heartbeat lines are written to **stderr** so
+   stdout stays the machine-readable command result. Exit codes match every
+   other command: **0** done, **3** blocked, **1** failed.
+
+The executor is disposed after the run (supervisor timers freed). With provider
+`none` the workflow runs exactly as before — the host layer is inert.
+
+> Note: fresh-workspace replacement generations require the workflow dispatch to
+> supply a `prepareReplacement` factory. The current `dispatch`/`dispatchBatch`
+> path does not, so a failed host attempt is retried in place (with a factual
+> failure note) up to `max_replacements_per_task` before the supervisor fences
+> it and returns a BLOCKED diagnostic. The replacement **budget** is real either
+> way.
+
+---
+
 ## How a driver runs one task
 
 1. **Resolve the model.** `task.tier` (set by the orchestrator) indexes

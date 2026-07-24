@@ -15,3 +15,7 @@ Produce `.rijo/milestones/<active>/qa/production-readiness.md`. This flow never 
 6. With `--fix`: group failures by root cause, fix in limited scope, re-run only failing journeys and needed regressions. Two rounds maximum.
 7. READY only when: production build passes, 100% of first-version requirements are mapped, critical journeys pass, no valid blocker/critical/high finding, no unhandled console/network error in critical flows, migrations and configuration documented, no mandatory check silently skipped.
 8. If a browser, environment, credential or indispensable service is unavailable: status is BLOCKED. Never READY by inference.
+
+## Turnkey host mode
+
+To run this flow autonomously against your own CLI, invoke the turnkey command instead of hand-rolling a protocol loop: `rijo check --host claude` (or `--host codex`, or set `config.host.provider`). RIJO detects the host (a missing CLI BLOCKS), supervises every attempt and prints progress to stderr. `npx rijo serve --stdio` remains available as the advanced JSON-RPC API for external hosts.

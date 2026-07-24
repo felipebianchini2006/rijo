@@ -126,6 +126,18 @@ export const SupervisorConfigSchema = z.object({
 export type SupervisorConfig = z.infer<typeof SupervisorConfigSchema>;
 
 /**
+ * Host runtime binding. `provider` names the CLI host RIJO drives turnkey
+ * (`rijo run --host <provider>` or this default). `none` (the default) leaves
+ * RIJO host-agnostic: an adapter/embedder binds the runtime, or the operator
+ * passes `--host` explicitly. Additive over schema v2 — an absent block parses
+ * to `{ provider: 'none' }` and changes no existing field.
+ */
+export const HostConfigSchema = z.object({
+  provider: z.enum(['claude', 'codex', 'none']).default('none'),
+});
+export type HostConfig = z.infer<typeof HostConfigSchema>;
+
+/**
  * Persisted per-logical-task supervision state. Only the CURRENT generation
  * holding the CURRENT lease can produce an applicable result; anything else
  * is disposed as LATE_OR_STALE_RESULT and never applied.
@@ -253,6 +265,7 @@ export const ConfigSchema = z.object({
   execution: ExecutionConfigSchema.default({}),
   research: ResearchConfigSchema.default({}),
   supervisor: SupervisorConfigSchema.default({}),
+  host: HostConfigSchema.default({}),
 });
 export type RijoConfig = z.infer<typeof ConfigSchema>;
 

@@ -31,10 +31,31 @@ npm install --global rijo@alpha
 rijo --status
 ```
 
-## Execução autônoma (ponte host-core)
+## Execução autônoma turnkey (`--host`)
 
-O RIJO não embarca um SDK de provedor. Para operá-lo de ponta a ponta dentro de
-um host de agentes (Claude Code, Codex ou o seu), inicie a ponte JSON-RPC:
+O RIJO não embarca um SDK de provedor, mas você não precisa programar um loop
+JSON-RPC. Passe `--host claude` ou `--host codex` (ou defina `host.provider` no
+`.rijo/config.yml`) e o RIJO detecta o CLI do host, monta o controlador de
+processo real, supervisiona cada tentativa (heartbeat, deadlines e orçamento de
+substituição da `config.supervisor`) e roda o workflow de ponta a ponta:
+
+```bash
+rijo run all --host claude              # executa todas as fases contra o Claude Code
+rijo new @PLANO.md --host codex --run    # cria o milestone e já executa, via Codex
+rijo check --host claude                 # decisão de prontidão turnkey
+```
+
+- Precedência: a flag `--host` vence `host.provider`; sem nenhum dos dois o
+  provider é `none` (comportamento host-agnóstico anterior, inalterado).
+- Um CLI de host ausente **BLOQUEIA** com diagnóstico claro (exit code 3) —
+  nada é simulado. O progresso/heartbeat sai no **stderr**; o resultado final
+  `[rijo …]` sai no stdout, com exit codes coerentes (0 done, 3 blocked, 1 failed).
+- `--host` também está disponível em `rijo ui` e `rijo fix`.
+
+## Host bridge (API avançada para hosts externos)
+
+Um host que embute o RIJO diretamente pode falar a ponte JSON-RPC sobre stdio
+em vez de usar o modo turnkey:
 
 ```bash
 npx rijo serve --stdio
@@ -77,6 +98,10 @@ rijo run all | next | 03
 rijo ui @design.zip                     # importa design como referência visual
 rijo fix "descrição do problema" @log.txt
 rijo check [--fix] [--production]       # decisão READY/NOT_READY/BLOCKED
+
+# turnkey por host: adicione --host claude|codex a new/run/check/ui/fix
+rijo run all --host claude
+rijo new @PLANO.md --host codex --run
 ```
 
 Invocações somente leitura (não planejam, não executam, não alteram contexto):

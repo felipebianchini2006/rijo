@@ -40,14 +40,27 @@ export function rijoInstructionBlock(): string {
 
 /**
  * Host↔core bridge instructions injected into every adapter instruction block.
- * A host that wants to run RIJO autonomously spawns `npx rijo serve --stdio`
- * and speaks the line-delimited JSON-RPC protocol described here.
+ * Turnkey mode (`rijo <cmd> --host …`) is the recommended path; the raw
+ * `npx rijo serve --stdio` JSON-RPC protocol is documented afterward as the
+ * advanced API for hosts that embed RIJO directly.
  */
 export function hostBridgeNote(): string {
   return [
-    '## Host bridge (execução autônoma)',
+    '## Execução autônoma (turnkey)',
     '',
-    'Para operar o RIJO de ponta a ponta, inicie o processo bridge e fale JSON-RPC (uma mensagem JSON por linha) sobre stdio:',
+    'Para operar o RIJO de ponta a ponta com o seu próprio CLI, NÃO programe um loop de protocolo — use o comando turnkey e deixe o RIJO detectar o host, supervisionar cada tentativa e transmitir o progresso:',
+    '',
+    '```',
+    'rijo run all --host claude      # ou: --host codex',
+    'rijo new @PLANO.md --host claude --run',
+    '```',
+    '',
+    '- O host vem de `--host` ou de `host.provider` no `.rijo/config.yml` (default `none`).',
+    '- Um CLI de host ausente resulta em BLOCKED (exit 3) — nada é simulado. Progresso/heartbeat vão para o stderr; o resultado final `[rijo …]` sai no stdout.',
+    '',
+    '## Host bridge (API avançada para hosts externos)',
+    '',
+    'Um host que embute o RIJO diretamente pode, em vez disso, iniciar o processo bridge e falar JSON-RPC (uma mensagem JSON por linha) sobre stdio:',
     '',
     '```',
     'npx rijo serve --stdio',

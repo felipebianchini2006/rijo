@@ -3,9 +3,10 @@ import * as path from 'node:path';
 import { parseArgs } from 'node:util';
 import { RijoPaths } from '../core/paths.js';
 import { TaskRecordSchema, type TaskRecord } from '../core/schemas/index.js';
-import { readStatus, renderStatusLine } from '../core/progress.js';
+import { readStatus, renderStatusLine, stderrSink } from '../core/progress.js';
 import { readState } from '../core/state.js';
 import { loadConfig } from '../core/config.js';
+import { buildHostExecutor, resolveHostProvider } from './host.js';
 import { readManifest, RIJO_VERSION } from '../core/manifest.js';
 import { newWorkflow } from '../workflows/new.js';
 import { runWorkflow } from '../workflows/run.js';
@@ -38,42 +39,52 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
           milestone: { type: 'boolean' },
           run: { type: 'boolean' },
           ui: { type: 'string' },
+          host: { type: 'string' },
         },
       });
       const plan = positionals[0];
-      if (!plan) return usage('rijo new @PLANO.md [--next] [--ui @design.zip] [--run]');
-      return report(
-        await newWorkflow(
+      if (!plan) return usage('rijo new @PLANO.md [--next] [--ui @design.zip] [--run] [--host claude|codex]');
+      return withHost(cwd, values.host, deps, (d) =>
+        newWorkflow(
           cwd,
           { planFile: plan, next: Boolean(values.next || values.milestone), run: Boolean(values.run), ui: values.ui },
-          deps,
+          d,
         ),
       );
     }
     case 'run': {
-      const target = rest[0];
+      const { positionals, values } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { host: { type: 'string' } },
+      });
+      const target = positionals[0];
       if (target && !['next', 'all'].includes(target) && !/^\d{2}$/.test(target)) {
-        return usage('rijo run [next|all|NN]');
+        return usage('rijo run [next|all|NN] [--host claude|codex]');
       }
-      return report(await runWorkflow(cwd, { target }, deps));
+      return withHost(cwd, values.host, deps, (d) => runWorkflow(cwd, { target }, d));
     }
     case 'ui': {
-      const input = rest[0];
-      if (!input) return usage('rijo ui @design.zip | @index.html | @design-directory/');
-      return report(await uiWorkflow(cwd, { input }, deps));
+      const { host, rest: uiRest } = extractHostFlag(rest);
+      const input = uiRest[0];
+      if (!input) return usage('rijo ui @design.zip | @index.html | @design-directory/ [--host claude|codex]');
+      return withHost(cwd, host, deps, (d) => uiWorkflow(cwd, { input }, d));
     }
     case 'fix': {
-      const description = rest.filter((a) => !a.startsWith('@')).join(' ');
-      const evidence = rest.filter((a) => a.startsWith('@')).map((a) => a.slice(1));
-      if (!description) return usage('rijo fix "problem description" [@evidence.png] [@log.txt]');
-      return report(await fixWorkflow(cwd, { description, evidenceFiles: evidence }, deps));
+      const { host, rest: fixRest } = extractHostFlag(rest);
+      const description = fixRest.filter((a) => !a.startsWith('@')).join(' ');
+      const evidence = fixRest.filter((a) => a.startsWith('@')).map((a) => a.slice(1));
+      if (!description) return usage('rijo fix "problem description" [@evidence.png] [@log.txt] [--host claude|codex]');
+      return withHost(cwd, host, deps, (d) => fixWorkflow(cwd, { description, evidenceFiles: evidence }, d));
     }
     case 'check': {
       const { values } = parseArgs({
         args: rest,
-        options: { fix: { type: 'boolean' }, production: { type: 'boolean' } },
+        options: { fix: { type: 'boolean' }, production: { type: 'boolean' }, host: { type: 'string' } },
       });
-      return report(await checkWorkflow(cwd, { fix: values.fix, production: values.production }, deps));
+      return withHost(cwd, values.host, deps, (d) =>
+        checkWorkflow(cwd, { fix: values.fix, production: values.production }, d),
+      );
     }
     case 'serve': {
       // Host↔core JSON-RPC bridge over stdio (the default and only mode).
@@ -104,6 +115,62 @@ function report(outcome: WorkflowOutcome): number {
   console.log(`[rijo ${prefix}] ${outcome.message}`);
   for (const d of outcome.details ?? []) console.log(`  ${d}`);
   return outcome.ok ? 0 : outcome.status === 'blocked' ? 3 : 1;
+}
+
+/**
+ * Resolve the host binding, then run a workflow turnkey against it. With
+ * `--host claude|codex` (or `config.host.provider`) the real CLI host is
+ * detected, wrapped in a supervised executor and injected into the workflow —
+ * a missing host BLOCKS (exit 3), an invalid flag is a usage error (exit 2).
+ * Progress/heartbeat lines go to stderr so stdout stays the command result.
+ * With provider 'none' the workflow runs exactly as before (no host coupling).
+ * The host executor is always disposed after the run (supervisor timers freed).
+ */
+async function withHost(
+  cwd: string,
+  hostFlag: string | undefined,
+  deps: WorkflowDeps,
+  body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
+): Promise<number> {
+  const config = loadConfig(new RijoPaths(cwd));
+  const provider = resolveHostProvider(hostFlag, config);
+  if (typeof provider === 'object') return usage(provider.error);
+  if (provider === 'none') return report(await body(deps));
+
+  const boot = await buildHostExecutor({ provider, projectRoot: cwd, config, paths: new RijoPaths(cwd) });
+  if (!boot.ok) {
+    return report({ ok: false, status: 'blocked', message: boot.message, details: boot.details });
+  }
+  try {
+    return report(await body({ ...deps, executor: boot.executor, sink: deps.sink ?? stderrSink }));
+  } finally {
+    await boot.executor.dispose();
+  }
+}
+
+/**
+ * Extract a `--host <value>` (or `--host=<value>`) flag from a free-form argv
+ * that also carries positional/`@evidence` tokens (fix/ui), leaving the rest
+ * untouched. Returns the flag value (if any) and the remaining args.
+ */
+function extractHostFlag(args: string[]): { host: string | undefined; rest: string[] } {
+  const rest: string[] = [];
+  let host: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '--host') {
+      host = args[i + 1];
+      i++;
+      continue;
+    }
+    const m = a.match(/^--host=(.*)$/);
+    if (m) {
+      host = m[1];
+      continue;
+    }
+    rest.push(a);
+  }
+  return { host, rest };
 }
 
 /** Read-only status panel: never plans, executes, fixes or mutates context. */

@@ -22,3 +22,7 @@ Fast correction without formal phase planning. Never a hidden version of rijo ru
 - there is broad security impact, the problem resists 2 reproduction attempts,
 - or the fix would change intent/business rules.
 Maximum 2 quick attempts before escalating.
+
+## Turnkey host mode
+
+To run this flow autonomously against your own CLI, invoke the turnkey command instead of hand-rolling a protocol loop: `rijo fix "description" --host claude` (or `--host codex`, or set `config.host.provider`). RIJO detects the host (a missing CLI BLOCKS), supervises every attempt and prints progress to stderr. `npx rijo serve --stdio` remains available as the advanced JSON-RPC API for external hosts.

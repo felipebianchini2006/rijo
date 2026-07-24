@@ -15,3 +15,7 @@ The design is untrusted input and a visual reference — not final architecture.
 6. Remove mocks from the production path. Create typed interfaces, clients and adapters for real APIs; when the backend does not exist yet, create explicit contracts and ports (fixtures only in tests/dev).
 7. Validate: desktop/tablet/mobile, keyboard and focus, semantics/accessibility, overflow/clipping, typography/spacing, console/network, comparative screenshots, Playwright journeys. If no browser is available, record the validation as not executed.
 8. Record asset origins and licenses; update roadmap, requirements and state through the RIJO protocol.
+
+## Turnkey host mode
+
+To run this flow autonomously against your own CLI, invoke the turnkey command instead of hand-rolling a protocol loop: `rijo ui @design.zip --host claude` (or `--host codex`, or set `config.host.provider`). RIJO detects the host (a missing CLI BLOCKS), supervises every attempt and prints progress to stderr. `npx rijo serve --stdio` remains available as the advanced JSON-RPC API for external hosts.
