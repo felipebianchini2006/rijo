@@ -312,6 +312,24 @@ export class AttemptWorkspace {
   }
 }
 
+/**
+ * Remove every leftover attempt workspace under `<runtimeDir>/workspaces`.
+ * A crashed run can leave whole workspace copies behind; a fresh run must
+ * never observe or reuse them (a stale copy could re-introduce a discarded
+ * attempt's edits). Returns the ids of the workspaces that were removed so the
+ * caller can emit progress; safe to call when the directory does not exist.
+ */
+export function discardOrphanWorkspaces(runtimeDir: string): string[] {
+  const wsDir = path.join(runtimeDir, 'workspaces');
+  if (!exists(wsDir)) return [];
+  const discarded: string[] = [];
+  for (const entry of fs.readdirSync(wsDir)) {
+    fs.rmSync(path.join(wsDir, entry), { recursive: true, force: true });
+    discarded.push(entry);
+  }
+  return discarded;
+}
+
 function copyTree(from: string, to: string, snapshot: TreeSnapshot): void {
   for (const [rel, entry] of snapshot) {
     const src = path.join(from, rel);

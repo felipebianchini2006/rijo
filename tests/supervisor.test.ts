@@ -550,27 +550,43 @@ describe('supervisor — crash recovery reconciliation', () => {
     (store as unknown as { create: (r: unknown) => unknown }).create(rec);
   }
 
-  it('fences an orphan STARTING/RUNNING record with no recoverable handle (crash post-spawn)', async () => {
+  it('fences an orphan STARTING record with no recoverable handle and resumes it (budget remains)', async () => {
     const paths = tmpPaths();
     writeRecord(paths, { state: 'STARTING' });
-    const report = await reconcileSupervisedTasks(paths);
+    const report = await reconcileSupervisedTasks(paths, { maxReplacements: 2 });
     expect(report.total).toBe(1);
-    expect(report.actions.fenced).toBe(1);
+    expect(report.actions.resumed).toBe(1);
+    expect(report.classifications['no_handle']).toBe(1);
     const rec = new TaskStore(paths).read('exec-01-T01')!;
-    expect(rec.state).toBe('CANCELLED');
+    expect(rec.state).toBe('REPLACING');
+    expect(rec.revoked_leases).toContain('lease-1'); // fenced
+    expect(rec.workspace_id).toBeNull(); // workspace invalidated
+  });
+
+  it('fences an orphan RUNNING record and exhausts it when no replacement budget remains', async () => {
+    const paths = tmpPaths();
+    writeRecord(paths, { state: 'RUNNING' });
+    const report = await reconcileSupervisedTasks(paths, { maxReplacements: 0 });
+    expect(report.actions.exhausted).toBe(1);
+    const rec = new TaskStore(paths).read('exec-01-T01')!;
+    expect(rec.state).toBe('EXHAUSTED'); // terminal
     expect(rec.revoked_leases).toContain('lease-1');
     expect(rec.workspace_id).toBeNull();
   });
 
-  it('leaves a completed attempt for the caller to validate (crash post-result/pre-apply)', async () => {
+  it('discards a completed-but-unvalidated attempt with fencing (crash post-result/pre-apply)', async () => {
     const paths = tmpPaths();
     writeRecord(paths, { state: 'RUNNING' });
     const controller = new FakeController();
     controller.queryStatus = { kind: 'completed', detail: 'exit 0' };
     const handle: HostAttemptHandle = { attempt_id: 'x', lease_id: 'lease-1', generation: 1, host: 'fake', result: Promise.resolve({} as AgentResult) };
-    const report = await reconcileSupervisedTasks(paths, { controllerLookup: () => ({ controller, handle }) });
-    expect(report.actions.left_for_caller).toBe(1);
-    expect(new TaskStore(paths).read('exec-01-T01')!.state).toBe('ORPHANED');
+    const report = await reconcileSupervisedTasks(paths, { maxReplacements: 2, controllerLookup: () => ({ controller, handle }) });
+    expect(report.classifications['completed_discarded']).toBe(1);
+    expect(report.actions.resumed).toBe(1);
+    const rec = new TaskStore(paths).read('exec-01-T01')!;
+    expect(rec.state).toBe('REPLACING'); // discarded, not applied; queued for a fresh attempt
+    expect(rec.revoked_leases).toContain('lease-1'); // completed result fenced out
+    expect(rec.workspace_id).toBeNull();
   });
 
   it('fences a dead/disconnected attempt reported by the recovered handle', async () => {
@@ -579,10 +595,24 @@ describe('supervisor — crash recovery reconciliation', () => {
     const controller = new FakeController();
     controller.queryStatus = { kind: 'dead' };
     const handle: HostAttemptHandle = { attempt_id: 'x', lease_id: 'lease-1', generation: 1, host: 'fake', result: Promise.resolve({} as AgentResult) };
-    const report = await reconcileSupervisedTasks(paths, { controllerLookup: () => ({ controller, handle }) });
+    const report = await reconcileSupervisedTasks(paths, { maxReplacements: 2, controllerLookup: () => ({ controller, handle }) });
     expect(report.classifications['dead']).toBe(1);
     const rec = new TaskStore(paths).read('exec-01-T01')!;
-    expect(rec.state).toBe('CANCELLED');
+    expect(rec.state).toBe('REPLACING');
     expect(rec.revoked_leases).toContain('lease-1');
+  });
+
+  it('is idempotent: a second reconciliation produces the same state and zero new events', async () => {
+    const paths = tmpPaths();
+    writeRecord(paths, { state: 'RUNNING' });
+    await reconcileSupervisedTasks(paths, { maxReplacements: 2 });
+    const store = new TaskStore(paths);
+    const afterFirst = store.read('exec-01-T01')!.state;
+    const eventsAfterFirst = store.readEvents('exec-01-T01').length;
+
+    const second = await reconcileSupervisedTasks(paths, { maxReplacements: 2 });
+    expect(second.total).toBe(0); // nothing left to reconcile
+    expect(store.read('exec-01-T01')!.state).toBe(afterFirst);
+    expect(store.readEvents('exec-01-T01').length).toBe(eventsAfterFirst); // no new events
   });
 });

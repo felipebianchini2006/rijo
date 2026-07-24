@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import { RijoPaths } from '../core/paths.js';
-import { AttemptWorkspace, snapshotTree, diffTrees } from '../core/workspace.js';
+import { AttemptWorkspace, snapshotTree, diffTrees, discardOrphanWorkspaces } from '../core/workspace.js';
+import { reconcileSupervisedTasks } from '../supervisor/recover.js';
 import { canonicalBaselineHash } from '../core/manifest.js';
 import { reconcileTransactions, type TxnHooks } from '../core/txn.js';
 import { loadConfig } from '../core/config.js';
@@ -118,9 +119,13 @@ export async function withLock<T>(
   }, opts.renewMs ?? RECOMMENDED_RENEW_MS);
   renewTimer.unref();
   try {
-    // Startup reconciliation: an interrupted milestone transaction is rolled
-    // back (no commit marker) or deterministically rolled forward (marker
-    // present) BEFORE any workflow observes the tree.
+    // Startup reconciliation runs for EVERY workflow, under the lock, before the
+    // body observes anything. Order matters:
+    //   (a) roll interrupted milestone transactions back/forward;
+    //   (b) reconcile crashed supervised tasks (fence stale attempts, resume or
+    //       exhaust each per replacement budget) so none can later apply;
+    //   (c) discard orphan attempt workspaces left by a crashed run so no stale
+    //       copy can re-introduce a discarded attempt's edits.
     const rec = reconcileTransactions(ctx.paths);
     for (const id of rec.rolledBack) {
       ctx.bus.emit('txn.rolled_back', { message: `transação incompleta descartada: ${id}` }, { txn: id });
@@ -128,6 +133,22 @@ export async function withLock<T>(
     for (const id of rec.rolledForward) {
       ctx.bus.emit('txn.rolled_forward', { message: `transação confirmada reaplicada: ${id}` }, { txn: id });
     }
+
+    const recovery = await reconcileSupervisedTasks(ctx.paths, {
+      maxReplacements: ctx.config.supervisor.max_replacements_per_task,
+    });
+    for (const e of recovery.entries) {
+      ctx.bus.emit(
+        'supervised.recovered',
+        { message: `tarefa supervisionada recuperada: ${e.logical_task_id} (${e.from} → ${e.action})` },
+        { ...e },
+      );
+    }
+
+    for (const ws of discardOrphanWorkspaces(ctx.paths.runtimeDir)) {
+      ctx.bus.emit('workspace.orphan_discarded', { message: `workspace órfão descartado: ${ws}` }, { workspace: ws });
+    }
+
     return await body();
   } finally {
     clearInterval(renewTimer);

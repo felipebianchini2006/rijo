@@ -11,6 +11,7 @@ import {
 import { withLock, type WorkflowContext } from '../src/workflows/shared.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { ProgressBus, silentSink } from '../src/core/progress.js';
+import { defaultConfig } from '../src/core/config.js';
 import { tmpProject, cleanup } from './helpers.js';
 
 function sleep(ms: number): Promise<void> {
@@ -252,7 +253,8 @@ describe('withLock', () => {
     const paths = new RijoPaths(root);
     const now = () => new Date(); // real clock: withLock's renewal timers are real too
     const bus = new ProgressBus(paths, 'test-run', silentSink, now);
-    return { paths, bus, now } as unknown as WorkflowContext;
+    // config is required: withLock reads config.supervisor for startup recovery.
+    return { paths, bus, now, config: defaultConfig() } as unknown as WorkflowContext;
   }
 
   it('renews the lease in the background so a long-running body never sees it expire', async () => {

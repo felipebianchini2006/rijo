@@ -1,4 +1,3 @@
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { exists, readText, readTextIfExists, writeFileAtomic, ensureDir } from '../core/fsx.js';
@@ -94,7 +93,8 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
     bus.emit('run.load', { status: 'running', stage: 'LOAD', message: 'validando manifest, drift e checkpoint' });
     const schemaGuard = guardSchema(ctx);
     if (schemaGuard) return schemaGuard;
-    discardOrphanWorkspaces(ctx);
+    // Orphan-workspace discard and crash recovery already ran in withLock (which
+    // also wraps `rijo new --run` composing runCore), so LOAD does not repeat it.
     const integrity = validateStateIntegrity(paths);
     const errors = integrity.filter((i) => i.severity === 'error');
     if (errors.length > 0) {
@@ -128,16 +128,6 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
       if (opts.target !== 'all') return outcome;
     }
     return completed(ctx, `Completed ${targets.length} phase(s) of ${milestone.id}.`);
-  }
-}
-
-/** Leftover attempt workspaces from a crashed run can never contaminate a new one. */
-function discardOrphanWorkspaces(ctx: WorkflowContext): void {
-  const wsDir = path.join(ctx.paths.runtimeDir, 'workspaces');
-  if (!exists(wsDir)) return;
-  for (const entry of fs.readdirSync(wsDir)) {
-    fs.rmSync(path.join(wsDir, entry), { recursive: true, force: true });
-    ctx.bus.emit('workspace.orphan_discarded', { message: `workspace órfão descartado: ${entry}` }, { workspace: entry });
   }
 }
 
