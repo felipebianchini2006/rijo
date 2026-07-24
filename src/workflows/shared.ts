@@ -3,13 +3,14 @@ import { loadConfig } from '../core/config.js';
 import { ProgressBus, consoleSink, newRunId, type ProgressSink } from '../core/progress.js';
 import { acquireLock, releaseLock } from '../core/locks.js';
 import { readState, writeState } from '../core/state.js';
-import { checkSchemaCompatibility, SchemaMismatchError, touchManifest } from '../core/manifest.js';
+import { SchemaMismatchError, touchManifest } from '../core/manifest.js';
+import { ensureSchemaCompatible, MigrationError } from '../core/migrate.js';
 import { exists } from '../core/fsx.js';
 import type { RijoConfig } from '../core/schemas/index.js';
 import type { AgentRunner } from '../agents/runner.js';
 import { UnboundAgentRunner, runBatch, runValidated } from '../agents/runner.js';
 import { tierFor } from '../agents/roles.js';
-import type { AgentTask, AgentResult } from '../agents/protocol.js';
+import { AgentTaskSchema, type AgentTask, type AgentTaskDraft, type AgentResult } from '../agents/protocol.js';
 import type { ShellRunner } from '../core/commands.js';
 import { SystemShellRunner } from '../core/commands.js';
 import type { GitOps } from '../core/git.js';
@@ -60,15 +61,24 @@ export class BlockedError extends Error {
 }
 
 /**
- * Guard against running against an incompatible on-disk schema. Returns a
- * blocked outcome if the manifest schema_version differs from this build.
+ * Guard against running against an incompatible on-disk schema. An OLDER
+ * schema is migrated in place (backup + deterministic transform) before the
+ * workflow proceeds; a NEWER schema blocks — an old build never touches a
+ * newer project. Returns a blocked outcome on failure, null when compatible.
  */
 export function guardSchema(ctx: WorkflowContext): WorkflowOutcome | null {
   try {
-    checkSchemaCompatibility(ctx.paths);
+    const report = ensureSchemaCompatible(ctx.paths, ctx.now);
+    if (report && report.changed.length > 0) {
+      ctx.bus.emit('schema.migrated', {
+        message: `schema migrado v${report.from} → v${report.to} (backup em ${report.backupDir})`,
+      });
+    }
     return null;
   } catch (err) {
-    if (err instanceof SchemaMismatchError) return blocked(ctx, 'Schema version mismatch.', [err.message]);
+    if (err instanceof SchemaMismatchError || err instanceof MigrationError) {
+      return blocked(ctx, 'Schema version mismatch.', [err instanceof Error ? err.message : String(err)]);
+    }
     throw err;
   }
 }
@@ -95,12 +105,13 @@ export interface WorkflowOutcome {
  * model routing becomes operational: the deterministic core resolves tier from
  * config.yml and the runner (or host bridge) receives it on every task.
  */
-export async function dispatch(ctx: WorkflowContext, task: AgentTask): Promise<AgentResult> {
-  return runValidated(ctx.runner, { ...task, tier: task.tier ?? tierFor(ctx.config, task.role) });
+export async function dispatch(ctx: WorkflowContext, task: AgentTaskDraft): Promise<AgentResult> {
+  const full: AgentTask = AgentTaskSchema.parse({ ...task, tier: task.tier ?? tierFor(ctx.config, task.role) });
+  return runValidated(ctx.runner, full);
 }
 
-export async function dispatchBatch(ctx: WorkflowContext, tasks: AgentTask[], max?: number): Promise<AgentResult[]> {
-  const withTier = tasks.map((t) => ({ ...t, tier: t.tier ?? tierFor(ctx.config, t.role) }));
+export async function dispatchBatch(ctx: WorkflowContext, tasks: AgentTaskDraft[], max?: number): Promise<AgentResult[]> {
+  const withTier = tasks.map((t) => AgentTaskSchema.parse({ ...t, tier: t.tier ?? tierFor(ctx.config, t.role) }));
   return runBatch(ctx.runner, withTier, max ?? ctx.config.limits.max_parallel_agents);
 }
 

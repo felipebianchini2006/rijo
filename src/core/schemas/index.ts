@@ -1,10 +1,97 @@
 import { z } from 'zod';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** Model roles are abstract tiers; adapters map them to concrete models. */
 export const ModelRoleSchema = z.enum(['lead', 'reviewer', 'planner', 'worker', 'researcher', 'qa']);
 export type ModelRole = z.infer<typeof ModelRoleSchema>;
+
+/**
+ * Concrete model mapping per provider tier. `model` is a real, host-valid
+ * model name/alias — never an abstract tier string. Validated against the
+ * host's known aliases at adapter-generation time.
+ */
+export const ClaudeTierSchema = z.object({
+  model: z.string().min(1),
+  effort: z.enum(['low', 'medium', 'high']).default('medium'),
+});
+export const CodexTierSchema = z.object({
+  model: z.string().min(1),
+  reasoning_effort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh']).default('medium'),
+});
+export type ClaudeTier = z.infer<typeof ClaudeTierSchema>;
+export type CodexTier = z.infer<typeof CodexTierSchema>;
+
+const DEFAULT_CLAUDE_TIERS: Record<string, ClaudeTier> = {
+  strongest: { model: 'opus', effort: 'high' },
+  'strongest-independent': { model: 'opus', effort: 'high' },
+  'balanced-reasoning': { model: 'sonnet', effort: 'high' },
+  'economical-coding': { model: 'sonnet', effort: 'medium' },
+  'economical-research': { model: 'haiku', effort: 'medium' },
+  'economical-browser': { model: 'sonnet', effort: 'medium' },
+};
+const DEFAULT_CODEX_TIERS: Record<string, CodexTier> = {
+  strongest: { model: 'gpt-5.2-codex', reasoning_effort: 'high' },
+  'strongest-independent': { model: 'gpt-5.2-codex', reasoning_effort: 'high' },
+  'balanced-reasoning': { model: 'gpt-5.2-codex', reasoning_effort: 'medium' },
+  'economical-coding': { model: 'gpt-5.2-codex', reasoning_effort: 'medium' },
+  'economical-research': { model: 'gpt-5.2-codex', reasoning_effort: 'low' },
+  'economical-browser': { model: 'gpt-5.2-codex', reasoning_effort: 'medium' },
+};
+
+/** Viewport used by the QA gate's real browser runs. */
+export const ViewportSchema = z.object({
+  name: z.string().min(1),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+});
+export type Viewport = z.infer<typeof ViewportSchema>;
+
+/**
+ * QA gate configuration: how `rijo check --production` starts, health-checks
+ * and drives the application under test. `start_command` is a structured argv
+ * (never a shell string).
+ */
+export const QaConfigSchema = z.object({
+  start_command: z.array(z.string()).default([]),
+  base_url: z.string().default('http://127.0.0.1:3000'),
+  health_url: z.string().default(''),
+  startup_timeout_ms: z.number().int().positive().default(60_000),
+  shutdown_timeout_ms: z.number().int().positive().default(10_000),
+  browsers: z.array(z.string()).default(['chromium']),
+  viewports: z
+    .array(ViewportSchema)
+    .default([
+      { name: 'desktop', width: 1440, height: 900 },
+      { name: 'mobile', width: 390, height: 844 },
+    ]),
+  /** journey ids explicitly waived, each with an auditable reason. */
+  waivers: z.array(z.object({ journey_id: z.string(), reason: z.string().min(1) })).default([]),
+});
+export type QaConfig = z.infer<typeof QaConfigSchema>;
+
+/**
+ * Execution policy configuration. `sandbox: 'required'` blocks repository-code
+ * execution when no OS sandbox is available; `'approved-unsandboxed'` is the
+ * explicit, auditable opt-out (recorded in every evidence entry).
+ */
+export const ExecutionConfigSchema = z.object({
+  sandbox: z.enum(['required', 'approved-unsandboxed']).default('required'),
+  network_default: z.enum(['none', 'restricted', 'enabled']).default('none'),
+  env_allowlist: z.array(z.string()).default([]),
+  command_timeout_ms: z.number().int().positive().default(10 * 60 * 1000),
+});
+export type ExecutionConfig = z.infer<typeof ExecutionConfigSchema>;
+
+/** Research policy: volatile decisions fail closed unless explicitly waived. */
+export const ResearchConfigSchema = z.object({
+  fail_closed: z.boolean().default(true),
+  /** auditable waivers: topic key -> reason */
+  waivers: z.array(z.object({ key: z.string(), reason: z.string().min(1) })).default([]),
+  /** compact sources.json when it exceeds this many entries */
+  max_sources: z.number().int().positive().default(500),
+});
+export type ResearchConfig = z.infer<typeof ResearchConfigSchema>;
 
 export const ConfigSchema = z.object({
   schema_version: z.number().int().default(SCHEMA_VERSION),
@@ -16,6 +103,12 @@ export const ConfigSchema = z.object({
       worker: z.string().default('economical-coding'),
       researcher: z.string().default('economical-research'),
       qa: z.string().default('economical-browser'),
+    })
+    .default({}),
+  providers: z
+    .object({
+      claude: z.record(z.string(), ClaudeTierSchema).default(DEFAULT_CLAUDE_TIERS),
+      codex: z.record(z.string(), CodexTierSchema).default(DEFAULT_CODEX_TIERS),
     })
     .default({}),
   limits: z
@@ -34,6 +127,9 @@ export const ConfigSchema = z.object({
       commit: z.boolean().default(true),
     })
     .default({}),
+  qa: QaConfigSchema.default({}),
+  execution: ExecutionConfigSchema.default({}),
+  research: ResearchConfigSchema.default({}),
 });
 export type RijoConfig = z.infer<typeof ConfigSchema>;
 
@@ -152,6 +248,46 @@ export const RequirementSchema = z.object({
 });
 export type Requirement = z.infer<typeof RequirementSchema>;
 
+/**
+ * Explicit task lifecycle. `done: true` is only ever derived from DONE; an
+ * IMPLEMENTED task whose patch was applied but not yet verified is visibly
+ * partial and is deterministically re-verified (never silently promoted) on
+ * resume. Transitions are validated by `assertTaskTransition`.
+ */
+export const TaskStatusSchema = z.enum([
+  'PENDING',
+  'RUNNING',
+  'IMPLEMENTED',
+  'VERIFYING',
+  'VERIFIED',
+  'DONE',
+  'FAILED',
+  'BLOCKED',
+]);
+export type TaskStatus = z.infer<typeof TaskStatusSchema>;
+
+const TASK_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+  PENDING: ['RUNNING', 'BLOCKED'],
+  RUNNING: ['IMPLEMENTED', 'FAILED', 'BLOCKED'],
+  IMPLEMENTED: ['VERIFYING', 'FAILED', 'BLOCKED'],
+  VERIFYING: ['VERIFIED', 'FAILED', 'BLOCKED'],
+  VERIFIED: ['DONE', 'VERIFYING', 'BLOCKED'],
+  DONE: [],
+  FAILED: ['PENDING'],
+  BLOCKED: ['PENDING'],
+};
+
+export class InvalidTaskTransitionError extends Error {
+  constructor(taskId: string, from: TaskStatus, to: TaskStatus) {
+    super(`Task ${taskId}: invalid lifecycle transition ${from} → ${to}`);
+    this.name = 'InvalidTaskTransitionError';
+  }
+}
+
+export function assertTaskTransition(taskId: string, from: TaskStatus, to: TaskStatus): void {
+  if (!TASK_TRANSITIONS[from].includes(to)) throw new InvalidTaskTransitionError(taskId, from, to);
+}
+
 export const PlanTaskSchema = z.object({
   id: z.string().regex(/^T\d{2}$/),
   name: z.string().min(1),
@@ -171,6 +307,8 @@ export const PlanTaskSchema = z.object({
    * blocking the phase. Everything else must produce real command evidence.
    */
   no_execution_justification: z.string().nullable().default(null),
+  status: TaskStatusSchema.default('PENDING'),
+  /** Derived convenience flag: true only when status is DONE. */
   done: z.boolean().default(false),
 });
 export type PlanTask = z.infer<typeof PlanTaskSchema>;

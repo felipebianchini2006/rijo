@@ -7,7 +7,7 @@ import type { CommandEvidence } from '../core/commands.js';
 import { deriveJourneys, JourneyResultSchema, type Journey, type JourneyResult } from '../qa/journeys.js';
 import { generatePlaywrightSpecs } from '../qa/playwright.js';
 import { decideReadiness } from '../qa/readiness.js';
-import type { AgentTask } from '../agents/protocol.js';
+import type { AgentTaskDraft } from '../agents/protocol.js';
 import {
   createContext,
   withLock,
@@ -89,7 +89,7 @@ export async function checkWorkflow(
           const failingChecks = checks.filter((c) => c.exit_code !== 0);
           if (failingJourneys.length === 0 && failingChecks.length === 0) break;
           bus.emit('check.fix', { stage: 'REPAIR', message: `rodada ${round}: corrigindo por causa raiz` });
-          const fixTask: AgentTask = {
+          const fixTask: AgentTaskDraft = {
             id: `check-fix-${round}`,
             role: 'worker',
             objective: 'Group the failing checks and journey findings by root cause and fix them in limited scope. Do not fix symptoms individually when one cause explains several failures.',
@@ -116,7 +116,7 @@ export async function checkWorkflow(
 
       // ---- 10: independent visual review
       bus.emit('check.visual', { stage: 'REPORT', message: 'revisão visual independente' });
-      const visualTask: AgentTask = {
+      const visualTask: AgentTaskDraft = {
         id: 'check-visual',
         role: 'reviewer',
         objective:
@@ -263,7 +263,7 @@ function runDeterministicChecks(ctx: WorkflowContext): CommandEvidence[] {
 }
 
 async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journey[]): Promise<JourneyResult[]> {
-  const tasks: AgentTask[] = journeys.map((j) => ({
+  const tasks: AgentTaskDraft[] = journeys.map((j) => ({
     id: `journey-${j.id}`,
     role: 'qa',
     objective: [

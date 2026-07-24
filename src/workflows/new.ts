@@ -22,12 +22,12 @@ import {
   updateMilestonesIndex,
   type CarryoverItem,
 } from '../core/milestones.js';
-import { writeRequirements, writeRoadmap, readRequirements } from '../core/roadmap.js';
+import { writeRequirements, writeRoadmap, readRequirements, readRoadmap } from '../core/roadmap.js';
 import { validateTraceability } from '../core/traceability.js';
 import { RequirementSchema, RoadmapPhaseSchema } from '../core/schemas/index.js';
 import { ResearchStore } from '../research/cache.js';
 import { renderBrief } from '../agents/prompts.js';
-import type { AgentTask } from '../agents/protocol.js';
+import { AgentTaskSchema, type AgentTaskDraft } from '../agents/protocol.js';
 import { generateAdapters } from '../adapters/index.js';
 import {
   createContext,
@@ -136,6 +136,20 @@ export async function newWorkflow(
           'Resume it with `rijo run` or resolve the checkpoint before starting the next milestone.',
         ]);
       }
+      // A phase mid-flight (or blocked) in the active milestone also holds the
+      // transition: STATE.md only records verified checkpoints, so the roadmap
+      // is the authority for in-progress execution.
+      if (activePrev && exists(activePrev.paths.roadmap)) {
+        const openPhase = readRoadmap(activePrev.paths.roadmap).phases.find(
+          (p) => p.status === 'IN_PROGRESS' || p.status === 'BLOCKED',
+        );
+        if (openPhase) {
+          return blocked(ctx, 'An interrupted execution checkpoint exists.', [
+            `Milestone ${activePrev.id}, phase ${openPhase.id} is ${openPhase.status}.`,
+            'Resume it with `rijo run` or resolve the checkpoint before starting the next milestone.',
+          ]);
+        }
+      }
       if (gitStatus.isRepo && gitStatus.dirtyFiles.length > 0) {
         return blocked(ctx, 'Unknown local changes present; they will never be discarded or stashed automatically.', [
           `Dirty files: ${gitStatus.dirtyFiles.slice(0, 20).join(', ')}`,
@@ -154,7 +168,7 @@ export async function newWorkflow(
     bus.emit('new.analyze', { stage: 'ANALYZE', message: 'extraindo escopo e requisitos do plano' });
     const planContent = readText(planPath);
     const previousContext = opts.next ? summarizePreviousMilestones(ctx) : '';
-    const extractTask: AgentTask = {
+    const extractTask: AgentTaskDraft = {
       id: 'new-extract',
       role: 'planner',
       objective:
@@ -173,7 +187,7 @@ export async function newWorkflow(
     };
     const extractResult = await dispatch(ctx, extractTask);
     if (!extractResult.ok || !extractResult.payload) {
-      return blocked(ctx, 'Plan extraction failed.', [extractResult.summary, `Brief was:\n${renderBrief(extractTask).slice(0, 400)}…`]);
+      return blocked(ctx, 'Plan extraction failed.', [extractResult.summary, `Brief was:\n${renderBrief(AgentTaskSchema.parse(extractTask)).slice(0, 400)}…`]);
     }
     const parsed = PlanExtractionSchema.safeParse(extractResult.payload);
     if (!parsed.success) {
@@ -299,7 +313,7 @@ export async function newWorkflow(
     const cached = topics.filter((t) => store.lookup(t.key));
     let researchSummaries: string[] = cached.map((t) => `- ${t.topic}: (cache) ${store.lookup(t.key)!.summary}`);
     if (toResearch.length > 0) {
-      const tasks: AgentTask[] = toResearch.map((t, i) => ({
+      const tasks: AgentTaskDraft[] = toResearch.map((t, i) => ({
         id: `new-research-${i + 1}`,
         role: 'researcher',
         objective: `Research: ${t.topic}. Prefer official docs, release/LTS pages, changelogs, security advisories, official registries. Never assume newest is best; weigh stability, support, security, compatibility, migration cost. Separate fact, inference and recommendation.`,

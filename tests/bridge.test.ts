@@ -98,9 +98,10 @@ function fakeHostResult(task: AgentTask, root: string): AgentResult {
   // worker executor: write each non-glob scope path into the project
   if (task.role === 'worker' && task.id.startsWith('exec-')) {
     const written: string[] = [];
+    const base = task.workspace?.root ?? root;
     for (const scope of task.write_scope) {
       if (scope.includes('*')) continue;
-      const target = path.join(root, scope);
+      const target = path.join(base, scope);
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, `// ${task.id}\n`, 'utf8');
       written.push(scope);
@@ -118,10 +119,11 @@ function fakeHostResult(task: AgentTask, root: string): AgentResult {
   }
   // spec writer: write SPEC.md to the declared write scope, report it
   if (task.id.startsWith('spec-')) {
-    const specPath = task.write_scope[0]!;
+    const specBase = task.workspace?.root ?? root;
+    const specPath = path.isAbsolute(task.write_scope[0]!) ? task.write_scope[0]! : path.join(specBase, task.write_scope[0]!);
     fs.mkdirSync(path.dirname(specPath), { recursive: true });
     fs.writeFileSync(specPath, `# Spec\n\nCenários observáveis de aceite.\n`, 'utf8');
-    return okResult(task, { files_written: [specPath] });
+    return okResult(task, { files_written: [task.write_scope[0]!] });
   }
   // researcher: sources payload
   if (task.id.startsWith('new-research')) {

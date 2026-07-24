@@ -13,6 +13,10 @@ export interface GitOps {
   commitPaths(cwd: string, message: string, paths: string[]): string | null;
   tag(cwd: string, name: string, message: string): boolean;
   init(cwd: string): boolean;
+  /** Paths changed between two commits (name-only). Empty on error. */
+  diffNames(cwd: string, from: string, to: string): string[];
+  /** Detached checkout of an exact commit into a new directory (isolated verification workspace). */
+  checkoutInto(cwd: string, commit: string, destDir: string): boolean;
 }
 
 function git(cwd: string, args: string[]): { code: number; out: string } {
@@ -59,6 +63,20 @@ export class SystemGit implements GitOps {
   init(cwd: string): boolean {
     return git(cwd, ['init', '-b', 'main']).code === 0;
   }
+
+  diffNames(cwd: string, from: string, to: string): string[] {
+    const r = git(cwd, ['diff', '--name-only', `${from}..${to}`]);
+    return r.code === 0 && r.out ? r.out.split('\n').filter(Boolean) : [];
+  }
+
+  /**
+   * Materialize the exact commit into destDir without touching the working
+   * tree: `git worktree add --detach` gives a clean checkout that shares the
+   * object store. Returns false when the commit does not exist.
+   */
+  checkoutInto(cwd: string, commit: string, destDir: string): boolean {
+    return git(cwd, ['worktree', 'add', '--detach', destDir, commit]).code === 0;
+  }
 }
 
 /** Test double: in-memory git. Tracks which paths were committed. */
@@ -90,5 +108,16 @@ export class FakeGit implements GitOps {
   init(): boolean {
     this.repo = true;
     return true;
+  }
+  diffNames(_cwd: string, from: string, to: string): string[] {
+    const idxFrom = this.commits.findIndex((c) => c.hash === from);
+    const idxTo = this.commits.findIndex((c) => c.hash === to);
+    if (idxFrom < 0 || idxTo < 0) return [];
+    const names = new Set<string>();
+    for (let i = idxFrom + 1; i <= idxTo; i++) for (const p of this.commits[i]!.paths) names.add(p);
+    return [...names].sort();
+  }
+  checkoutInto(): boolean {
+    return false; // in-memory double cannot materialize a checkout
   }
 }

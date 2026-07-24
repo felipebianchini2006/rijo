@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { exists, writeFileAtomic, readText } from '../core/fsx.js';
 import { serializeFrontmatter, parseFrontmatter } from '../core/frontmatter.js';
 import { snapshotFiles, diffSnapshots, pathInScope } from '../core/scope.js';
-import type { AgentTask } from '../agents/protocol.js';
+import type { AgentTaskDraft } from '../agents/protocol.js';
 import {
   createContext,
   withLock,
@@ -82,7 +82,7 @@ export async function fixWorkflow(
     // ---- reproduce + diagnose (agent), bounded attempts
     let diagnosis: z.infer<typeof DiagnosisSchema> | null = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const diagTask: AgentTask = {
+      const diagTask: AgentTaskDraft = {
         id: `fix-diagnose-${attempt}`,
         role: 'lead',
         objective: `Reproduce this problem BEFORE editing anything, then identify the root cause: "${opts.description}". Formulate hypotheses and test the most likely one with evidence.`,
@@ -124,7 +124,7 @@ export async function fixWorkflow(
     const fixBaseline = snapshotFiles(projectRoot);
     let repair: z.infer<typeof RepairSchema> | null = null;
     for (let attempt = 1; attempt <= config.limits.fix_attempts; attempt++) {
-      const repairTask: AgentTask = {
+      const repairTask: AgentTaskDraft = {
         id: `fix-repair-${attempt}`,
         role: 'worker',
         objective: `Apply the smallest coherent fix for the diagnosed root cause. Add a regression test when technically possible. Root cause: ${diagnosis.root_cause}. Reproduction: ${diagnosis.reproduction_steps}`,

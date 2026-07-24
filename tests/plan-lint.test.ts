@@ -5,7 +5,7 @@ import {
   lintPlan,
   scopesOverlap,
   parallelGroups,
-  markTaskDone,
+  setTaskStatus,
   writePlan,
   readPlan,
 } from '../src/core/plan.js';
@@ -168,7 +168,7 @@ describe('parallelGroups', () => {
   });
 });
 
-describe('markTaskDone', () => {
+describe('setTaskStatus (task lifecycle)', () => {
   let root: string;
 
   beforeEach(() => {
@@ -179,7 +179,7 @@ describe('markTaskDone', () => {
     cleanup(root);
   });
 
-  it('flips done and persists it to the plan file', () => {
+  it('walks the full lifecycle and only DONE flips the done flag', () => {
     const planPath = path.join(root, 'PLAN.md');
     const plan: PhasePlan = {
       phase: '01',
@@ -188,19 +188,39 @@ describe('markTaskDone', () => {
     writePlan(planPath, plan, 'A short narrative for the phase.');
 
     const before = readPlan(planPath);
+    expect(before.tasks.map((t) => t.status)).toEqual(['PENDING', 'PENDING']);
     expect(before.tasks.map((t) => t.done)).toEqual([false, false]);
 
-    const returned = markTaskDone(planPath, 'T01');
+    setTaskStatus(planPath, 'T01', 'RUNNING');
+    setTaskStatus(planPath, 'T01', 'IMPLEMENTED');
+    // implemented is visible but NOT done — no promotion without verification
+    let mid = readPlan(planPath);
+    expect(mid.tasks.find((t) => t.id === 'T01')!.status).toBe('IMPLEMENTED');
+    expect(mid.tasks.find((t) => t.id === 'T01')!.done).toBe(false);
+
+    setTaskStatus(planPath, 'T01', 'VERIFYING');
+    setTaskStatus(planPath, 'T01', 'VERIFIED');
+    const returned = setTaskStatus(planPath, 'T01', 'DONE');
     expect(returned.tasks.find((t) => t.id === 'T01')!.done).toBe(true);
 
     const after = readPlan(planPath);
+    expect(after.tasks.find((t) => t.id === 'T01')!.status).toBe('DONE');
     expect(after.tasks.find((t) => t.id === 'T01')!.done).toBe(true);
     expect(after.tasks.find((t) => t.id === 'T02')!.done).toBe(false);
+  });
+
+  it('rejects skipping the lifecycle (PENDING → DONE is a core error)', () => {
+    const planPath = path.join(root, 'PLAN.md');
+    writePlan(planPath, { phase: '01', tasks: [task('T01'), task('T02')] }, 'narrative');
+    expect(() => setTaskStatus(planPath, 'T01', 'DONE')).toThrow(/invalid lifecycle transition/);
+    expect(() => setTaskStatus(planPath, 'T01', 'VERIFIED')).toThrow(/invalid lifecycle transition/);
+    // the failed attempts persisted nothing
+    expect(readPlan(planPath).tasks.find((t) => t.id === 'T01')!.status).toBe('PENDING');
   });
 
   it('throws for an unknown task id', () => {
     const planPath = path.join(root, 'PLAN.md');
     writePlan(planPath, { phase: '01', tasks: [task('T01'), task('T02')] }, 'narrative');
-    expect(() => markTaskDone(planPath, 'T99')).toThrow(/T99 not found/);
+    expect(() => setTaskStatus(planPath, 'T99', 'RUNNING')).toThrow(/T99 not found/);
   });
 });

@@ -163,10 +163,12 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
     .on(
       (t) => t.id.startsWith('spec-'),
       (t) => {
-        const specPath = t.write_scope[0]!;
+        // spec writer runs in an isolated workspace; the relative spec path is its write scope
+        const base = t.workspace?.root ?? root;
+        const specPath = path.isAbsolute(t.write_scope[0]!) ? t.write_scope[0]! : path.join(base, t.write_scope[0]!);
         fs.mkdirSync(path.dirname(specPath), { recursive: true });
         fs.writeFileSync(specPath, `# Spec\n\nCenários observáveis de aceite.\n`, 'utf8');
-        return ok(t, { files_written: [specPath] });
+        return ok(t, { files_written: [t.write_scope[0]!] });
       },
     )
     .on(
@@ -184,11 +186,12 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
     .on(
       (t) => t.role === 'worker' && t.id.startsWith('exec-'),
       (t) => {
-        // simulate the worker touching its write scope inside the project
+        // simulate the worker touching its write scope inside its ISOLATED workspace
+        const base = t.workspace?.root ?? root;
         const written: string[] = [];
         for (const scope of t.write_scope) {
           if (scope.includes('*')) continue;
-          const target = path.join(root, scope);
+          const target = path.join(base, scope);
           fs.mkdirSync(path.dirname(target), { recursive: true });
           fs.writeFileSync(target, `// ${t.id}\n`, 'utf8');
           written.push(scope);

@@ -24,8 +24,23 @@ export const AgentTaskSchema = z.object({
   return_format: z.string().min(1),
   /** extra instructions (kept short; the brief IS the context) */
   notes: z.string().default(''),
+  /**
+   * Isolated attempt workspace. When present, ALL writes happen under `root`;
+   * the controlled checkout is off-limits and any change there is a violation.
+   * Reviewers and researchers get null (read-only by default).
+   */
+  workspace: z.object({ id: z.string(), root: z.string() }).nullable().default(null),
+  /**
+   * Immutable canonical baseline this task was briefed against: the sha256 of
+   * the manifest's hash map at dispatch time. A result is only applicable
+   * while this baseline is still current (checked by the core, never by the
+   * agent).
+   */
+  canonical_baseline: z.string().nullable().default(null),
 });
 export type AgentTask = z.infer<typeof AgentTaskSchema>;
+/** Authoring shape: fields with defaults (workspace, canonical_baseline, …) may be omitted. */
+export type AgentTaskDraft = z.input<typeof AgentTaskSchema>;
 
 export const AgentResultSchema = z.object({
   task_id: z.string(),

@@ -7,7 +7,7 @@ import { extractZipSafely, UnsafeZipError, type ZipInspection } from '../securit
 import { activeMilestone } from '../core/milestones.js';
 import { touchManifest } from '../core/manifest.js';
 import { readState, writeState, initialState } from '../core/state.js';
-import type { AgentTask } from '../agents/protocol.js';
+import type { AgentTaskDraft } from '../agents/protocol.js';
 import {
   createContext,
   withLock,
@@ -117,7 +117,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     // ---- 6-14: agent-driven mapping + conversion
     bus.emit('ui.convert', { stage: 'IMPORT', message: 'mapeando e convertendo para o stack do projeto' });
     const mappingPath = path.join(importDir, 'MAPPING.md');
-    const convertTask: AgentTask = {
+    const convertTask: AgentTaskDraft = {
       id: `ui-convert-${importId}`,
       role: 'worker',
       objective: [
@@ -157,7 +157,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     let validationNote = 'browser validation SKIPPED: capability unavailable (recorded, not simulated)';
     if (ctx.runner.capabilities.browser) {
       bus.emit('ui.validate', { stage: 'UI_SMOKE', message: 'validando desktop/tablet/mobile, a11y, console' });
-      const validateTask: AgentTask = {
+      const validateTask: AgentTaskDraft = {
         id: `ui-validate-${importId}`,
         role: 'qa',
         objective:

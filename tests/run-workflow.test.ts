@@ -166,18 +166,26 @@ describe('rijo run', () => {
     await newWorkflow(root, { planFile: '@PLANO.md' }, d);
     const first = await runWorkflow(root, {}, d);
     expect(first.status).toBe('blocked');
-    // T01 is checkpointed as done in the plan
+    // T01's patch was applied but the phase never verified: the plan shows the
+    // partial implementation WITHOUT promoting it to done.
     const planPath = path.join(milestoneDir(root), 'phases', '01-catalogo', 'PLAN.md');
-    expect(readPlan(planPath).tasks.find((t) => t.id === 'T01')!.done).toBe(true);
+    const t01AfterFirst = readPlan(planPath).tasks.find((t) => t.id === 'T01')!;
+    expect(t01AfterFirst.status).toBe('IMPLEMENTED');
+    expect(t01AfterFirst.done).toBe(false);
+    // the failed T02 attempt left no trace in the checkout
+    expect(fs.existsSync(path.join(root, 'src', 'b.ts'))).toBe(false);
 
     const execCountAfterFirst = d.runner.executed.filter((t) => t.id === 'exec-01-T01').length;
     failT02 = false;
     const second = await runWorkflow(root, {}, d);
     expect(second.ok, second.message).toBe(true);
-    // T01 was NOT re-executed on resume
+    // T01 was NOT re-executed on resume (it was re-VERIFIED, never re-implemented)
     expect(d.runner.executed.filter((t) => t.id === 'exec-01-T01').length).toBe(execCountAfterFirst);
     // spec/plan not regenerated
     expect(d.runner.executed.filter((t) => t.id === 'spec-01').length).toBe(1);
+    // both tasks reached DONE through the full lifecycle
+    const finalPlan = readPlan(planPath);
+    expect(finalPlan.tasks.every((t) => t.status === 'DONE' && t.done)).toBe(true);
   });
 
   it('parallel tasks with disjoint write scopes run in one batch; overlapping are serialized', async () => {
@@ -198,13 +206,27 @@ describe('rijo run', () => {
     expect(workers).toHaveLength(2);
   });
 
-  it('scope violation by a worker is rejected', async () => {
+  it('scope violation by a worker is rejected and leaves no changes', async () => {
     const d = deps(root);
     d.runner.on(
       (t) => t.id === 'exec-01-T01',
-      (t) => ok(t, { files_written: ['src/OUTSIDE.ts'], payload: { done: true, notes: '' } }),
+      (t) => {
+        // the worker REALLY writes outside its scope, inside its workspace,
+        // and hides it from files_written (lying payload)
+        const base = t.workspace!.root;
+        fs.mkdirSync(path.join(base, 'src'), { recursive: true });
+        fs.writeFileSync(path.join(base, 'src', 'a.ts'), '// in scope\n');
+        fs.writeFileSync(path.join(base, 'src', 'OUTSIDE.ts'), '// hidden out-of-scope\n');
+        return ok(t, { files_written: ['src/a.ts'], payload: { done: true, notes: '' } });
+      },
     );
     await newWorkflow(root, { planFile: '@PLANO.md' }, d);
-    await expect(runWorkflow(root, {}, d)).rejects.toThrow(/outside its declared scope/);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toMatch(/outside its individual write scope/);
+    // NOTHING from the violating attempt reached the checkout — not even the
+    // in-scope part (the workspace is discarded whole)
+    expect(fs.existsSync(path.join(root, 'src', 'OUTSIDE.ts'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'src', 'a.ts'))).toBe(false);
   });
 });

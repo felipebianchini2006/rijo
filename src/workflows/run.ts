@@ -1,20 +1,30 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { exists, readText, readTextIfExists, writeFileAtomic, ensureDir } from '../core/fsx.js';
 import { parseFrontmatter, serializeFrontmatter } from '../core/frontmatter.js';
 import { phasePaths, type PhasePaths } from '../core/paths.js';
 import { readState, writeState, initialState } from '../core/state.js';
-import { touchManifest, checkSchemaCompatibility, SchemaMismatchError } from '../core/manifest.js';
+import { touchManifest, canonicalBaselineHash } from '../core/manifest.js';
 import { activeMilestone, type MilestoneRef } from '../core/milestones.js';
 import { readRequirements, readRoadmap, writeRequirements, writeRoadmap, nextPhase, type RoadmapDoc } from '../core/roadmap.js';
-import { readPlan, writePlan, lintPlan, markTaskDone, parallelGroups } from '../core/plan.js';
+import { readPlan, writePlan, lintPlan, setTaskStatus, parallelGroups } from '../core/plan.js';
 import { validateStateIntegrity } from '../core/traceability.js';
 import { checkContextBudget } from '../core/contextBudget.js';
-import { snapshotFiles, diffSnapshots, enforceScopeDelta, pathInScope, type FileSnapshot } from '../core/scope.js';
+import { snapshotFiles, diffSnapshots, pathInScope, type FileSnapshot } from '../core/scope.js';
+import {
+  AttemptWorkspace,
+  snapshotTree,
+  diffTrees,
+  WorkspaceScopeError,
+  CanonicalWriteError,
+  SymlinkEscapeError,
+  PatchConflictError,
+} from '../core/workspace.js';
 import { redact } from '../security/redact.js';
-import { PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, type RoadmapPhase, type PhasePlan } from '../core/schemas/index.js';
+import { PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
 import type { CommandEvidence } from '../core/commands.js';
-import type { AgentTask } from '../agents/protocol.js';
+import type { AgentTask, AgentResult } from '../agents/protocol.js';
 import {
   createContext,
   withLock,
@@ -23,6 +33,7 @@ import {
   failed,
   dispatch,
   dispatchBatch,
+  guardSchema,
   type WorkflowContext,
   type WorkflowDeps,
   type WorkflowOutcome,
@@ -78,12 +89,9 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
   {
     // ---- LOAD
     bus.emit('run.load', { status: 'running', stage: 'LOAD', message: 'validando manifest, drift e checkpoint' });
-    try {
-      checkSchemaCompatibility(paths);
-    } catch (err) {
-      if (err instanceof SchemaMismatchError) return blocked(ctx, 'Schema version mismatch.', [err.message]);
-      throw err;
-    }
+    const schemaGuard = guardSchema(ctx);
+    if (schemaGuard) return schemaGuard;
+    discardOrphanWorkspaces(ctx);
     const integrity = validateStateIntegrity(paths);
     const errors = integrity.filter((i) => i.severity === 'error');
     if (errors.length > 0) {
@@ -120,6 +128,16 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
   }
 }
 
+/** Leftover attempt workspaces from a crashed run can never contaminate a new one. */
+function discardOrphanWorkspaces(ctx: WorkflowContext): void {
+  const wsDir = path.join(ctx.paths.runtimeDir, 'workspaces');
+  if (!exists(wsDir)) return;
+  for (const entry of fs.readdirSync(wsDir)) {
+    fs.rmSync(path.join(wsDir, entry), { recursive: true, force: true });
+    ctx.bus.emit('workspace.orphan_discarded', { message: `workspace órfão descartado: ${entry}` }, { workspace: entry });
+  }
+}
+
 function resolveTargets(ctx: WorkflowContext, roadmap: RoadmapDoc, target?: string): RoadmapPhase[] {
   if (target && /^\d{2}$/.test(target)) {
     const phase = roadmap.phases.find((p) => p.id === target);
@@ -152,6 +170,58 @@ function resolveTargets(ctx: WorkflowContext, roadmap: RoadmapDoc, target?: stri
   }
   const np = nextPhase(roadmap);
   return np ? [np] : [];
+}
+
+/** Attempt bundle: the dispatched task plus its isolated workspace. */
+interface Attempt {
+  task: AgentTask;
+  workspace: AttemptWorkspace;
+}
+
+/**
+ * Prepare an isolated attempt: create the workspace, remap the brief's file
+ * references into it and stamp the canonical baseline. The agent only ever
+ * sees (and writes) the workspace copy.
+ */
+function prepareAttempt(
+  ctx: WorkflowContext,
+  task: AgentTask,
+  opts: { canonicalWriteScope?: string[] } = {},
+): Attempt {
+  const baseline = canonicalBaselineHash(ctx.paths);
+  const workspace = AttemptWorkspace.create(ctx.projectRoot, {
+    taskId: task.id,
+    writeScope: task.write_scope,
+    canonicalWriteScope: opts.canonicalWriteScope,
+    baselineCommit: ctx.git.status(ctx.projectRoot).isRepo ? ctx.git.headCommit(ctx.projectRoot) : null,
+    baselineCanonicalHash: baseline,
+  });
+  const remap = (p: string) => {
+    const rel = path.relative(ctx.projectRoot, p);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) return p;
+    return path.join(workspace.root, rel);
+  };
+  const remapped: AgentTask = {
+    ...task,
+    canonical_files: task.canonical_files.map(remap),
+    code_files: task.code_files.map(remap),
+    workspace: { id: workspace.id, root: workspace.root },
+    canonical_baseline: baseline,
+  };
+  return { task: remapped, workspace };
+}
+
+/**
+ * A read-only dispatch (reviewer/researcher/planner returning a payload):
+ * no workspace, empty write scope, and the controlled checkout is verified
+ * untouched afterwards — a "read-only" agent that wrote anything is a hard
+ * violation, not a warning.
+ */
+async function dispatchReadOnly(ctx: WorkflowContext, task: AgentTask): Promise<{ result: AgentResult; violation: string[] }> {
+  const before = snapshotTree(ctx.projectRoot);
+  const result = await dispatch(ctx, { ...task, write_scope: [], workspace: null, canonical_baseline: canonicalBaselineHash(ctx.paths) });
+  const delta = diffTrees(before, snapshotTree(ctx.projectRoot));
+  return { result, violation: delta.changed };
 }
 
 async function executePhase(
@@ -195,6 +265,19 @@ async function executePhase(
     touchManifest(paths, () => {}, now);
   };
 
+  /** Append-only transition event FIRST, then the plan projection, then manifest hashes. */
+  const transition = (taskId: string, to: TaskStatus, reason = '') => {
+    bus.emit('task.transition', { message: `tarefa ${taskId} → ${to}${reason ? ` (${reason})` : ''}` }, { task: taskId, to, reason });
+    setTaskStatus(pp.plan, taskId, to);
+    touchManifest(paths, () => {}, now);
+  };
+
+  // Record which files were ALREADY dirty before this phase ran: a phase commit
+  // must never appropriate pre-existing user changes, and overlapping paths are
+  // an explicit conflict rather than a silent sweep.
+  const gitStatusAtStart = ctx.git.status(ctx.projectRoot);
+  const dirtyAtStart = new Set(gitStatusAtStart.dirtyFiles);
+
   markPhase('IN_PROGRESS');
 
   // ---- RESEARCH_DELTA (deterministic: only flag; agents re-research on demand elsewhere)
@@ -205,21 +288,35 @@ async function executePhase(
     stage('SPEC_READY', 'gerando especificação da fase');
     const reqDoc = readRequirements(milestone.paths.requirements);
     const phaseReqs = reqDoc.requirements.filter((r) => r.phase === phase.id);
+    const specRel = path.relative(ctx.projectRoot, pp.spec).split(path.sep).join('/');
     const specTask: AgentTask = {
       id: `spec-${phase.id}`,
       role: 'planner',
       objective: `Write the SPEC.md for phase ${phase.id} (${phase.name}). It must be actionable, testable, tied to real code surfaces, complete and coherent, with observable acceptance scenarios for each requirement.`,
       canonical_files: [paths.rules, milestone.paths.scope, milestone.paths.requirements, milestone.paths.research].filter(exists),
       code_files: [],
-      write_scope: [pp.spec.replace(/\\/g, '/')],
+      write_scope: [specRel],
       acceptance_criteria: phaseReqs.map((r) => `${r.id}: ${r.acceptance}`),
       verification_commands: [],
-      return_format: 'Write SPEC.md to disk; return a one-line confirmation.',
+      return_format: 'Write SPEC.md to disk (inside your workspace); return a one-line confirmation.',
       notes: `Requirements in this phase:\n${phaseReqs.map((r) => `- ${r.id}: ${r.description}`).join('\n')}`,
+      workspace: null,
+      canonical_baseline: null,
     };
-    const res = await dispatch(ctx, specTask);
-    if (!res.ok || !exists(pp.spec)) {
-      return blocked(ctx, `Phase ${phase.id}: spec generation failed.`, [res.summary]);
+    // The spec is a canonical artifact: this is an explicitly core-authorized
+    // canonical write, isolated in a workspace and applied only after validation.
+    const attempt = prepareAttempt(ctx, specTask, { canonicalWriteScope: [specRel] });
+    const res = await dispatch(ctx, attempt.task);
+    try {
+      if (!res.ok || !exists(path.join(attempt.workspace.root, specRel))) {
+        return blocked(ctx, `Phase ${phase.id}: spec generation failed.`, [res.summary]);
+      }
+      attempt.workspace.applyVerifiedPatch();
+      touchManifest(paths, () => {}, now);
+    } catch (err) {
+      return blocked(ctx, `Phase ${phase.id}: spec generation violated workspace boundaries.`, [String((err as Error).message)]);
+    } finally {
+      attempt.workspace.discard();
     }
   } else {
     stage('SPEC_READY', 'especificação existente validada');
@@ -244,17 +341,25 @@ async function executePhase(
         acceptance_criteria: ['2-4 tasks', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
         verification_commands: [],
         return_format:
-          'JSON payload matching PhasePlan: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[], write_scope[], depends_on[], parallel, tdd, tests[], evidence_expected, done:false}]}',
+          'JSON payload matching PhasePlan: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[], write_scope[], depends_on[], parallel, tdd, tests[], evidence_expected}]}',
         notes: reviewNotes.length ? `Previous review issues to address:\n${reviewNotes.join('\n')}` : '',
+        workspace: null,
+        canonical_baseline: null,
       };
-      const res = await dispatch(ctx, planTask);
+      const { result: res, violation } = await dispatchReadOnly(ctx, planTask);
+      if (violation.length > 0) {
+        return blocked(ctx, `Phase ${phase.id}: planner (read-only) modified the checkout.`, violation);
+      }
       const parsed = PhasePlanSchema.safeParse(res.payload);
       if (!res.ok || !parsed.success) {
         return blocked(ctx, `Phase ${phase.id}: planning failed.`, [res.summary, ...(parsed.success ? [] : [parsed.error.message])]);
       }
       plan = parsed.data;
       plan.phase = phase.id;
+      // The PLAN is a canonical artifact written by the CORE from the planner's
+      // validated payload — the agent never touches the plan file itself.
       writePlan(pp.plan, plan, `Generated for ${phase.name}.`);
+      touchManifest(paths, () => {}, now);
     }
 
     stage('PLAN_LINT', 'validação determinística do plano');
@@ -282,8 +387,13 @@ async function executePhase(
       verification_commands: [],
       return_format: 'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}',
       notes: '',
+      workspace: null,
+      canonical_baseline: null,
     };
-    const reviewRes = await dispatch(ctx, reviewTask);
+    const { result: reviewRes, violation: reviewViolation } = await dispatchReadOnly(ctx, reviewTask);
+    if (reviewViolation.length > 0) {
+      return blocked(ctx, `Phase ${phase.id}: plan reviewer (read-only) modified the checkout.`, reviewViolation);
+    }
     const review = ReviewPayloadSchema.safeParse(reviewRes.payload);
     if (!reviewRes.ok || !review.success) {
       return blocked(ctx, `Phase ${phase.id}: plan review failed to produce a verdict.`, [reviewRes.summary]);
@@ -303,65 +413,144 @@ async function executePhase(
   bus.emit('run.plan_approved', { message: 'plano aprovado' });
 
   // Baseline snapshot of the working tree (excluding .rijo internals) taken
-  // before any worker runs. Everything a worker actually changes is measured
-  // against this — the agent's self-report is never trusted for scope.
+  // before any worker patch is applied — the reviewer's diff and the phase
+  // commit are computed against this.
   const phaseBaseline: FileSnapshot = snapshotFiles(ctx.projectRoot);
 
-  // ---- EXECUTE (fresh worker per task; parallel only for disjoint scopes)
+  // Deterministic resume: a RUNNING task from a crashed run is reset (its
+  // orphan workspace was already discarded — nothing it did survived); a
+  // FAILED/BLOCKED task gets a fresh attempt from a clean baseline; an
+  // IMPLEMENTED/VERIFYING/VERIFIED task is re-verified, never re-implemented
+  // and never silently promoted.
+  {
+    const current = readPlan(pp.plan);
+    for (const t of current.tasks) {
+      if (t.status === 'RUNNING') {
+        transition(t.id, 'FAILED', 'interrupted run — attempt discarded');
+        transition(t.id, 'PENDING', 'reset for a fresh attempt');
+      } else if (t.status === 'FAILED' || t.status === 'BLOCKED') {
+        transition(t.id, 'PENDING', 'reset for a fresh attempt');
+      }
+    }
+  }
+
+  // ---- EXECUTE (fresh isolated workspace per task; parallel only for disjoint scopes)
   const groups = parallelGroups(plan.tasks, config.limits.max_parallel_agents);
   const totalTasks = plan.tasks.length;
   for (const group of groups) {
-    const pending = group.filter((t) => !readPlan(pp.plan).tasks.find((x) => x.id === t.id)?.done);
+    const statuses = new Map(readPlan(pp.plan).tasks.map((t) => [t.id, t.status]));
+    const pending = group.filter((t) => statuses.get(t.id) === 'PENDING');
     if (pending.length === 0) continue;
-    const tasks: AgentTask[] = pending.map((t) => ({
-      id: `exec-${phase.id}-${t.id}`,
-      role: 'worker',
-      objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Do not modify files outside your write scope; if you need to, stop and request a new allocation.`,
-      canonical_files: [ctx.paths.rules, pp.spec, pp.plan].filter(exists),
-      code_files: t.files,
-      write_scope: t.write_scope,
-      acceptance_criteria: [t.evidence_expected],
-      verification_commands: t.tests,
-      return_format: 'JSON payload: {done: boolean, notes: string}. Also list files_written.',
-      notes: '',
-    }));
+
+    // All lifecycle transitions FIRST (each one touches the canonical plan),
+    // THEN the workspaces are created — every attempt in the group captures
+    // the same, final canonical baseline.
+    for (const t of pending) transition(t.id, 'RUNNING');
+    const attempts: Attempt[] = [];
+    for (const t of pending) {
+      const workerTask: AgentTask = {
+        id: `exec-${phase.id}-${t.id}`,
+        role: 'worker',
+        objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation.`,
+        canonical_files: [ctx.paths.rules, pp.spec, pp.plan].filter(exists),
+        code_files: t.files.map((f) => path.resolve(ctx.projectRoot, f)),
+        write_scope: t.write_scope,
+        acceptance_criteria: [t.evidence_expected],
+        verification_commands: t.tests,
+        return_format: 'JSON payload: {done: boolean, notes: string}. Also list files_written.',
+        notes: '',
+        workspace: null,
+        canonical_baseline: null,
+      };
+      attempts.push(prepareAttempt(ctx, workerTask));
+    }
+
     const taskIdx = plan.tasks.findIndex((t) => t.id === pending[0]!.id) + 1;
     stage('EXECUTE', `executando ${pending.map((t) => t.id).join('+')}`, {});
     bus.emit('run.task_start', {
       stage: 'EXECUTE',
       task: { id: pending[0]!.id, index: taskIdx, total: totalTasks, name: pending[0]!.name },
-      agent: { role: 'worker', id: tasks[0]!.id },
+      agent: { role: 'worker', id: attempts[0]!.task.id },
       message: pending.map((t) => t.name).join(' | '),
     });
-    // snapshot right before this group so we can attribute its real changes
-    const groupBaseline = snapshotFiles(ctx.projectRoot);
-    const results = await dispatchBatch(ctx, tasks);
+
+    const discardAll = () => attempts.forEach((a) => a.workspace.discard());
+    let results: AgentResult[];
+    try {
+      results = await dispatchBatch(ctx, attempts.map((a) => a.task));
+    } catch (err) {
+      discardAll();
+      pending.forEach((t) => transition(t.id, 'FAILED', 'dispatch error'));
+      return blocked(ctx, `Phase ${phase.id}: worker dispatch failed.`, [String((err as Error).message)]);
+    }
+
+    // Any failed result discards EVERY workspace of the group before anything
+    // is applied — a failed attempt can never leave changes incorporated.
     for (let i = 0; i < results.length; i++) {
       const r = results[i]!;
       const t = pending[i]!;
       if (!r.ok) {
+        discardAll();
+        pending.forEach((x) => transition(x.id, 'FAILED', `group failed at ${t.id}`));
         return blocked(ctx, `Phase ${phase.id}: task ${t.id} failed.`, [r.summary, ...r.scope_requests.map((s) => `scope request: ${s}`)]);
       }
     }
-    // Authoritative scope enforcement: compare the REAL filesystem delta of the
-    // whole group against the union of the group's declared write scopes. An
-    // agent that edited an out-of-scope file and hid it from files_written is
-    // caught here regardless of its payload.
-    const groupScopes = pending.flatMap((t) => t.write_scope);
-    const delta = diffSnapshots(groupBaseline, snapshotFiles(ctx.projectRoot));
-    try {
-      enforceScopeDelta(pending.map((t) => t.id).join('+'), delta, groupScopes);
-    } catch (err) {
-      throw err; // ScopeDiffViolationError — a hard failure, never silently accepted
+
+    // Canonical baseline must still be current: an attempt briefed against an
+    // older canonical context can never be applied.
+    const baselineNow = canonicalBaselineHash(paths);
+    const stale = attempts.filter((a) => a.task.canonical_baseline !== baselineNow);
+    if (stale.length > 0) {
+      discardAll();
+      pending.forEach((t) => transition(t.id, 'FAILED', 'canonical baseline drift'));
+      return blocked(ctx, `Phase ${phase.id}: canonical context changed while attempts ran (CANONICAL_DRIFT).`, [
+        `Stale attempts: ${stale.map((a) => a.task.id).join(', ')}. Re-run to retry against the current baseline.`,
+      ]);
     }
-    for (const t of pending) {
-      markTaskDone(pp.plan, t.id);
+
+    // Authoritative scope enforcement per INDIVIDUAL task: the real filesystem
+    // delta of each workspace (including .rijo, removals, renames, symlinks) is
+    // validated against that task's own scope — never the group union, and the
+    // agent's files_written report is irrelevant.
+    try {
+      for (const a of attempts) a.workspace.validate();
+    } catch (err) {
+      discardAll();
+      pending.forEach((t) => transition(t.id, 'FAILED', 'boundary violation'));
+      if (
+        err instanceof WorkspaceScopeError ||
+        err instanceof CanonicalWriteError ||
+        err instanceof SymlinkEscapeError
+      ) {
+        return blocked(ctx, `Phase ${phase.id}: ${err.message}`, []);
+      }
+      throw err;
+    }
+
+    // Apply the validated patches to the controlled checkout. A conflict with a
+    // concurrent (user) change blocks with no partial merge.
+    for (let i = 0; i < attempts.length; i++) {
+      const a = attempts[i]!;
+      const t = pending[i]!;
+      try {
+        a.workspace.applyVerifiedPatch();
+      } catch (err) {
+        discardAll();
+        transition(t.id, 'FAILED', 'patch conflict');
+        if (err instanceof PatchConflictError) {
+          return blocked(ctx, `Phase ${phase.id}: ${err.message}`, [
+            'Commit or revert the concurrent change, then re-run.',
+          ]);
+        }
+        throw err;
+      }
+      a.workspace.discard();
+      transition(t.id, 'IMPLEMENTED');
       bus.emit('run.task_done', {
-        completedUnits: readPlan(pp.plan).tasks.filter((x) => x.done).length,
+        completedUnits: readPlan(pp.plan).tasks.filter((x) => x.status !== 'PENDING' && x.status !== 'RUNNING').length,
         totalUnits: totalTasks,
-        message: `tarefa ${t.id} concluída`,
+        message: `tarefa ${t.id} implementada (não verificada)`,
       });
-      checkpoint('EXECUTE', `Task ${t.id} of phase ${phase.id} implemented; plan checkbox flipped.`, { task: t.id });
     }
   }
 
@@ -389,6 +578,9 @@ async function executePhase(
   let evidences: CommandEvidence[] = [];
   while (true) {
     stage('VERIFY', 'executando build, lint e testes direcionados');
+    for (const t of readPlan(pp.plan).tasks) {
+      if (t.status === 'IMPLEMENTED' || t.status === 'VERIFIED') transition(t.id, 'VERIFYING');
+    }
     evidences = runVerification(ctx, plan, projectCommands);
 
     // A command rejected by the security policy is a hard block, never a
@@ -420,21 +612,19 @@ async function executePhase(
         );
       }
       reviewLoops++;
-      const fixTask: AgentTask = {
+      const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
         id: `verify-fix-${phase.id}-l${reviewLoops}`,
-        role: 'worker',
         objective: 'Fix the verification failures below with the smallest coherent change. Do not weaken tests to make them pass.',
-        canonical_files: [pp.spec, pp.plan].filter(exists),
-        code_files: plan.tasks.flatMap((t) => t.files),
-        write_scope: plan.tasks.flatMap((t) => t.write_scope),
-        acceptance_criteria: ['All verification commands exit 0'],
-        verification_commands: failures.map((f) => f.command),
-        return_format: 'JSON payload: {done: boolean, notes: string}',
+        acceptance: ['All verification commands exit 0'],
+        commands: failures.map((f) => f.command),
         notes: failures.map((f) => `${f.command} → exit ${f.exit_code}\n${f.summary.slice(0, 800)}`).join('\n\n'),
-      };
-      const fixRes = await dispatch(ctx, fixTask);
-      if (!fixRes.ok) return blocked(ctx, `Phase ${phase.id}: repair worker failed.`, [fixRes.summary]);
+      });
+      if (repairOutcome) return repairOutcome;
       continue;
+    }
+
+    for (const t of readPlan(pp.plan).tasks) {
+      if (t.status === 'VERIFYING') transition(t.id, 'VERIFIED');
     }
 
     stage('CODE_REVIEW', 'revisão independente do código');
@@ -445,19 +635,25 @@ async function executePhase(
       objective:
         'Independent code review. You receive the spec, the plan, the diff and the verification evidence — never the implementer reasoning. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject.',
       canonical_files: [pp.spec, pp.plan].filter(exists),
-      code_files: plan.tasks.flatMap((t) => t.files),
+      code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
       write_scope: [],
       acceptance_criteria: [],
       verification_commands: [],
       return_format: 'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}',
       notes: `DIFF SUMMARY:\n${diffSummary}\n\nEVIDENCE:\n${evidences.map((e) => `${e.command} → exit ${e.exit_code}`).join('\n')}`,
+      workspace: null,
+      canonical_baseline: null,
     };
-    const crRes = await dispatch(ctx, crTask);
+    const { result: crRes, violation: crViolation } = await dispatchReadOnly(ctx, crTask);
+    if (crViolation.length > 0) {
+      return blocked(ctx, `Phase ${phase.id}: code reviewer (read-only) modified the checkout.`, crViolation);
+    }
     const cr = ReviewPayloadSchema.safeParse(crRes.payload);
     if (!crRes.ok || !cr.success) {
       return blocked(ctx, `Phase ${phase.id}: code review failed to produce a verdict.`, [crRes.summary]);
     }
     writeReviewDoc(pp, cr.data, reviewLoops, now);
+    touchManifest(paths, () => {}, now);
     const specGaps = cr.data.findings.filter((f) => f.type === 'intent_gap' || f.type === 'spec_gap');
     if (specGaps.length > 0) {
       return blocked(
@@ -476,20 +672,14 @@ async function executePhase(
       );
     }
     reviewLoops++;
-    const repairTask: AgentTask = {
+    const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
       id: `review-fix-${phase.id}-l${reviewLoops}`,
-      role: 'worker',
       objective: 'Address the valid review findings below with minimal coherent changes.',
-      canonical_files: [pp.spec, pp.plan].filter(exists),
-      code_files: plan.tasks.flatMap((t) => t.files),
-      write_scope: plan.tasks.flatMap((t) => t.write_scope),
-      acceptance_criteria: ['Findings addressed', 'Verification commands still pass'],
-      verification_commands: [],
-      return_format: 'JSON payload: {done: boolean, notes: string}',
+      acceptance: ['Findings addressed', 'Verification commands still pass'],
+      commands: [],
       notes: actionable.map((f) => `${f.type}/${f.severity}: ${f.description}${f.file ? ` (${f.file})` : ''}`).join('\n'),
-    };
-    const repairRes = await dispatch(ctx, repairTask);
-    if (!repairRes.ok) return blocked(ctx, `Phase ${phase.id}: review repair failed.`, [repairRes.summary]);
+    });
+    if (repairOutcome) return repairOutcome;
   }
 
   // ---- UI_SMOKE (only for UI surfaces; honest about capability)
@@ -500,35 +690,49 @@ async function executePhase(
       bus.emit('run.ui_smoke', { stage: 'UI_SMOKE', message: 'browser indisponível; smoke registrado como não executado' });
     } else {
       stage('UI_SMOKE', 'smoke visual da superfície alterada');
+      const screenshotScope = path.relative(ctx.projectRoot, path.join(milestone.paths.qaDir, 'screenshots')).split(path.sep).join('/') + '/**';
       const smokeTask: AgentTask = {
         id: `ui-smoke-${phase.id}`,
         role: 'qa',
         objective: 'UI smoke: load the changed surface, check console and network for errors, exercise the main navigation, capture a minimal screenshot.',
         canonical_files: [pp.spec].filter(exists),
         code_files: [],
-        write_scope: [path.join(milestone.paths.qaDir, 'screenshots').replace(/\\/g, '/') + '/**'],
+        write_scope: [screenshotScope],
         acceptance_criteria: ['No unhandled console errors', 'No failing network requests on the main flow'],
         verification_commands: [],
         return_format: 'JSON payload: {passed, console_errors[], network_errors[], screenshot, notes}',
         notes: '',
+        workspace: null,
+        canonical_baseline: null,
       };
-      const smokeRes = await dispatch(ctx, smokeTask);
+      const smokeAttempt = prepareAttempt(ctx, smokeTask, { canonicalWriteScope: [screenshotScope] });
+      const smokeRes = await dispatch(ctx, smokeAttempt.task);
       const smoke = UiSmokePayloadSchema.safeParse(smokeRes.payload);
-      if (!smokeRes.ok || !smoke.success || !smoke.data.passed) {
-        return blocked(ctx, `Phase ${phase.id}: UI smoke failed.`, [
-          smokeRes.summary,
-          ...(smoke.success ? [...smoke.data.console_errors, ...smoke.data.network_errors] : []),
-        ]);
+      try {
+        if (!smokeRes.ok || !smoke.success || !smoke.data.passed) {
+          return blocked(ctx, `Phase ${phase.id}: UI smoke failed.`, [
+            smokeRes.summary,
+            ...(smoke.success ? [...smoke.data.console_errors, ...smoke.data.network_errors] : []),
+          ]);
+        }
+        smokeAttempt.workspace.applyVerifiedPatch();
+      } catch (err) {
+        return blocked(ctx, `Phase ${phase.id}: UI smoke violated workspace boundaries.`, [String((err as Error).message)]);
+      } finally {
+        smokeAttempt.workspace.discard();
       }
       uiSmokeNote = `passed${smoke.data.screenshot ? ` (screenshot: ${smoke.data.screenshot})` : ''}`;
     }
   }
 
-  // ---- PERSIST: finalize ALL phase artifacts BEFORE the commit, so the commit
-  // that represents the verified phase actually contains them. The commit hash
-  // (which only exists after the commit) is written back in a small metadata
-  // sync afterwards — never leaving verified work outside the commit.
+  // ---- PERSIST: finalize ALL phase artifacts BEFORE the commit, WITHOUT any
+  // self-referencing hash. The C1 code commit contains code + tests + final
+  // phase state; the hash cross-references land in a separate evidence commit
+  // (C2) that may only touch allowed metadata paths.
   stage('PERSIST', 'persistindo resumo, evidências e estado');
+  for (const t of readPlan(pp.plan).tasks) {
+    if (t.status === 'VERIFIED') transition(t.id, 'DONE');
+  }
   const finalPlan = readPlan(pp.plan);
   writeFileAtomic(
     pp.verification,
@@ -538,7 +742,9 @@ async function executePhase(
         verified_at: now().toISOString(),
         commands: evidences.map((e) => ({ command: e.command, exit_code: e.exit_code, duration_ms: e.duration_ms })),
         ui_smoke: uiSmokeNote,
-        commit: null,
+        tested_commit: null,
+        evidence_commit: null,
+        vcs: ctx.git.status(ctx.projectRoot).isRepo && config.git.commit ? 'git' : 'disabled',
       },
       [
         `# Verification — phase ${phase.id}`,
@@ -562,16 +768,16 @@ async function executePhase(
       ].join('\n'),
     ),
   );
-  // Requirement completion: only mark DONE the requirements this phase truly
-  // covered (a task references them) and that carry test evidence. Plan lint
-  // already guarantees every phase requirement is covered by a task.
+  // Requirement completion: DONE only when task, test, review and evidence are
+  // all linked. We only reach here after the review approved; the requirement
+  // records the tests and the verification evidence explicitly.
   const reqDocFinal = readRequirements(milestone.paths.requirements);
   const hadEvidence = evidences.length > 0;
   for (const r of reqDocFinal.requirements) {
     if (r.phase !== phase.id) continue;
-    const coveringTasks = finalPlan.tasks.filter((t) => t.requirement_ids.includes(r.id));
+    const coveringTasks = finalPlan.tasks.filter((t) => t.requirement_ids.includes(r.id) && t.status === 'DONE');
     if (coveringTasks.length === 0) {
-      // Not implemented by any task — never silently mark DONE.
+      // Not implemented by any completed task — never silently mark DONE.
       r.status = 'BLOCKED';
       continue;
     }
@@ -584,7 +790,7 @@ async function executePhase(
         ? `Non-executable work (waiver): ${coveringTasks.map((t) => t.no_execution_justification).join('; ')}`
         : 'Verified by phase verification commands (no dedicated test declared in plan).';
     }
-    r.evidence = `VERIFICATION.md of phase ${phase.id} (${evidences.length} commands${hadEvidence ? ', all exit 0' : ', waived'})`;
+    r.evidence = `VERIFICATION.md + REVIEW.md of phase ${phase.id} (${evidences.length} commands${hadEvidence ? ', all exit 0' : ', waived'}; review approved)`;
   }
   writeRequirements(milestone.paths.requirements, reqDocFinal);
   markPhase('DONE', null);
@@ -594,32 +800,51 @@ async function executePhase(
     next_step: 'rijo run (next phase) or rijo check',
   });
 
-  // ---- COMMIT: stage ONLY the authorized paths — the source files that
-  // actually changed within a task's write scope, plus the RIJO artifacts.
-  // Pre-existing unrelated edits in the working tree are never swept in.
+  // ---- COMMIT: two-commit model without self-reference.
+  //   C1 (code commit): source changed within task scopes + all phase state,
+  //      with no commit hash recorded anywhere inside it.
+  //   verification already ran against exactly this tree.
+  //   C2 (evidence commit): ONLY the allowed metadata paths, updated to point
+  //      at C1. The C1..C2 range is verified to contain nothing else.
   let commitHash: string | null = null;
   const gitStatus = ctx.git.status(ctx.projectRoot);
   if (config.git.commit && gitStatus.isRepo) {
     stage('COMMIT', 'commit dos arquivos autorizados da fase verificada');
     const sourceDelta = diffSnapshots(phaseBaseline, snapshotFiles(ctx.projectRoot));
     const authorizedSource = sourceDelta.changed.filter((p) => plan.tasks.some((t) => pathInScope(p, t.write_scope)));
+
+    // Pre-existing user edits on the same paths are an explicit conflict —
+    // never silently appropriated into a RIJO commit.
+    const appropriated = authorizedSource.filter((p) => dirtyAtStart.has(p));
+    if (appropriated.length > 0) {
+      return blocked(ctx, `Phase ${phase.id}: files had pre-existing local changes before this phase ran.`, [
+        `Conflicting paths: ${appropriated.join(', ')}`,
+        'Commit or revert your local changes, then re-run the phase.',
+      ]);
+    }
+
+    const rel = (p: string) => path.relative(ctx.projectRoot, p).split(path.sep).join('/');
     const rijoArtifacts = [
       pp.spec, pp.plan, pp.summary, pp.review, pp.verification,
       milestone.paths.requirements, milestone.paths.roadmap,
       paths.state, paths.manifest, paths.milestonesIndex, paths.stack, paths.decisions,
     ]
       .filter(exists)
-      .map((p) => path.relative(ctx.projectRoot, p).split(path.sep).join('/'));
+      .map(rel);
     const toCommit = [...new Set([...authorizedSource, ...rijoArtifacts])];
     commitHash = ctx.git.commitPaths(ctx.projectRoot, `rijo(${milestone.id}-F${phase.id}): ${phase.name} verified`, toCommit);
     if (!commitHash) {
-      return blocked(ctx, `Phase ${phase.id}: commit failed while git commits are enabled.`, [
+      return blocked(ctx, `Phase ${phase.id}: code commit (C1) failed while git commits are enabled.`, [
         'The verified artifacts are on disk but the phase commit did not complete.',
       ]);
     }
-    // metadata sync: write the hash cross-reference and commit just those files
+
+    // C2: evidence pointing at C1 — only allowed metadata paths may change.
     const { data, body } = parseFrontmatter(readText(pp.verification));
-    writeFileAtomic(pp.verification, serializeFrontmatter({ ...(data as Record<string, unknown>), commit: commitHash }, body));
+    writeFileAtomic(
+      pp.verification,
+      serializeFrontmatter({ ...(data as Record<string, unknown>), tested_commit: commitHash, evidence_commit: null }, body),
+    );
     markPhase('DONE', commitHash);
     checkpoint('DONE', `Phase ${phase.id} (${phase.name}) verified and committed.`, {
       task: null,
@@ -627,10 +852,41 @@ async function executePhase(
       last_commit: commitHash,
       next_step: 'rijo run (next phase) or rijo check',
     });
-    const metaFiles = [pp.verification, milestone.paths.roadmap, paths.state]
+    const allowedEvidencePaths = [pp.verification, milestone.paths.roadmap, paths.state, paths.manifest, paths.milestonesIndex]
       .filter(exists)
-      .map((p) => path.relative(ctx.projectRoot, p).split(path.sep).join('/'));
-    ctx.git.commitPaths(ctx.projectRoot, `rijo(${milestone.id}-F${phase.id}): phase metadata sync`, metaFiles);
+      .map(rel);
+    const evidenceCommit = ctx.git.commitPaths(ctx.projectRoot, `rijo(${milestone.id}-F${phase.id}): evidence for ${commitHash.slice(0, 12)}`, allowedEvidencePaths);
+    if (!evidenceCommit) {
+      return blocked(ctx, `Phase ${phase.id}: evidence commit (C2) failed.`, [
+        `Code commit ${commitHash} exists but its evidence metadata is uncommitted.`,
+      ]);
+    }
+    // Deterministic check: C1..C2 contains ONLY allowed evidence metadata.
+    const rangeFiles = ctx.git.diffNames(ctx.projectRoot, commitHash, evidenceCommit);
+    const illegal = rangeFiles.filter((f) => !allowedEvidencePaths.includes(f));
+    if (illegal.length > 0) {
+      return blocked(ctx, `Phase ${phase.id}: evidence commit touched non-evidence paths.`, illegal);
+    }
+    // Record the evidence commit inside its own file for auditability (this
+    // makes the working file differ from C2 by exactly one known field; it is
+    // folded into the NEXT phase's C1, never left dangling as unknown state).
+    const after = parseFrontmatter(readText(pp.verification));
+    writeFileAtomic(
+      pp.verification,
+      serializeFrontmatter({ ...(after.data as Record<string, unknown>), evidence_commit: evidenceCommit }, after.body),
+    );
+    touchManifest(paths, () => {}, now);
+    const finalCommit = ctx.git.commitPaths(ctx.projectRoot, `rijo(${milestone.id}-F${phase.id}): evidence sealed`, [rel(pp.verification), rel(paths.manifest)]);
+    if (!finalCommit) {
+      return blocked(ctx, `Phase ${phase.id}: evidence seal commit failed.`, []);
+    }
+
+    // The tree must be clean for everything RIJO touched when the phase ends.
+    const endStatus = ctx.git.status(ctx.projectRoot);
+    const rijoDirty = endStatus.dirtyFiles.filter((f) => toCommit.includes(f) || allowedEvidencePaths.includes(f));
+    if (rijoDirty.length > 0) {
+      return blocked(ctx, `Phase ${phase.id}: tree not clean after commits.`, rijoDirty);
+    }
   }
 
   bus.emit('run.phase_done', {
@@ -640,6 +896,55 @@ async function executePhase(
     message: `fase ${phase.id} concluída${commitHash ? ` (commit ${commitHash.slice(0, 8)})` : ''}`,
   });
   return completed(ctx, `Phase ${phase.id} (${phase.name}) done${commitHash ? `, commit ${commitHash}` : ''}.`);
+}
+
+/**
+ * Run a repair worker in an isolated workspace and apply its verified patch.
+ * Returns a WorkflowOutcome on failure (to be returned by the caller), null on
+ * success.
+ */
+async function runRepairAttempt(
+  ctx: WorkflowContext,
+  phaseId: string,
+  pp: PhasePaths,
+  plan: PhasePlan,
+  spec: { id: string; objective: string; acceptance: string[]; commands: string[]; notes: string },
+): Promise<WorkflowOutcome | null> {
+  const repairTask: AgentTask = {
+    id: spec.id,
+    role: 'worker',
+    objective: spec.objective,
+    canonical_files: [pp.spec, pp.plan].filter(exists),
+    code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
+    write_scope: plan.tasks.flatMap((t) => t.write_scope),
+    acceptance_criteria: spec.acceptance,
+    verification_commands: spec.commands,
+    return_format: 'JSON payload: {done: boolean, notes: string}',
+    notes: spec.notes,
+    workspace: null,
+    canonical_baseline: null,
+  };
+  const attempt = prepareAttempt(ctx, repairTask);
+  try {
+    const res = await dispatch(ctx, attempt.task);
+    if (!res.ok) {
+      return blocked(ctx, `Phase ${phaseId}: repair worker failed.`, [res.summary]);
+    }
+    attempt.workspace.applyVerifiedPatch();
+    return null;
+  } catch (err) {
+    if (
+      err instanceof WorkspaceScopeError ||
+      err instanceof CanonicalWriteError ||
+      err instanceof SymlinkEscapeError ||
+      err instanceof PatchConflictError
+    ) {
+      return blocked(ctx, `Phase ${phaseId}: repair attempt discarded — ${err.message}`, []);
+    }
+    throw err;
+  } finally {
+    attempt.workspace.discard();
+  }
 }
 
 /** Detect the project's own verification scripts (npm scripts today). */

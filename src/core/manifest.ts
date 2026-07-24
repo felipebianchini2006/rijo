@@ -1,20 +1,69 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ManifestSchema, SCHEMA_VERSION, type Manifest, type MilestoneStatus } from './schemas/index.js';
-import { exists, readJsonIfExists, sha256File, writeJsonAtomic } from './fsx.js';
+import { exists, readJsonIfExists, sha256, sha256File, writeJsonAtomic } from './fsx.js';
 import type { RijoPaths } from './paths.js';
 
 export const RIJO_VERSION = '0.1.0-alpha.1';
 
-/** Files tracked for drift detection, relative to .rijo/. */
+/** Global files tracked for drift detection, relative to .rijo/. */
 const TRACKED = ['PROJECT.md', 'RULES.md', 'STACK.md', 'MILESTONES.md', 'STATE.md', 'DECISIONS.md', 'config.yml'];
 
+/** Per-milestone canonical artifacts tracked for drift. */
+const MILESTONE_TRACKED = ['SCOPE.md', 'REQUIREMENTS.md', 'ROADMAP.md', 'RESEARCH.md', 'CLOSEOUT.md'];
+
+/** Per-phase canonical artifacts tracked for drift. */
+const PHASE_TRACKED = ['SPEC.md', 'PLAN.md', 'VERIFICATION.md', 'REVIEW.md'];
+
+/**
+ * Hash the ENTIRE relevant canonical context: global files, the active
+ * milestone's requirements/roadmap/specs/plans/verifications, decisions,
+ * configuration and research sources. Any change outside the core is drift.
+ */
 export function computeHashes(paths: RijoPaths): Record<string, string> {
   const hashes: Record<string, string> = {};
   for (const rel of TRACKED) {
     const p = path.join(paths.root, rel);
     if (exists(p)) hashes[rel] = sha256File(p);
   }
+  if (exists(paths.researchSources)) hashes['research/sources.json'] = sha256File(paths.researchSources);
+
+  const raw = readJsonIfExists<{ active_milestone?: string | null; milestones?: Array<{ id: string; slug: string }> }>(
+    paths.manifest,
+  );
+  const active = raw?.active_milestone ? raw.milestones?.find((m) => m.id === raw.active_milestone) : null;
+  if (active) {
+    const mdir = paths.milestoneDir(active.id, active.slug);
+    const mrel = path.relative(paths.root, mdir).split(path.sep).join('/');
+    for (const f of MILESTONE_TRACKED) {
+      const p = path.join(mdir, f);
+      if (exists(p)) hashes[`${mrel}/${f}`] = sha256File(p);
+    }
+    const phasesDir = path.join(mdir, 'phases');
+    if (exists(phasesDir)) {
+      for (const entry of fs.readdirSync(phasesDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (!entry.isDirectory()) continue;
+        for (const f of PHASE_TRACKED) {
+          const p = path.join(phasesDir, entry.name, f);
+          if (exists(p)) hashes[`${mrel}/phases/${entry.name}/${f}`] = sha256File(p);
+        }
+      }
+    }
+  }
   return hashes;
+}
+
+/**
+ * Deterministic digest of the whole canonical context. Every AgentTask carries
+ * this at dispatch; a result is only applicable while the digest is unchanged.
+ */
+export function canonicalBaselineHash(paths: RijoPaths): string {
+  const hashes = computeHashes(paths);
+  const sorted = Object.keys(hashes)
+    .sort()
+    .map((k) => `${k}:${hashes[k]}`)
+    .join('\n');
+  return sha256(sorted);
 }
 
 export function readManifest(paths: RijoPaths): Manifest | null {

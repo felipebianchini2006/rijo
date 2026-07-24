@@ -1,5 +1,5 @@
 import { parseFrontmatter, serializeFrontmatter } from './frontmatter.js';
-import { PhasePlanSchema, type PhasePlan, type PlanTask } from './schemas/index.js';
+import { PhasePlanSchema, assertTaskTransition, type PhasePlan, type PlanTask, type TaskStatus } from './schemas/index.js';
 import { readText, writeFileAtomic } from './fsx.js';
 
 /**
@@ -21,23 +21,30 @@ export function writePlan(planPath: string, plan: PhasePlan, narrative: string):
     '',
     ...plan.tasks.map(
       (t) =>
-        `- [${t.done ? 'x' : ' '}] ${t.id} ${t.name} (${t.requirement_ids.join(', ') || 'technical'})`,
+        `- [${t.done ? 'x' : t.status === 'IMPLEMENTED' || t.status === 'VERIFYING' || t.status === 'VERIFIED' ? '~' : ' '}] ${t.id} ${t.name} [${t.status}] (${t.requirement_ids.join(', ') || 'technical'})`,
     ),
     '',
   ].join('\n');
   writeFileAtomic(planPath, serializeFrontmatter(PhasePlanSchema.parse(plan), body));
 }
 
-export function markTaskDone(planPath: string, taskId: string): PhasePlan {
+/**
+ * Persist a validated lifecycle transition for one task. The `done` flag is
+ * DERIVED (status === DONE) — it can never be flipped without walking the
+ * lifecycle, so an implemented-but-unverified task is visibly partial.
+ */
+export function setTaskStatus(planPath: string, taskId: string, to: TaskStatus): PhasePlan {
   const plan = readPlan(planPath);
   const task = plan.tasks.find((t) => t.id === taskId);
   if (!task) throw new Error(`Task ${taskId} not found in ${planPath}`);
-  task.done = true;
+  assertTaskTransition(taskId, task.status, to);
+  task.status = to;
+  task.done = to === 'DONE';
   const { body } = parseFrontmatter(readText(planPath));
   // regenerate checkbox lines from source of truth (front matter)
   const narrative = body
     .split('\n')
-    .filter((l) => !/^- \[[ x]\] T\d{2} /.test(l) && !/^# Plan — /.test(l))
+    .filter((l) => !/^- \[[ x~]\] T\d{2} /.test(l) && !/^# Plan — /.test(l))
     .join('\n');
   writePlan(planPath, plan, narrative);
   return plan;
