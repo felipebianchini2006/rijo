@@ -5,6 +5,7 @@ import { resolveCodexTier } from '../agents/roles.js';
 import { nodeSpawner, type Spawner } from './spawn.js';
 import { validateCodexModel } from './models.js';
 import { buildHostPrompt, extractAgentResult, diagnosticTail, failResult } from './parse.js';
+import type { ProcessLaunch, RawExit } from './processTypes.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_CAPABILITIES: RunnerCapabilities = { subagents: true, parallelism: true, browser: false };
@@ -12,12 +13,7 @@ const DEFAULT_CAPABILITIES: RunnerCapabilities = { subagents: true, parallelism:
 /** Codex sandbox modes (https://learn.chatgpt.com/docs/non-interactive-mode). */
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
 
-export interface CodexCliOptions {
-  projectRoot: string;
-  config: RijoConfig;
-  spawner?: Spawner;
-  timeoutMs?: number;
-  capabilities?: Partial<RunnerCapabilities>;
+export interface CodexLaunchOptions {
   /** Binary name/path. Default 'codex'. */
   bin?: string;
   /**
@@ -26,10 +22,27 @@ export interface CodexCliOptions {
    * otherwise (reviewers/researchers). Set this to override.
    */
   sandbox?: CodexSandbox;
+  /** Project root — used only as the fallback cwd when a task has no workspace. */
+  projectRoot?: string;
+}
+
+export interface CodexCliOptions extends CodexLaunchOptions {
+  projectRoot: string;
+  config: RijoConfig;
+  spawner?: Spawner;
+  timeoutMs?: number;
+  capabilities?: Partial<RunnerCapabilities>;
+}
+
+/** Sandbox posture for a task: workspace-write only when there is a workspace to write into. */
+export function sandboxForTask(task: AgentTask, forced?: CodexSandbox): CodexSandbox {
+  return forced ?? (task.workspace ? 'workspace-write' : 'read-only');
 }
 
 /**
- * AgentRunner backed by the Codex CLI in non-interactive `codex exec` mode.
+ * PURE command builder: turn a task + config into a concrete `codex exec`
+ * launch. Single source of truth for Codex argv, shared by the runner and the
+ * supervised CodexProcessController.
  *
  * Flags (verified 2026-07-24 against
  * https://learn.chatgpt.com/docs/non-interactive-mode and
@@ -41,83 +54,102 @@ export interface CodexCliOptions {
  *   -c model_reasoning_effort="…"  reasoning effort from the tier
  *   --skip-git-repo-check          allow running outside a git repo
  *
- * The concrete model is resolved from config (never the abstract tier) and
- * validated before spawning. The AgentResult is recovered from the agent's
- * final message in the JSONL stream; the reported `thread_id` is appended to
- * the summary when available. Unparseable output becomes an explicit ok:false.
+ * cwd is the attempt workspace root (never the canonical project root). Throws
+ * on an unresolved/invalid model BEFORE any process is created.
+ */
+export function buildCodexLaunch(task: AgentTask, config: RijoConfig, opts: CodexLaunchOptions = {}): ProcessLaunch {
+  const tierName = task.tier ?? config.models[task.role];
+  const tier = resolveCodexTier(config, tierName, task.role);
+  validateCodexModel(tier.model);
+
+  const cwd = task.workspace?.root ?? opts.projectRoot ?? process.cwd();
+  const sandbox = sandboxForTask(task, opts.sandbox);
+  const args = [
+    'exec',
+    buildHostPrompt(task),
+    '--json',
+    '--sandbox',
+    sandbox,
+    '-m',
+    tier.model,
+    '-c',
+    `model_reasoning_effort="${tier.reasoning_effort}"`,
+    '--skip-git-repo-check',
+  ];
+  return { command: opts.bin ?? 'codex', args, cwd };
+}
+
+/**
+ * PURE exit parser: recover an AgentResult from a finished `codex exec`
+ * process. On success the reported thread id is appended to the summary; on an
+ * unparseable stream a host-error-aware ok:false diagnostic is produced. Never
+ * simulates a result. (Spawn failures and timeouts are the caller's concern.)
+ */
+export function parseCodexExit(task: AgentTask, exit: RawExit): AgentResult {
+  const { result, threadId, hostError } = parseCodexStdout(exit.stdout, task.id);
+  if (result) {
+    if (threadId) result.summary = `${result.summary} (codex thread ${threadId})`;
+    return result;
+  }
+  const tail = diagnosticTail(exit.stderr, exit.stdout);
+  return failResult(
+    task.id,
+    hostError
+      ? `Codex CLI returned no parseable AgentResult (exit ${exit.code}). Host error: ${hostError}. ${tail}`
+      : `Codex CLI returned no parseable AgentResult (exit ${exit.code}). ${tail}`,
+  );
+}
+
+/**
+ * AgentRunner backed by the Codex CLI in non-interactive `codex exec` mode. The
+ * concrete model is resolved from config (never the abstract tier) and validated
+ * before spawning; argv comes from `buildCodexLaunch` and results from
+ * `parseCodexExit`, so this runner and the supervised CodexProcessController
+ * share one command/parse implementation.
  */
 export class CodexCliRunner implements AgentRunner {
   public readonly capabilities: RunnerCapabilities;
   private readonly spawner: Spawner;
   private readonly timeoutMs: number;
-  private readonly bin: string;
-  private readonly forcedSandbox: CodexSandbox | undefined;
-  private readonly projectRoot: string;
   private readonly config: RijoConfig;
+  private readonly launchOpts: CodexLaunchOptions;
 
   constructor(opts: CodexCliOptions) {
-    this.projectRoot = opts.projectRoot;
     this.config = opts.config;
     this.spawner = opts.spawner ?? nodeSpawner;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.bin = opts.bin ?? 'codex';
-    this.forcedSandbox = opts.sandbox;
     this.capabilities = { ...DEFAULT_CAPABILITIES, ...opts.capabilities };
+    this.launchOpts = { bin: opts.bin, sandbox: opts.sandbox, projectRoot: opts.projectRoot };
   }
 
   async runTask(task: AgentTask): Promise<AgentResult> {
-    let model: string;
-    let effort: string;
+    let launch: ProcessLaunch;
     try {
-      const tierName = task.tier ?? this.config.models[task.role];
-      const tier = resolveCodexTier(this.config, tierName, task.role);
-      validateCodexModel(tier.model);
-      model = tier.model;
-      effort = tier.reasoning_effort;
+      launch = buildCodexLaunch(task, this.config, this.launchOpts);
     } catch (err) {
       return failResult(task.id, err instanceof Error ? err.message : String(err));
     }
 
-    const cwd = task.workspace?.root ?? this.projectRoot;
-    const sandbox: CodexSandbox = this.forcedSandbox ?? (task.workspace ? 'workspace-write' : 'read-only');
-    const args = [
-      'exec',
-      buildHostPrompt(task),
-      '--json',
-      '--sandbox',
-      sandbox,
-      '-m',
-      model,
-      '-c',
-      `model_reasoning_effort="${effort}"`,
-      '--skip-git-repo-check',
-    ];
-
-    const res = await this.spawner({ command: this.bin, args, cwd, timeoutMs: this.timeoutMs });
+    const res = await this.spawner({
+      command: launch.command,
+      args: launch.args,
+      cwd: launch.cwd,
+      input: launch.input,
+      env: launch.env,
+      timeoutMs: this.timeoutMs,
+    });
 
     if (res.spawnError) {
       return failResult(
         task.id,
-        `Codex CLI could not be started (${res.spawnError}). Is "${this.bin}" installed and on PATH?`,
+        `Codex CLI could not be started (${res.spawnError}). Is "${launch.command}" installed and on PATH?`,
       );
     }
     if (res.timedOut) {
       return failResult(task.id, `Codex CLI timed out after ${this.timeoutMs}ms for task ${task.id}.`);
     }
 
-    const { result, threadId, hostError } = parseCodexStdout(res.stdout, task.id);
-    if (result) {
-      if (threadId) result.summary = `${result.summary} (codex thread ${threadId})`;
-      return result;
-    }
-
-    const tail = diagnosticTail(res.stderr, res.stdout);
-    return failResult(
-      task.id,
-      hostError
-        ? `Codex CLI returned no parseable AgentResult (exit ${res.code}). Host error: ${hostError}. ${tail}`
-        : `Codex CLI returned no parseable AgentResult (exit ${res.code}). ${tail}`,
-    );
+    return parseCodexExit(task, { code: res.code, signal: res.signal, stdout: res.stdout, stderr: res.stderr });
   }
 }
 

@@ -1,10 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { ClaudeCliRunner } from '../src/hosts/claudeCli.js';
-import { CodexCliRunner } from '../src/hosts/codexCli.js';
+import { ClaudeCliRunner, buildClaudeLaunch, parseClaudeExit } from '../src/hosts/claudeCli.js';
+import { CodexCliRunner, buildCodexLaunch, parseCodexExit } from '../src/hosts/codexCli.js';
 import { detectClaudeCli, detectCodexCli } from '../src/hosts/detect.js';
 import { validateClaudeModel, validateCodexModel, InvalidModelError } from '../src/hosts/models.js';
 import { extractAgentResult, buildHostPrompt } from '../src/hosts/parse.js';
 import type { Spawner, SpawnRequest, SpawnResult } from '../src/hosts/spawn.js';
+import type { RawExit } from '../src/hosts/processTypes.js';
 import { ConfigSchema, type RijoConfig } from '../src/core/schemas/index.js';
 import type { AgentTask, AgentResult } from '../src/agents/protocol.js';
 
@@ -135,9 +136,15 @@ describe('ClaudeCliRunner argv assembly', () => {
     expect(args).toContain('-p');
     expect(args).toContain('--output-format');
     expect(args[args.indexOf('--output-format') + 1]).toBe('json');
-    expect(args).toContain('--permission-mode');
-    // isolated workspace -> project root added for read access
-    expect(args[args.indexOf('--add-dir') + 1]).toBe('/proj');
+    // worker -> writer role -> acceptEdits (workspace-scoped)
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    // WRITE FENCE (P0.4): the canonical project root is NEVER granted as a
+    // writable/readable extra dir — no --add-dir leak into the checkout.
+    expect(args).not.toContain('--add-dir');
+    expect(args).not.toContain('/proj');
+    // deny rules for sensitive files are always passed via --settings
+    const settings = JSON.parse(args[args.indexOf('--settings') + 1]!);
+    expect(settings.permissions.deny).toEqual(expect.arrayContaining(['Read(.env)', 'Read(**/*.pem)']));
   });
 
   it('parses structured_output when the envelope carries it', async () => {
@@ -328,6 +335,145 @@ describe('CodexCliRunner argv assembly', () => {
     expect(r.summary).toContain('No codex provider mapping');
     expect(calls.length).toBe(0);
     void runner;
+  });
+});
+
+/** Value that follows a flag in an argv array. */
+function argAfter(args: string[], flag: string): string | undefined {
+  const i = args.indexOf(flag);
+  return i >= 0 ? args[i + 1] : undefined;
+}
+
+describe('buildClaudeLaunch (pure builder, P0.2/P0.4)', () => {
+  it('builds worker argv: concrete model/effort, acceptEdits, workspace cwd, deny settings, NO project-root leak', () => {
+    const launch = buildClaudeLaunch(task(), CONFIG, { projectRoot: '/proj' });
+    expect(launch.command).toBe('claude');
+    expect(launch.cwd).toBe('/tmp/rijo-ws-1'); // workspace root, never /proj
+    expect(argAfter(launch.args, '--model')).toBe('sonnet');
+    expect(argAfter(launch.args, '--effort')).toBe('medium');
+    expect(argAfter(launch.args, '--permission-mode')).toBe('acceptEdits');
+    expect(launch.args).not.toContain('--add-dir');
+    expect(launch.args).not.toContain('/proj');
+    const deny = JSON.parse(argAfter(launch.args, '--settings')!).permissions.deny as string[];
+    // credentials blocked for read AND write, project-relative and in $HOME
+    expect(deny).toEqual(
+      expect.arrayContaining([
+        'Read(.env)',
+        'Write(.env)',
+        'Edit(.env)',
+        'Read(**/*.pem)',
+        'Read(**/id_rsa*)',
+        'Read(~/.ssh/**)',
+        'Read(~/.aws/**)',
+        'Read(~/.config/gh/**)',
+        'Read(~/.gnupg/**)',
+        'Read(.npmrc)',
+        'Read(.netrc)',
+      ]),
+    );
+  });
+
+  it('read-only roles (planner/researcher/reviewer) run under --permission-mode plan', () => {
+    for (const role of ['planner', 'researcher', 'reviewer'] as const) {
+      const launch = buildClaudeLaunch(task({ role, tier: 'balanced-reasoning', workspace: null }), CONFIG, {
+        projectRoot: '/proj',
+      });
+      expect(argAfter(launch.args, '--permission-mode'), role).toBe('plan');
+      // read-only role still carries the sensitive-file denylist
+      expect(launch.args).toContain('--settings');
+    }
+  });
+
+  it('resolves researcher tier to the concrete economical-research model', () => {
+    const launch = buildClaudeLaunch(task({ role: 'researcher', tier: 'economical-research', workspace: null }), CONFIG);
+    expect(argAfter(launch.args, '--model')).toBe('haiku');
+  });
+
+  it('honours an explicit permission-mode override', () => {
+    const launch = buildClaudeLaunch(task(), CONFIG, { permissionMode: 'bypassPermissions', projectRoot: '/proj' });
+    expect(argAfter(launch.args, '--permission-mode')).toBe('bypassPermissions');
+  });
+
+  it('throws on an invalid configured model BEFORE producing a launch', () => {
+    const badConfig = ConfigSchema.parse({
+      providers: { claude: { 'economical-coding': { model: 'strongest', effort: 'medium' } } },
+    });
+    expect(() => buildClaudeLaunch(task(), badConfig, { projectRoot: '/proj' })).toThrow(/Invalid claude model/);
+  });
+});
+
+describe('buildCodexLaunch (pure builder, P0.2)', () => {
+  it('builds worker argv: workspace-write sandbox, concrete model/effort, workspace cwd', () => {
+    const launch = buildCodexLaunch(task(), CONFIG, { projectRoot: '/proj' });
+    expect(launch.command).toBe('codex');
+    expect(launch.args[0]).toBe('exec');
+    expect(launch.cwd).toBe('/tmp/rijo-ws-1');
+    expect(argAfter(launch.args, '--sandbox')).toBe('workspace-write');
+    expect(argAfter(launch.args, '-m')).toBe('gpt-5.6-terra');
+    expect(argAfter(launch.args, '-c')).toBe('model_reasoning_effort="medium"');
+    expect(launch.args).toContain('--skip-git-repo-check');
+  });
+
+  it('uses read-only sandbox and the fast model for a researcher without a workspace', () => {
+    const launch = buildCodexLaunch(task({ role: 'researcher', tier: 'economical-research', workspace: null }), CONFIG);
+    expect(argAfter(launch.args, '--sandbox')).toBe('read-only');
+    expect(argAfter(launch.args, '-m')).toBe('gpt-5.6-luna');
+    expect(argAfter(launch.args, '-c')).toBe('model_reasoning_effort="low"');
+  });
+
+  it('throws on an invalid configured Codex model', () => {
+    const badConfig = ConfigSchema.parse({
+      providers: { codex: { 'economical-coding': { model: 'sonnet', reasoning_effort: 'medium' } } },
+    });
+    expect(() => buildCodexLaunch(task(), badConfig, { projectRoot: '/proj' })).toThrow(/Invalid codex model/);
+  });
+});
+
+describe('parseClaudeExit / parseCodexExit (pure parsers, P0.2)', () => {
+  const exit = (over: Partial<RawExit>): RawExit => ({ code: 0, signal: null, stdout: '', stderr: '', ...over });
+
+  it('parseClaudeExit recovers an AgentResult from the JSON envelope', () => {
+    const r = parseClaudeExit(task(), exit({ stdout: JSON.stringify({ result: agentResultJson() }) }));
+    expect(r.ok).toBe(true);
+    expect(r.files_written).toEqual(['src/widget.ts']);
+  });
+
+  it('parseClaudeExit returns ok:false with a diagnostic when unparseable', () => {
+    const r = parseClaudeExit(task(), exit({ code: 1, stdout: 'garbage', stderr: 'boom' }));
+    expect(r.ok).toBe(false);
+    expect(r.summary).toContain('no parseable AgentResult');
+    expect(r.summary).toContain('boom');
+  });
+
+  it('parseCodexExit recovers the result and appends the thread id', () => {
+    const stdout = [
+      JSON.stringify({ type: 'thread.started', thread_id: 'th_xyz' }),
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: agentResultJson() } }),
+    ].join('\n');
+    const r = parseCodexExit(task(), exit({ stdout }));
+    expect(r.ok).toBe(true);
+    expect(r.summary).toContain('codex thread th_xyz');
+  });
+
+  it('parseCodexExit surfaces a usage-limit host error when nothing parses', () => {
+    const stdout = [
+      JSON.stringify({ type: 'error', message: "You've hit your usage limit. try again later." }),
+      JSON.stringify({ type: 'turn.failed', error: { message: "You've hit your usage limit." } }),
+    ].join('\n');
+    const r = parseCodexExit(task(), exit({ code: 1, stdout, stderr: 'reading stdin' }));
+    expect(r.ok).toBe(false);
+    expect(r.summary).toContain('usage limit');
+    expect(r.summary).toContain('Host error');
+  });
+
+  it('parseCodexExit skips malformed JSONL lines without crashing', () => {
+    const stdout = [
+      'not json at all',
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: agentResultJson() } }),
+      '{ half',
+    ].join('\n');
+    const r = parseCodexExit(task(), exit({ stdout }));
+    expect(r.ok).toBe(true);
   });
 });
 

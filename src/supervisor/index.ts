@@ -29,3 +29,9 @@ export {
   type ProcessLaunch,
   type RawExit,
 } from './processController.js';
+export {
+  killProcessTree,
+  processGroupAlive,
+  type KillTreeOptions,
+  type KillTreeResult,
+} from './killTree.js';
