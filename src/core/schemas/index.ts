@@ -30,13 +30,18 @@ const DEFAULT_CLAUDE_TIERS: Record<string, ClaudeTier> = {
   'economical-research': { model: 'haiku', effort: 'medium' },
   'economical-browser': { model: 'sonnet', effort: 'medium' },
 };
+// Codex model IDs verified against https://developers.openai.com/codex/models
+// (redirects to https://learn.chatgpt.com/docs/models), checked 2026-07-24:
+// gpt-5.6-sol (flagship), gpt-5.6-terra (balanced), gpt-5.6-luna (fast).
+// gpt-5.2* and gpt-5.3-codex are documented as DEPRECATED, so the previous
+// 'gpt-5.2-codex' default is corrected here to the current flagship line.
 const DEFAULT_CODEX_TIERS: Record<string, CodexTier> = {
-  strongest: { model: 'gpt-5.2-codex', reasoning_effort: 'high' },
-  'strongest-independent': { model: 'gpt-5.2-codex', reasoning_effort: 'high' },
-  'balanced-reasoning': { model: 'gpt-5.2-codex', reasoning_effort: 'medium' },
-  'economical-coding': { model: 'gpt-5.2-codex', reasoning_effort: 'medium' },
-  'economical-research': { model: 'gpt-5.2-codex', reasoning_effort: 'low' },
-  'economical-browser': { model: 'gpt-5.2-codex', reasoning_effort: 'medium' },
+  strongest: { model: 'gpt-5.6-sol', reasoning_effort: 'high' },
+  'strongest-independent': { model: 'gpt-5.6-sol', reasoning_effort: 'high' },
+  'balanced-reasoning': { model: 'gpt-5.6-terra', reasoning_effort: 'medium' },
+  'economical-coding': { model: 'gpt-5.6-terra', reasoning_effort: 'medium' },
+  'economical-research': { model: 'gpt-5.6-luna', reasoning_effort: 'low' },
+  'economical-browser': { model: 'gpt-5.6-terra', reasoning_effort: 'medium' },
 };
 
 /** Viewport used by the QA gate's real browser runs. */

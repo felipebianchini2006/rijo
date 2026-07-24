@@ -17,4 +17,7 @@ export { FakeGit, SystemGit, type GitOps } from './core/git.js';
 export { snapshotFiles, diffSnapshots, enforceScopeDelta, pathInScope } from './core/scope.js';
 export { silentSink, consoleSink, readStatus, renderStatusLine } from './core/progress.js';
 export { generateAdapters } from './adapters/index.js';
+export { AttemptWorkspace, snapshotTree, diffTrees } from './core/workspace.js';
+export { planCommand, buildEnv, nativeSandboxAvailable } from './security/execpolicy.js';
+export * from './hosts/index.js';
 export * as schemas from './core/schemas/index.js';

@@ -3,6 +3,7 @@ import { ensureDir, exists, readTextIfExists, readJsonIfExists, writeFileAtomic,
 import { loadConfig } from '../core/config.js';
 import { RijoPaths } from '../core/paths.js';
 import type { ModelRole } from '../core/schemas/index.js';
+import { claudeTierForRole } from '../agents/roles.js';
 import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
 
 const SKILLS = ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
@@ -66,13 +67,16 @@ export function generateClaudeAdapter(projectRoot: string): AdapterReport {
   for (const agent of AGENT_DEFS) {
     const dir = path.join(projectRoot, '.claude', 'agents');
     ensureDir(dir);
+    // `model` MUST be a concrete Claude model Claude Code accepts (alias
+    // opus/sonnet/haiku/fable or a claude-* id) — never the abstract RIJO tier
+    // string. Resolved from providers.claude for the role's tier; `tier` keeps
+    // the routing traceable to the same value the orchestrator sets on each
+    // AgentTask for role `${agent.role}`.
     const tier = config.models[agent.role];
+    const resolved = claudeTierForRole(config, agent.role);
     writeFileAtomic(
       path.join(dir, `${agent.name}.md`),
-      // `model` is the RIJO role tier (e.g. "economical-coding"). The host maps
-      // that placeholder tier to a concrete Claude model; the tier is the same
-      // value the orchestrator sets on each AgentTask for role `${agent.role}`.
-      `---\nname: ${agent.name}\ndescription: ${agent.description}\nrole: ${agent.role}\nmodel: ${tier}\n---\n\n${agent.body}\n`,
+      `---\nname: ${agent.name}\ndescription: ${agent.description}\nrole: ${agent.role}\ntier: ${tier}\nmodel: ${resolved.model}\n---\n\n${agent.body}\n`,
     );
     report.generated.push(`.claude/agents/${agent.name}.md`);
   }

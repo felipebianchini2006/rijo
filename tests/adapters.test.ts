@@ -60,7 +60,21 @@ describe('generateAdapters', () => {
     for (const skill of ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check']) {
       expect(fs.existsSync(path.join(root, '.claude', 'skills', skill, 'SKILL.md'))).toBe(true);
     }
-    expect(fs.existsSync(path.join(root, '.claude', 'agents', 'rijo-worker.md'))).toBe(true);
+    const workerAgentPath = path.join(root, '.claude', 'agents', 'rijo-worker.md');
+    expect(fs.existsSync(workerAgentPath)).toBe(true);
+
+    // The `model` field MUST be a concrete Claude model Claude Code accepts —
+    // never the abstract RIJO tier string. rijo-worker maps to role `worker`,
+    // tier `economical-coding`, which resolves to the `sonnet` alias.
+    const workerAgent = fs.readFileSync(workerAgentPath, 'utf8');
+    const modelLine = workerAgent.match(/^model:\s*(.+)$/m)?.[1]?.trim();
+    expect(modelLine, workerAgent).toBeDefined();
+    expect(['opus', 'sonnet', 'haiku', 'fable']).toContain(modelLine!);
+    // the abstract tier must NOT leak into the model field
+    expect(modelLine).not.toBe('economical-coding');
+    expect(modelLine).not.toMatch(/^(strongest|balanced|economical)/);
+    // routing stays traceable via a separate tier line
+    expect(workerAgent).toMatch(/^tier:\s*economical-coding$/m);
 
     const claudeMd = fs.readFileSync(path.join(root, 'CLAUDE.md'), 'utf8');
     expect(claudeMd).toContain(BEGIN);
