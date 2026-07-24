@@ -76,6 +76,9 @@ export class FakeAgentRunner implements AgentRunner {
       files_written: [],
       payload: null,
       scope_requests: [],
+      attempt_id: null,
+      generation: null,
+      lease_id: null,
     };
   }
 }
@@ -96,6 +99,9 @@ export class UnboundAgentRunner implements AgentRunner {
       files_written: [],
       payload: null,
       scope_requests: [],
+      attempt_id: null,
+      generation: null,
+      lease_id: null,
     };
   }
 }

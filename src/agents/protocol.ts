@@ -2,6 +2,23 @@ import { z } from 'zod';
 import { ModelRoleSchema } from '../core/schemas/index.js';
 
 /**
+ * Identity of ONE supervised attempt at a logical task. The core only accepts
+ * a result when generation and lease match the CURRENT record, the state
+ * admits completion, the canonical baseline is still valid and the workspace
+ * belongs to this attempt. Everything else is LATE_OR_STALE_RESULT.
+ */
+export const AgentAttemptIdentitySchema = z.object({
+  logical_task_id: z.string(),
+  attempt_id: z.string(),
+  generation: z.number().int().min(1),
+  lease_id: z.string(),
+  idempotency_key: z.string(),
+  canonical_baseline_hash: z.string().nullable().default(null),
+  workspace_id: z.string().nullable().default(null),
+});
+export type AgentAttemptIdentity = z.infer<typeof AgentAttemptIdentitySchema>;
+
+/**
  * Contract between the deterministic orchestrator and any agent runtime.
  * Every agent receives an explicit brief and returns a structured result.
  * Progressive context: never the whole repository.
@@ -37,6 +54,10 @@ export const AgentTaskSchema = z.object({
    * agent).
    */
   canonical_baseline: z.string().nullable().default(null),
+  /** Supervised attempt identity (null for unsupervised/direct dispatch). */
+  attempt: AgentAttemptIdentitySchema.nullable().default(null),
+  /** Expert profiles selected by the deterministic router (max 3). */
+  expert_profiles: z.array(z.string()).max(3).default([]),
 });
 export type AgentTask = z.infer<typeof AgentTaskSchema>;
 /** Authoring shape: fields with defaults (workspace, canonical_baseline, …) may be omitted. */
@@ -53,6 +74,10 @@ export const AgentResultSchema = z.object({
   payload: z.unknown().nullable().default(null),
   /** requested out-of-scope writes; require a new allocation from the orchestrator */
   scope_requests: z.array(z.string()).default([]),
+  /** echo of the attempt identity — required for a supervised result to be accepted */
+  attempt_id: z.string().nullable().default(null),
+  generation: z.number().int().nullable().default(null),
+  lease_id: z.string().nullable().default(null),
 });
 export type AgentResult = z.infer<typeof AgentResultSchema>;
 

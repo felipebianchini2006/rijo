@@ -114,6 +114,9 @@ export class RpcAgentRunner implements AgentRunner {
         files_written: [],
         payload: null,
         scope_requests: [],
+      attempt_id: null,
+      generation: null,
+      lease_id: null,
       });
       return;
     }
@@ -126,6 +129,9 @@ export class RpcAgentRunner implements AgentRunner {
         files_written: [],
         payload: null,
         scope_requests: [],
+      attempt_id: null,
+      generation: null,
+      lease_id: null,
       });
       return;
     }

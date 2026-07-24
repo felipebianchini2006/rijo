@@ -24,7 +24,7 @@ import {
 import { redact } from '../security/redact.js';
 import { PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
 import type { CommandEvidence } from '../core/commands.js';
-import type { AgentTask, AgentResult } from '../agents/protocol.js';
+import type { AgentTask, AgentTaskDraft, AgentResult } from '../agents/protocol.js';
 import {
   createContext,
   withLock,
@@ -240,7 +240,7 @@ async function executePhase(
     const reqDoc = readRequirements(milestone.paths.requirements);
     const phaseReqs = reqDoc.requirements.filter((r) => r.phase === phase.id);
     const specRel = path.relative(ctx.projectRoot, pp.spec).split(path.sep).join('/');
-    const specTask: AgentTask = {
+    const specTask: AgentTaskDraft = {
       id: `spec-${phase.id}`,
       role: 'planner',
       objective: `Write the SPEC.md for phase ${phase.id} (${phase.name}). It must be actionable, testable, tied to real code surfaces, complete and coherent, with observable acceptance scenarios for each requirement.`,
@@ -282,7 +282,7 @@ async function executePhase(
   while (true) {
     if (!plan) {
       stage('PLAN', `planejando tarefas (revisão ${revisions})`);
-      const planTask: AgentTask = {
+      const planTask: AgentTaskDraft = {
         id: `plan-${phase.id}-r${revisions}`,
         role: 'planner',
         objective: `Produce the execution plan for phase ${phase.id}: between 2 and 4 tasks, exact files or code regions, dependencies, per-worker write scope, tests and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Set tdd=true for testable behavior.`,
@@ -327,7 +327,7 @@ async function executePhase(
     }
 
     stage('PLAN_REVIEW', 'revisão independente do plano');
-    const reviewTask: AgentTask = {
+    const reviewTask: AgentTaskDraft = {
       id: `plan-review-${phase.id}-r${revisions}`,
       role: 'reviewer',
       objective: `Independent brief review of the phase plan: completeness, coherence, risk, requirement coverage, adherence to rules. You receive spec and plan, never the author's reasoning.`,
@@ -399,7 +399,7 @@ async function executePhase(
     for (const t of pending) transition(t.id, 'RUNNING');
     const attempts: Attempt[] = [];
     for (const t of pending) {
-      const workerTask: AgentTask = {
+      const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
         objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation.`,
@@ -580,7 +580,7 @@ async function executePhase(
 
     stage('CODE_REVIEW', 'revisão independente do código');
     const diffSummary = changedFilesReport(ctx, phaseBaseline);
-    const crTask: AgentTask = {
+    const crTask: AgentTaskDraft = {
       id: `code-review-${phase.id}-l${reviewLoops}`,
       role: 'reviewer',
       objective:
@@ -642,7 +642,7 @@ async function executePhase(
     } else {
       stage('UI_SMOKE', 'smoke visual da superfície alterada');
       const screenshotScope = path.relative(ctx.projectRoot, path.join(milestone.paths.qaDir, 'screenshots')).split(path.sep).join('/') + '/**';
-      const smokeTask: AgentTask = {
+      const smokeTask: AgentTaskDraft = {
         id: `ui-smoke-${phase.id}`,
         role: 'qa',
         objective: 'UI smoke: load the changed surface, check console and network for errors, exercise the main navigation, capture a minimal screenshot.',
@@ -864,7 +864,7 @@ async function runRepairAttempt(
   plan: PhasePlan,
   spec: { id: string; objective: string; acceptance: string[]; commands: string[]; notes: string },
 ): Promise<WorkflowOutcome | null> {
-  const repairTask: AgentTask = {
+  const repairTask: AgentTaskDraft = {
     id: spec.id,
     role: 'worker',
     objective: spec.objective,

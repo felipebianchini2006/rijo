@@ -16,6 +16,9 @@ export function buildHostPrompt(task: AgentTask): string {
     files_written: [],
     payload: null,
     scope_requests: [],
+    attempt_id: null,
+    generation: null,
+    lease_id: null,
   };
   return [
     renderBrief(task),
@@ -123,5 +126,15 @@ export function diagnosticTail(stderr: string, stdout: string, max = 300): strin
 
 /** Build an ok:false AgentResult with a precise diagnostic. Never simulates work. */
 export function failResult(taskId: string, summary: string): AgentResult {
-  return { task_id: taskId, ok: false, summary, files_written: [], payload: null, scope_requests: [] };
+  return {
+    task_id: taskId,
+    ok: false,
+    summary,
+    files_written: [],
+    payload: null,
+    scope_requests: [],
+    attempt_id: null,
+    generation: null,
+    lease_id: null,
+  };
 }
