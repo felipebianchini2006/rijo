@@ -1,0 +1,274 @@
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { detectClaudeCli } from '../src/hosts/detect.js';
+import {
+  assertScenarioAOutcome,
+  createFixture,
+  gitSubjects,
+  haikuConfigYaml,
+  packTarball,
+  readStatusJson,
+  rmFixture,
+  runRijo,
+  taskEventsPath,
+  trackedDirty,
+  assertNoSecrets,
+} from './live-workflow-harness.js';
+
+/**
+ * LIVE, FULL-WORKFLOW E2E — not a driver ping. These tests pack the real
+ * tarball, install it into a pristine fixture and drive the installed `rijo`
+ * binary turnkey against the REAL Claude Code CLI end to end:
+ * new → research → spec → plan → review → execute → verify → code-review →
+ * transactional finalize (C1/C2/seal).
+ *
+ * GATED twice, exactly like tests/live-e2e.test.ts:
+ *   1. RIJO_LIVE_E2E=1 (opt-in — real, paid model calls; haiku tiers keep it cheap);
+ *   2. the Claude CLI must be genuinely detected on PATH.
+ * When a gate is closed the test SKIPS EXPLICITLY (labelled), never silently.
+ *
+ *   RIJO_LIVE_E2E=1 npx vitest run tests/workflow-live.e2e.test.ts
+ *
+ * ── Why the Scenario B `claude` shim is legitimate ────────────────────────────
+ * Scenario B proves the real resilience chain (stall → whole-tree kill → fresh
+ * generation → completion) in the REAL pipeline. Determinism WITHOUT faking a
+ * model result is achieved by a `claude` PATH shim that:
+ *   • proxies every non-worker and every replacement invocation to the REAL
+ *     `claude` binary (detection `--version`, spec, plan, review, and the
+ *     generation-2 worker all run the real host and real model);
+ *   • on ONLY the first execution-worker invocation, spawns a real child + real
+ *     grandchild, records their pids, ignores SIGTERM and hangs FOREVER —
+ *     printing NOTHING. It never emits a fabricated AgentResult. A hung host
+ *     that answers nothing is indistinguishable from a genuinely wedged real
+ *     host, which is exactly the failure the supervisor must survive. Every
+ *     result the workflow actually ACCEPTS comes from the real Claude.
+ */
+
+const LIVE = process.env['RIJO_LIVE_E2E'] === '1';
+const claude = LIVE ? await detectClaudeCli() : { available: false, version: null };
+const TEST_TIMEOUT_MS = 1_200_000;
+
+let tarball: string | null = null;
+
+beforeAll(() => {
+  if (LIVE && claude.available) tarball = packTarball();
+});
+
+afterAll(() => {
+  if (tarball) fs.rmSync(tarball, { force: true });
+});
+
+/** Guard both gates with an explicit, labelled skip (never a silent skip). */
+function gate(ctx: { skip: (note?: string) => void }): boolean {
+  if (!LIVE) {
+    ctx.skip('SKIPPED: set RIJO_LIVE_E2E=1 to run the live full-workflow E2E (real paid model calls).');
+    return false;
+  }
+  if (!claude.available) {
+    ctx.skip('SKIPPED: the Claude CLI is not detected on PATH (honest gate — nothing is faked).');
+    return false;
+  }
+  return true;
+}
+
+describe('LIVE full-workflow E2E (Claude)', () => {
+  it(
+    'Scenario A — turnkey `rijo new --run` builds, verifies, reviews and finalizes a phase against the real host',
+    async (ctx) => {
+      if (!gate(ctx)) return;
+      const fixture = createFixture(tarball!, 'rijo-wf-a-', haikuConfigYaml('claude'));
+      try {
+        // Single-shot turnkey: new → (research/spec/plan/review/execute/verify/
+        // code-review) → transactional finalize, all against the real Claude.
+        const run = runRijo(fixture, ['new', '@PLANO.md', '--host', 'claude', '--run'], { timeoutMs: TEST_TIMEOUT_MS - 60_000 });
+        expect(run.status, `rijo new --run did not exit 0:\n${run.combined}`).toBe(0);
+
+        assertScenarioAOutcome(fixture);
+      } finally {
+        rmFixture(fixture);
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'Scenario B — a real stalled generation is whole-tree killed and a fresh generation completes',
+    async (ctx) => {
+      if (!gate(ctx)) return;
+
+      const realClaude = execFileSync('which', ['claude'], { encoding: 'utf8' }).trim();
+      expect(realClaude, 'could not resolve the real claude binary').toBeTruthy();
+
+      // Short worker deadline so the stalled generation-1 is terminated fast;
+      // every other role keeps a generous deadline so real host turns finish.
+      const configYaml = haikuConfigYaml('claude', {
+        // The stalled gen-1 hangs forever, so any finite worker deadline
+        // terminates it; keep it long enough that the REAL gen-2 worker turn
+        // finishes comfortably inside the deadline.
+        workerHardTimeoutMs: 45_000,
+        heartbeatIntervalMs: 1_000,
+        cancelGraceMs: 4_000,
+        hardKillGraceMs: 2_000,
+        maxReplacements: 1,
+      });
+      const fixture = createFixture(tarball!, 'rijo-wf-b-', configYaml);
+
+      // Shim + its state directory (counter + recorded pids) live outside the fixture.
+      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-wf-b-shim-'));
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-wf-b-state-'));
+      writeClaudeShim(shimDir);
+
+      try {
+        // Single turnkey `new --run` (like Scenario A) with the `claude` shim
+        // FIRST on PATH for the WHOLE run. A single process keeps our pre-seeded
+        // config (short worker deadline) in memory — a separate `rijo run` would
+        // read the default config `rijo new` rewrites on first init, and even
+        // re-writing config.yml out-of-band trips the manifest drift guard. The
+        // shim proxies every non-worker call (detection, extraction, spec, plan,
+        // review) to the REAL claude and stalls only the first execution worker;
+        // its replacement and every other call run the real host.
+        const runEnv: NodeJS.ProcessEnv = {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
+          RIJO_REAL_CLAUDE: realClaude,
+          RIJO_SHIM_STATE: stateDir,
+        };
+        const run = runRijo(fixture, ['new', '@PLANO.md', '--host', 'claude', '--run'], {
+          env: runEnv,
+          timeoutMs: TEST_TIMEOUT_MS - 120_000,
+        });
+        expect(run.status, `rijo new --run did not exit 0 after replacement:\n${run.combined}`).toBe(0);
+
+        // ---- The stalled generation-1 process tree (shim + child + grandchild)
+        // must be entirely dead: kill(pid, 0) throws ESRCH for each.
+        const pids = readShimPids(stateDir);
+        expect(pids.length, `expected 3 recorded pids (shim, child, grandchild), got ${pids.length}`).toBe(3);
+        for (const pid of pids) {
+          expect(() => process.kill(pid, 0), `pid ${pid} from the stalled gen-1 tree must be dead`).toThrow();
+        }
+
+        // ---- Receipts prove the chain: cancellation ladder → force terminate →
+        // replacement → a generation-2 SUCCEEDED.
+        const events = fs.readFileSync(taskEventsPath(fixture), 'utf8');
+        expect(events, 'no CANCELLING transition recorded').toContain('CANCELLING');
+        expect(events, 'no force-terminate receipt recorded').toContain('force_terminated');
+        expect(events, 'no REPLACING transition recorded').toContain('REPLACING');
+        assertNoSecrets(events);
+
+        const status = readStatusJson(fixture);
+        const replaced = status.supervisor.tasks.find(
+          (t) => t.logical_task_id.startsWith('exec-') && t.generation === 2 && t.replacements === 1,
+        );
+        expect(replaced, `no exec task reached generation 2 SUCCEEDED: ${JSON.stringify(status.supervisor.tasks)}`).toBeDefined();
+        expect(replaced!.state).toBe('SUCCEEDED');
+
+        // ---- Only the generation-2 patch was applied: generation-1 produced
+        // NOTHING (it hung), so the committed source is necessarily gen-2's, and
+        // no attempt workspace survives.
+        const wsDir = path.join(fixture.root, '.rijo', 'runtime', 'workspaces');
+        const leftover = fs.existsSync(wsDir) ? fs.readdirSync(wsDir) : [];
+        expect(leftover, `attempt workspaces leaked (gen-1 not discarded): ${leftover.join(', ')}`).toEqual([]);
+
+        // ---- Phase finalized with the full commit chain, clean tree.
+        const subjects = gitSubjects(fixture);
+        expect(subjects.some((s) => /F0\d.*verified/.test(s)), `no C1 verified commit:\n${subjects.join('\n')}`).toBe(true);
+        expect(subjects.some((s) => /evidence sealed/.test(s)), `no seal commit:\n${subjects.join('\n')}`).toBe(true);
+        expect(trackedDirty(fixture), 'tracked tree not clean after run').toEqual([]);
+      } finally {
+        rmFixture(fixture);
+        fs.rmSync(shimDir, { recursive: true, force: true });
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+/** Recorded pids of the stalled generation-1 tree (shim, child, grandchild). */
+function readShimPids(stateDir: string): number[] {
+  const files = ['pid-shim', 'pid-child', 'pid-grandchild'];
+  const pids: number[] = [];
+  for (const f of files) {
+    const p = path.join(stateDir, f);
+    if (!fs.existsSync(p)) continue;
+    const n = parseInt(fs.readFileSync(p, 'utf8').trim(), 10);
+    if (Number.isInteger(n) && n > 0) pids.push(n);
+  }
+  return pids;
+}
+
+/**
+ * Write the deterministic `claude` PATH shim (an executable Node script). It
+ * proxies to the real binary for everything except the FIRST execution-worker
+ * invocation, which spawns a real child+grandchild, records pids, ignores
+ * SIGTERM and hangs — never printing a fabricated result. See the file header
+ * for why this is a legitimate, non-fabricating stall injector.
+ */
+function writeClaudeShim(shimDir: string): void {
+  const shim = `#!/usr/bin/env node
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawnSync, spawn } = require('child_process');
+
+const REAL = process.env.RIJO_REAL_CLAUDE;
+const STATE = process.env.RIJO_SHIM_STATE;
+const argv = process.argv.slice(2);
+const joined = argv.join('\\n');
+
+// Execution-worker attempts carry the 'exec-' logical id in their prompt argv.
+const isExecWorker = joined.indexOf('exec-') !== -1;
+
+function execReal() {
+  const res = spawnSync(REAL, argv, { stdio: 'inherit' });
+  process.exit(res.status == null ? 1 : res.status);
+}
+
+if (!isExecWorker) {
+  // Detection (--version) and every non-worker role: the REAL host runs.
+  execReal();
+}
+
+// Count only execution-worker invocations. The FIRST one stalls; every later
+// one (the generation-2 replacement, and any other task) runs the REAL host.
+const counterFile = path.join(STATE, 'worker-count');
+let count = 0;
+try { count = parseInt(fs.readFileSync(counterFile, 'utf8'), 10) || 0; } catch (e) {}
+count += 1;
+fs.writeFileSync(counterFile, String(count));
+
+if (count !== 1) {
+  execReal();
+}
+
+// ---- Generation-1 stall: real process tree that ignores SIGTERM and hangs.
+// It prints NOTHING — no fabricated model result is ever produced.
+const grandchildSrc =
+  "process.on('SIGTERM',function(){});process.on('SIGINT',function(){});" +
+  "require('fs').writeFileSync(process.env.PID_FILE, String(process.pid));" +
+  "setInterval(function(){}, 1000000000);";
+const childSrc =
+  "process.on('SIGTERM',function(){});process.on('SIGINT',function(){});" +
+  "var cp=require('child_process');" +
+  "var gc=cp.spawn(process.execPath,['-e'," + JSON.stringify(grandchildSrc) + "]," +
+  "{stdio:'ignore',env:Object.assign({},process.env,{PID_FILE:process.env.GC_PID_FILE})});" +
+  "setInterval(function(){}, 1000000000);";
+
+const child = spawn(process.execPath, ['-e', childSrc], {
+  stdio: 'ignore',
+  env: Object.assign({}, process.env, { GC_PID_FILE: path.join(STATE, 'pid-grandchild') }),
+});
+fs.writeFileSync(path.join(STATE, 'pid-child'), String(child.pid));
+fs.writeFileSync(path.join(STATE, 'pid-shim'), String(process.pid));
+
+process.on('SIGTERM', function () {});
+process.on('SIGINT', function () {});
+setInterval(function () {}, 1000000000);
+`;
+  const shimPath = path.join(shimDir, 'claude');
+  fs.writeFileSync(shimPath, shim, { mode: 0o755 });
+  fs.chmodSync(shimPath, 0o755);
+}
