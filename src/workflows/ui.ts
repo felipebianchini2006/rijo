@@ -1,9 +1,10 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
-import { exists, ensureDir, writeFileAtomic, inventory, readTextIfExists } from '../core/fsx.js';
+import { exists, ensureDir, writeFileAtomic, readTextIfExists } from '../core/fsx.js';
 import { serializeFrontmatter } from '../core/frontmatter.js';
-import { extractZipSafely, UnsafeZipError, type ZipInspection } from '../security/zip.js';
+import { extractZipSafely, UnsafeZipError, MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_TOTAL_BYTES, type ZipInspection } from '../security/zip.js';
+import { scanForMocks } from '../security/mockscan.js';
 import { activeMilestone } from '../core/milestones.js';
 import { touchManifest } from '../core/manifest.js';
 import { readState, writeState, initialState } from '../core/state.js';
@@ -15,6 +16,8 @@ import {
   completed,
   failed,
   dispatch,
+  dispatchReadOnly,
+  prepareAttempt,
   guardSchema,
   type WorkflowContext,
   type WorkflowDeps,
@@ -26,14 +29,20 @@ export interface UiOptions {
   input: string;
 }
 
-const ConversionSchema = z.object({
-  converted: z.boolean(),
-  components_created: z.array(z.string()).default([]),
-  routes_mapped: z.array(z.object({ from: z.string(), to: z.string() })).default([]),
-  mocks_removed: z.array(z.string()).default([]),
-  remaining_mocks: z.array(z.string()).default([]),
-  api_contracts: z.array(z.string()).default([]),
-  notes: z.string().default(''),
+const MappingSchema = z.object({
+  mappings: z
+    .array(
+      z.object({
+        from: z.string(),
+        to: z.string().min(1),
+        kind: z.enum(['component', 'route', 'asset', 'api', 'state', 'style', 'test', 'config']),
+        notes: z.string().default(''),
+      }),
+    )
+    .min(1),
+  routes: z.array(z.object({ from: z.string(), to: z.string() })).default([]),
+  divergences: z.array(z.string()).default([]),
+  states_covered: z.array(z.enum(['loading', 'empty', 'error', 'success'])).default([]),
 });
 
 /**
@@ -73,12 +82,18 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         inspection = extractZipSafely(inputPath, stagingDir);
       } else if (fs.statSync(inputPath).isDirectory()) {
         ensureDir(stagingDir);
-        fs.cpSync(inputPath, stagingDir, { recursive: true, dereference: false, filter: (src) => !fs.lstatSync(src).isSymbolicLink() });
-        inspection = { entries: inventory(stagingDir).map((f) => ({ name: f.relPath, size: f.size })), warnings: [], executables: [], installScripts: [] };
+        inspection = copyDirectorySafely(inputPath, stagingDir);
       } else {
+        const st = fs.lstatSync(inputPath);
+        if (!st.isFile()) {
+          return blocked(ctx, 'Design input rejected: not a regular file.', [opts.input]);
+        }
+        if (st.size > MAX_ENTRY_BYTES) {
+          return blocked(ctx, `Design input rejected: file exceeds ${MAX_ENTRY_BYTES} bytes.`, [opts.input]);
+        }
         ensureDir(stagingDir);
         fs.copyFileSync(inputPath, path.join(stagingDir, path.basename(inputPath)));
-        inspection = { entries: [{ name: path.basename(inputPath), size: fs.statSync(inputPath).size }], warnings: [], executables: [], installScripts: [] };
+        inspection = { entries: [{ name: path.basename(inputPath), size: st.size }], warnings: [], executables: [], installScripts: [] };
       }
     } catch (err) {
       if (err instanceof UnsafeZipError) {
@@ -114,69 +129,184 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       }
     }
 
-    // ---- 6-14: agent-driven mapping + conversion
-    bus.emit('ui.convert', { stage: 'IMPORT', message: 'mapeando e convertendo para o stack do projeto' });
+    // ---- mapping (READ-ONLY agent): the mapping is a validated payload the
+    // CORE writes to disk — the agent never touches MAPPING.md itself.
+    bus.emit('ui.convert', { stage: 'IMPORT', message: 'mapeando design para o stack do projeto (agente read-only)' });
     const mappingPath = path.join(importDir, 'MAPPING.md');
+    const mapTask: AgentTaskDraft = {
+      id: `ui-map-${importId}`,
+      role: 'planner',
+      objective: [
+        'Map the imported design (visual reference, NOT final architecture) onto the target project stack.',
+        'For every origin file decide the destination path (component/route/asset/api/state/style/test/config), deliberate divergences, and which UI states (loading, empty, error, success) each page must implement.',
+        'Destinations must be exact project-relative paths — never globs, never .rijo, never node_modules.',
+      ].join('\n'),
+      canonical_files: [paths.rules, paths.stack].filter(exists),
+      code_files: inspection.entries.slice(0, 50).map((e) => path.join(stagingDir, e.name)),
+      write_scope: [],
+      acceptance_criteria: ['Every relevant origin file has a destination', 'Routes and API contracts are mapped', 'All four UI states are planned'],
+      verification_commands: [],
+      return_format:
+        'JSON payload: {mappings:[{from,to,kind:component|route|asset|api|state|style|test|config,notes}], routes:[{from,to}], divergences[], states_covered:[loading|empty|error|success]}',
+      notes: `Target stack hints: ${targetHints.join(', ') || 'see STACK.md'}\n${stackNote.slice(0, 1500)}`,
+    };
+    const { result: mapRes, violation: mapViolation } = await dispatchReadOnly(ctx, mapTask);
+    if (mapViolation.length > 0) {
+      return blocked(ctx, 'UI mapping agent (read-only) modified the checkout.', mapViolation);
+    }
+    const mapping = MappingSchema.safeParse(mapRes.payload);
+    if (!mapRes.ok || !mapping.success) {
+      return blocked(ctx, 'UI mapping failed to produce a valid payload.', [mapRes.summary]);
+    }
+
+    // ---- write scope DERIVED from the mapping — never '**'
+    const scopeIssues: string[] = [];
+    const writeScope: string[] = [];
+    for (const m of mapping.data.mappings) {
+      const to = m.to.replace(/\\/g, '/');
+      if (to.includes('*')) scopeIssues.push(`glob destination not allowed: ${to}`);
+      else if (to.startsWith('.rijo') || to.startsWith('.git') || to.includes('node_modules')) scopeIssues.push(`forbidden destination: ${to}`);
+      else if (path.isAbsolute(to) || to.startsWith('..')) scopeIssues.push(`destination escapes the project: ${to}`);
+      else writeScope.push(to);
+    }
+    if (scopeIssues.length > 0) {
+      return blocked(ctx, 'UI mapping produced an invalid write scope.', scopeIssues);
+    }
+    const requiredStates = ['loading', 'empty', 'error', 'success'] as const;
+    const missingStates = requiredStates.filter((st) => !mapping.data.states_covered.includes(st));
+    if (missingStates.length > 0) {
+      return blocked(ctx, 'UI mapping does not plan all required UI states.', [
+        `Missing states: ${missingStates.join(', ')} (loading, empty, error and success are mandatory).`,
+      ]);
+    }
+    writeFileAtomic(
+      mappingPath,
+      serializeFrontmatter(
+        { import_id: importId, states_covered: mapping.data.states_covered, routes: mapping.data.routes, divergences: mapping.data.divergences },
+        [
+          `# Mapping — import ${importId}`,
+          '',
+          '| Origin | Destination | Kind | Notes |',
+          '|---|---|---|---|',
+          ...mapping.data.mappings.map((m) => `| ${m.from} | ${m.to} | ${m.kind} | ${m.notes.replace(/\|/g, '\\|')} |`),
+          '',
+          '## Routes',
+          ...(mapping.data.routes.length ? mapping.data.routes.map((r) => `- ${r.from} → ${r.to}`) : ['- none']),
+          '',
+          '## Deliberate divergences',
+          ...(mapping.data.divergences.length ? mapping.data.divergences.map((d) => `- ${d}`) : ['- none']),
+          '',
+        ].join('\n'),
+      ),
+    );
+
+    // ---- conversion in an ISOLATED workspace, bounded by the derived scope
+    bus.emit('ui.convert_exec', { stage: 'IMPORT', message: `convertendo em workspace isolado (${writeScope.length} destinos)` });
     const convertTask: AgentTaskDraft = {
       id: `ui-convert-${importId}`,
       role: 'worker',
       objective: [
-        'Convert the imported design (visual reference, NOT final architecture) into the target project stack.',
-        `1. Write ${rel(projectRoot, mappingPath)}: origin file → destination component/route/state/API/asset, deliberate divergences, visual-equivalence criteria.`,
-        '2. Convert to the target language/framework following its native practices (routing, server/client split, data fetching, forms, metadata, images, accessibility, error boundaries, loading/empty states).',
-        '3. No iframes, no runtime dependency on the prototype, no copied bundles.',
-        '4. Remove mocks from the production path; create typed interfaces/clients for real APIs; when the backend does not exist yet, create explicit contracts and ports (fixtures only in tests).',
-        '5. Preserve visual fidelity without perpetuating bad technical decisions.',
+        'Convert the imported design into the target stack following MAPPING.md exactly.',
+        'Native practices of the framework (routing, data fetching, forms, accessibility, error boundaries, loading/empty/error/success states).',
+        'No iframes, no runtime dependency on the prototype, no copied bundles, NO mocks in the production path (typed contracts/ports for missing backends; fixtures only in tests).',
       ].join('\n'),
-      canonical_files: [paths.rules, paths.stack].filter(exists),
+      canonical_files: [paths.rules, paths.stack, mappingPath].filter(exists),
       code_files: inspection.entries.slice(0, 50).map((e) => path.join(stagingDir, e.name)),
-      write_scope: ['**'],
-      acceptance_criteria: [
-        'MAPPING.md exists with origin→destination table',
-        'No mock remains in the production path',
-        'Routes and APIs are mapped',
-      ],
+      write_scope: writeScope,
+      acceptance_criteria: ['All mapped destinations implemented', 'No mock remains in the production path'],
       verification_commands: [],
-      return_format:
-        'JSON payload: {converted, components_created[], routes_mapped[{from,to}], mocks_removed[], remaining_mocks[], api_contracts[], notes}',
-      notes: `Target stack hints: ${targetHints.join(', ') || 'see STACK.md'}\n${stackNote.slice(0, 1500)}`,
+      return_format: 'JSON payload: {converted: boolean, components_created[], notes}',
+      notes: '',
     };
-    const res = await dispatch(ctx, convertTask);
-    const conv = ConversionSchema.safeParse(res.payload);
-    if (!res.ok || !conv.success || !conv.data.converted) {
-      return blocked(ctx, 'UI conversion failed.', [res.summary]);
-    }
-    if (conv.data.remaining_mocks.length > 0) {
-      return blocked(ctx, 'UI conversion left mocks in the production path.', conv.data.remaining_mocks);
-    }
-    if (!exists(mappingPath)) {
-      return blocked(ctx, 'UI conversion did not produce MAPPING.md.', ['The mapping file is mandatory for traceability.']);
-    }
-
-    // ---- 15: validation (browser when available; honest otherwise)
-    let validationNote = 'browser validation SKIPPED: capability unavailable (recorded, not simulated)';
-    if (ctx.runner.capabilities.browser) {
-      bus.emit('ui.validate', { stage: 'UI_SMOKE', message: 'validando desktop/tablet/mobile, a11y, console' });
-      const validateTask: AgentTaskDraft = {
-        id: `ui-validate-${importId}`,
-        role: 'qa',
-        objective:
-          'Validate the imported UI: desktop/tablet/mobile viewports, keyboard and focus, semantics/accessibility, overflow/clipping, typography/spacing, console and network, comparative screenshots.',
-        canonical_files: [mappingPath],
-        code_files: [],
-        write_scope: [path.join(importDir, 'validation').replace(/\\/g, '/') + '/**'],
-        acceptance_criteria: ['No console errors on main routes', 'No layout overflow on the three viewports'],
-        verification_commands: [],
-        return_format: 'JSON payload: {passed: boolean, notes: string}',
-        notes: '',
-      };
-      const vres = await dispatch(ctx, validateTask);
-      const vparsed = z.object({ passed: z.boolean(), notes: z.string().default('') }).safeParse(vres.payload);
-      if (!vres.ok || !vparsed.success || !vparsed.data.passed) {
-        return blocked(ctx, 'UI validation failed.', [vres.summary]);
+    const attempt = prepareAttempt(ctx, convertTask);
+    let deltaFiles: string[] = [];
+    try {
+      const res = await dispatch(ctx, attempt.task);
+      const conv = z.object({ converted: z.boolean(), components_created: z.array(z.string()).default([]), notes: z.string().default('') }).safeParse(res.payload);
+      if (!res.ok || !conv.success || !conv.data.converted) {
+        return blocked(ctx, 'UI conversion failed.', [res.summary]);
       }
-      validationNote = `browser validation passed: ${vparsed.data.notes}`;
+      // real delta validated against the DERIVED scope (agent report ignored)
+      const delta = attempt.workspace.validate();
+      deltaFiles = delta.changed;
+      if (deltaFiles.length === 0) {
+        return blocked(ctx, 'UI conversion produced no changes.', []);
+      }
+
+      // ---- deterministic mock scan on the REAL changed files (payload is never proof)
+      const mockFindings = scanForMocks(attempt.workspace.root, delta.added.concat(delta.modified));
+      if (mockFindings.length > 0) {
+        return blocked(
+          ctx,
+          'UI conversion left mocks/placeholders in the production path (deterministic scan).',
+          mockFindings.slice(0, 15).map((f) => `${f.file}:${f.line} [${f.pattern}] ${f.excerpt}`),
+        );
+      }
+
+      // ---- build + typecheck of the target stack, inside the workspace
+      const pkg = pkgRaw ? (JSON.parse(pkgRaw) as { scripts?: Record<string, string> }) : null;
+      const verifyScripts = ['typecheck', 'build'].filter((sc) => pkg?.scripts?.[sc]);
+      if (!pkg || verifyScripts.length === 0) {
+        return blocked(ctx, 'UI import requires a verifiable target stack.', [
+          'The project must declare a build and/or typecheck script so the imported UI can be verified before applying.',
+        ]);
+      }
+      for (const sc of verifyScripts) {
+        const ev = ctx.shell.run(`npm run ${sc}`, { cwd: attempt.workspace.root });
+        bus.emit('ui.verify', { message: `${sc} → exit ${ev.exit_code}` });
+        if (ev.blocked || ev.exit_code !== 0) {
+          return blocked(ctx, `UI import failed ${sc} in the isolated workspace.`, [ev.summary.slice(0, 600)]);
+        }
+      }
+
+      // ---- REAL browser validation is mandatory when pages were imported
+      const pagesImported = deltaFiles.some((f) => /\.(html?|tsx|jsx|vue|svelte)$/i.test(f));
+      var validationNote = 'no pages imported (assets/config only); browser validation not required';
+      if (pagesImported) {
+        if (!ctx.runner.capabilities.browser) {
+          return blocked(ctx, 'UI import with pages requires a real browser validation runtime.', [
+            'The current runtime has no browser capability; run through a host with browser support (BLOCKED, never skipped).',
+          ]);
+        }
+        bus.emit('ui.validate', { stage: 'UI_SMOKE', message: 'validação real: rotas, estados, viewports, console' });
+        const validateTask: AgentTaskDraft = {
+          id: `ui-validate-${importId}`,
+          role: 'qa',
+          objective:
+            'Validate the converted UI in a real browser: every mapped route renders; loading, empty, error and success states behave; desktop/tablet/mobile viewports; keyboard and focus; console and network clean.',
+          canonical_files: [mappingPath],
+          code_files: deltaFiles.map((f) => path.join(attempt.workspace.root, f)),
+          write_scope: [],
+          acceptance_criteria: [
+            'Every mapped route renders without console errors',
+            'Loading, empty, error and success states verified',
+            'No layout overflow on the three viewports',
+          ],
+          verification_commands: [],
+          return_format: 'JSON payload: {passed: boolean, routes_checked[], states_checked[], notes}',
+          notes: `Routes to validate: ${mapping.data.routes.map((r) => r.to).join(', ') || 'from MAPPING.md'}`,
+        };
+        const vres = await dispatch(ctx, { ...validateTask, workspace: { id: attempt.workspace.id, root: attempt.workspace.root } });
+        const vparsed = z
+          .object({ passed: z.boolean(), routes_checked: z.array(z.string()).default([]), states_checked: z.array(z.string()).default([]), notes: z.string().default('') })
+          .safeParse(vres.payload);
+        if (!vres.ok || !vparsed.success || !vparsed.data.passed) {
+          return blocked(ctx, 'UI browser validation failed.', [vres.summary]);
+        }
+        validationNote = `browser validation passed (${vparsed.data.routes_checked.length} routes, states: ${vparsed.data.states_checked.join(', ') || 'reported ok'}): ${vparsed.data.notes}`;
+      }
+
+      // ---- ALL gates passed: only now the patch reaches the checkout
+      attempt.workspace.applyVerifiedPatch();
+    } catch (err) {
+      if (err instanceof Error && ['WorkspaceScopeError', 'CanonicalWriteError', 'SymlinkEscapeError', 'PatchConflictError'].includes(err.name)) {
+        return blocked(ctx, `UI conversion discarded — ${err.message}`, []);
+      }
+      throw err;
+    } finally {
+      attempt.workspace.discard();
     }
+    const conv = { data: { components_created: deltaFiles, routes_mapped: mapping.data.routes, api_contracts: mapping.data.mappings.filter((m) => m.kind === 'api').map((m) => m.to), notes: '' } };
 
     // ---- 16-17: record origin/licenses + update state
     writeFileAtomic(
@@ -252,4 +382,40 @@ function buildInventory(inspection: ZipInspection): string {
 
 function rel(root: string, p: string): string {
   return path.relative(root, p).split(path.sep).join('/');
+}
+
+/** Zip-equivalent safety limits for directory inputs: entry count, per-file and
+ *  total size, symlinks skipped, special files rejected. */
+function copyDirectorySafely(from: string, to: string): ZipInspection {
+  const inspection: ZipInspection = { entries: [], warnings: [], executables: [], installScripts: [] };
+  let total = 0;
+  const walk = (dir: string, relBase: string) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      const rel = relBase ? `${relBase}/${e.name}` : e.name;
+      if (inspection.entries.length >= MAX_ENTRIES) {
+        throw new UnsafeZipError(`Directory has more than ${MAX_ENTRIES} entries`);
+      }
+      if (e.isSymbolicLink()) {
+        inspection.warnings.push(`Symlink skipped: ${rel}`);
+        continue;
+      }
+      if (e.isDirectory()) {
+        walk(full, rel);
+        continue;
+      }
+      if (!e.isFile()) {
+        throw new UnsafeZipError(`Special file in directory input: ${rel}`, rel);
+      }
+      const size = fs.statSync(full).size;
+      if (size > MAX_ENTRY_BYTES) throw new UnsafeZipError(`File exceeds per-entry limit (${size} bytes): ${rel}`, rel);
+      total += size;
+      if (total > MAX_TOTAL_BYTES) throw new UnsafeZipError(`Directory exceeds total size limit (${MAX_TOTAL_BYTES} bytes)`);
+      ensureDir(path.dirname(path.join(to, rel)));
+      fs.copyFileSync(full, path.join(to, rel));
+      inspection.entries.push({ name: rel, size });
+    }
+  };
+  walk(from, '');
+  return inspection;
 }

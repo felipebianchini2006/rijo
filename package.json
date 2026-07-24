@@ -32,7 +32,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "sbom": "npm sbom --sbom-format cyclonedx"
   },
   "dependencies": {
     "adm-zip": "^0.5.18",

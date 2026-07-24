@@ -6,7 +6,7 @@ import { newWorkflow } from '../src/workflows/new.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRoadmap } from '../src/core/roadmap.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, ok, wireUi } from './helpers.js';
 
 const IMPORT_ID = '202607231200'; // fixed by helpers' now()
 
@@ -29,18 +29,13 @@ describe('new → ui → run composition (single lock, no double-acquire)', () =
   afterEach(() => cleanup(root));
 
   it('runs new, then ui import, then all phases without a lock deadlock', async () => {
-    const d = deps(root, { capabilities: { subagents: true, parallelism: true, browser: false } });
-    // wire the ui conversion handler to write MAPPING.md and report clean
+    const d = deps(root, { capabilities: { subagents: true, parallelism: true, browser: true } });
+    wireUi(d, root);
+    // browser:true also activates run.ts's per-phase UI_SMOKE gate for
+    // ui_surface phases (independent of the ui import pipeline itself).
     d.runner.on(
-      (t) => t.id.startsWith('ui-convert'),
-      (t) => {
-        const mapping = path.join(root, '.rijo', 'imports', IMPORT_ID, 'MAPPING.md');
-        fs.mkdirSync(path.dirname(mapping), { recursive: true });
-        fs.writeFileSync(mapping, '# Mapping\n\n| index.html | app/page.tsx |\n');
-        return ok(t, {
-          payload: { converted: true, components_created: ['app/page.tsx'], routes_mapped: [{ from: 'index.html', to: '/' }], mocks_removed: [], remaining_mocks: [], api_contracts: [], notes: 'ok' },
-        });
-      },
+      (t) => t.id.startsWith('ui-smoke-'),
+      (t) => ok(t, { payload: { passed: true, console_errors: [], network_errors: [], screenshot: null, notes: 'smoke ok' } }),
     );
 
     const outcome = await newWorkflow(root, { planFile: '@PLANO.md', ui: '@design.zip', run: true }, d);

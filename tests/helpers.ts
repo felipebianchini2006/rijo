@@ -203,6 +203,66 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
   return runner;
 }
 
+/** Valid mapping payload for the UI import pipeline (all four states planned). */
+export const UI_MAPPING_PAYLOAD = {
+  mappings: [
+    { from: 'index.html', to: 'app/page.tsx', kind: 'component', notes: 'home' },
+    { from: 'about.html', to: 'app/about/page.tsx', kind: 'component', notes: 'about' },
+    { from: 'assets/logo.svg', to: 'public/logo.svg', kind: 'asset', notes: '' },
+  ],
+  routes: [
+    { from: 'index.html', to: '/' },
+    { from: 'about.html', to: '/about' },
+  ],
+  divergences: [],
+  states_covered: ['loading', 'empty', 'error', 'success'],
+};
+
+/**
+ * Wire the standard UI import handlers: read-only mapper, workspace-writing
+ * converter and passing browser validator. The fixture project gains a
+ * package.json with a typecheck script so the target stack is verifiable.
+ */
+export function wireUi(
+  d: { runner: FakeAgentRunner },
+  root: string,
+  opts: { mapping?: unknown; convert?: (t: AgentTask) => AgentResult; validatePassed?: boolean } = {},
+): void {
+  const pkgPath = path.join(root, 'package.json');
+  if (!fs.existsSync(pkgPath)) {
+    fs.writeFileSync(pkgPath, JSON.stringify({ name: 'fixture', version: '0.0.0', scripts: { typecheck: 'tsc --noEmit' } }));
+  }
+  d.runner
+    .on(
+      (t) => t.id.startsWith('ui-map-'),
+      (t) => ok(t, { payload: opts.mapping ?? UI_MAPPING_PAYLOAD }),
+    )
+    .on(
+      (t) => t.id.startsWith('ui-convert-'),
+      (t) => {
+        if (opts.convert) return opts.convert(t);
+        const base = t.workspace!.root;
+        for (const scope of t.write_scope) {
+          fs.mkdirSync(path.dirname(path.join(base, scope)), { recursive: true });
+          fs.writeFileSync(path.join(base, scope), `// converted ${scope}\nexport default function Page() { return null; }\n`);
+        }
+        return ok(t, { payload: { converted: true, components_created: t.write_scope, notes: 'converted' } });
+      },
+    )
+    .on(
+      (t) => t.id.startsWith('ui-validate-'),
+      (t) =>
+        ok(t, {
+          payload: {
+            passed: opts.validatePassed ?? true,
+            routes_checked: ['/', '/about'],
+            states_checked: ['loading', 'empty', 'error', 'success'],
+            notes: 'validated in real browser runtime',
+          },
+        }),
+    );
+}
+
 export function deps(root: string, opts: StandardRunnerOpts = {}): WorkflowDeps & { git: FakeGit; shell: FakeShellRunner; runner: FakeAgentRunner } {
   const git = new FakeGit();
   const shell = new FakeShellRunner();

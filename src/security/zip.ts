@@ -71,6 +71,12 @@ export function extractZipSafely(zipPath: string, destDir: string): ZipInspectio
     if (!isEntrySizeSafe(size)) {
       throw new UnsafeZipError(`Entry declares too large an uncompressed size (${size} bytes): ${name}`, name);
     }
+    // decompression-bomb heuristic: an abusive expansion ratio is rejected
+    // even when the declared size is under the absolute ceiling
+    const compressed = entry.header.compressedSize;
+    if (compressed > 0 && size > 1024 * 1024 && size / compressed > 200) {
+      throw new UnsafeZipError(`Abusive expansion ratio (${Math.round(size / compressed)}x) for ${name}`, name);
+    }
     total += size;
     if (total > MAX_TOTAL_BYTES) {
       throw new UnsafeZipError(`Archive exceeds total size limit (${MAX_TOTAL_BYTES} bytes)`);

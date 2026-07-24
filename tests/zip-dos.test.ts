@@ -45,6 +45,35 @@ describe('zip DoS protection', () => {
     expect(inspection.entries.length).toBe(50);
   });
 
+  it('rejects an entry with an abusive compression ratio even under the absolute size ceiling', () => {
+    // A ~2MB all-zero buffer compresses to a couple KB with DEFLATE, giving an
+    // expansion ratio far past the 200x heuristic while staying under the
+    // absolute MAX_ENTRY_BYTES ceiling — the classic zip-bomb shape the
+    // declared-size check alone would miss.
+    const zip = new AdmZip();
+    zip.addFile('bomb.bin', Buffer.alloc(2 * 1024 * 1024));
+    const zipPath = path.join(dir, 'ratio-bomb.zip');
+    fs.writeFileSync(zipPath, zip.toBuffer());
+
+    // sanity: confirm the fixture actually exercises the ratio heuristic
+    // (declared size under the ceiling, but size/compressed > 200) before
+    // asserting on the extractor's behavior.
+    const inspect = new AdmZip(zipPath).getEntries()[0]!;
+    expect(inspect.header.size).toBeLessThanOrEqual(MAX_ENTRY_BYTES);
+    expect(inspect.header.size).toBeGreaterThan(1024 * 1024);
+    expect(inspect.header.compressedSize).toBeGreaterThan(0);
+    expect(inspect.header.size / inspect.header.compressedSize).toBeGreaterThan(200);
+
+    expect(() => extractZipSafely(zipPath, path.join(dir, 'out-ratio-bomb'))).toThrow(UnsafeZipError);
+    try {
+      extractZipSafely(zipPath, path.join(dir, 'out-ratio-bomb2'));
+      expect.fail('expected UnsafeZipError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(UnsafeZipError);
+      expect((err as Error).message).toMatch(/expansion ratio/i);
+    }
+  });
+
   it('still rejects traversal and absolute paths', () => {
     const zip = new AdmZip();
     zip.addFile('AAAAevil', Buffer.from('x'));

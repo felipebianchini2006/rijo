@@ -1,25 +1,90 @@
 name: ci
+
 on:
   push:
-    branches: [main]
+    branches: [main, 'dev/**']
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test-and-pack:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        node: [22, 24]
+        node: [22.x, 24.x]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          cache: npm
+
       - run: npm ci
+
       - run: npm run typecheck
+
       # unit + integration + golden + CLI E2E with fake agent runner,
       # including tests/pack.e2e.test.ts which packs the tarball, installs it
       # into an empty fixture and executes the packaged CLI.
+      #
+      # tests/gate.e2e.test.ts and tests/sandbox.test.ts are gated on
+      # darwin + sandbox availability and self-skip on linux/windows, so no
+      # browser/sandbox provisioning is required in CI.
       - run: npm test
+
+      - run: npm run build
+
       - run: npm pack
+
+      # Cross-platform tarball validation in a clean fixture directory,
+      # independent of tests/pack.e2e.test.ts: proves the packaged tarball
+      # installs and runs standalone on every matrix OS. Runs under bash
+      # even on windows-runners for a single consistent script.
+      - name: Validate packed tarball in clean fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PKG_DIR="$(pwd)"
+          TARBALL="$(ls "$PKG_DIR"/rijo-*.tgz)"
+          echo "Using tarball: $TARBALL"
+
+          FIXTURE_DIR="$(mktemp -d)"
+          cd "$FIXTURE_DIR"
+
+          npm init -y
+          npm install "$TARBALL"
+
+          echo "== npx rijo --version =="
+          npx rijo --version
+
+          echo "== npx rijo --status --json =="
+          npx rijo --status --json
+
+          echo "== ESM import surface =="
+          node -e "import('rijo').then(m => console.log(Object.keys(m)))"
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm audit --omit=dev --audit-level=high
+
+      - name: Generate SBOM (CycloneDX)
+        run: npm sbom --sbom-format cyclonedx > sbom.cyclonedx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json
