@@ -170,7 +170,11 @@ describe('supervisor — real processes', () => {
     expect(events).not.toContain('force_terminated'); // SIGTERM was enough
   });
 
-  it('SIGKILLs a process that ignores SIGTERM (forceTerminate proven)', async () => {
+  // POSIX-only: on Windows there are no signals — child.kill('SIGTERM') is
+  // TerminateProcess, so a child CANNOT ignore it and the SIGKILL rung of the
+  // ladder is unreachable (and unnecessary): graceful cancel already
+  // hard-terminates there. The ladder itself is covered by the fake-clock suite.
+  it.runIf(process.platform !== 'win32')('SIGKILLs a process that ignores SIGTERM (forceTerminate proven)', async () => {
     const controller = controllerFor();
     const paths = tmpPaths();
     const supervisor = new Supervisor({ controller, config: cfg(), paths, clock: new SystemClock() });
