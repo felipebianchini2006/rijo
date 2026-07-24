@@ -11,6 +11,12 @@ export interface ReadinessInput {
   journeyResults: JourneyResult[];
   missingCapabilities: string[];
   fixesApplied: string[];
+  /** requirements considered first-version scope (must be DONE for READY). */
+  firstVersion?: boolean;
+  /** journey ids explicitly waived, with an auditable reason. */
+  waivers?: Array<{ journey_id: string; reason: string }>;
+  /** true when a production build script exists in the project. */
+  hasBuild?: boolean;
 }
 
 export interface ReadinessDecision {
@@ -19,11 +25,12 @@ export interface ReadinessDecision {
 }
 
 /**
- * READY only when every gate passes. BLOCKED when an indispensable capability
+ * READY only when EVERY gate passes. BLOCKED when an indispensable capability
  * is unavailable — never READY by inference.
  */
 export function decideReadiness(input: ReadinessInput): ReadinessDecision {
   const reasons: string[] = [];
+  const waived = new Set((input.waivers ?? []).map((w) => w.journey_id));
 
   if (input.missingCapabilities.length > 0) {
     return {
@@ -32,30 +39,52 @@ export function decideReadiness(input: ReadinessInput): ReadinessDecision {
     };
   }
 
-  const failedChecks = input.deterministicChecks.filter((c) => c.exit_code !== 0);
-  for (const c of failedChecks) reasons.push(`Check failed: ${c.command} (exit ${c.exit_code})`);
+  // A pinned commit is mandatory: a readiness report must reference the exact
+  // build it evaluated.
+  if (!input.commit) reasons.push('No pinned commit — cannot certify a specific build.');
 
-  const buildCheck = input.deterministicChecks.find((c) => /build/.test(c.command));
-  if (buildCheck && buildCheck.exit_code !== 0) reasons.push('Production build failing');
+  // Any failed deterministic check blocks.
+  for (const c of input.deterministicChecks.filter((c) => c.blocked)) {
+    reasons.push(`Check blocked by policy: ${c.command}`);
+  }
+  for (const c of input.deterministicChecks.filter((c) => c.exit_code !== 0 && !c.blocked)) {
+    reasons.push(`Check failed: ${c.command} (exit ${c.exit_code})`);
+  }
 
-  const unmapped = input.requirements.filter(
-    (r) => r.status !== 'CANCELLED' && r.status !== 'CARRIED' && !input.journeys.some((j) => j.requirement_ids.includes(r.id)),
-  );
-  for (const r of unmapped) reasons.push(`Requirement not covered by any journey: ${r.id}`);
+  // A production build must have run and passed. Its absence blocks READY.
+  const buildCheck = input.deterministicChecks.find((c) => /\bbuild\b/.test(c.command));
+  if (!buildCheck) reasons.push('No production build was executed (build script missing or not run).');
+  else if (buildCheck.exit_code !== 0) reasons.push('Production build failing');
 
-  const criticalJourneys = input.journeys.filter((j) => j.critical);
-  for (const j of criticalJourneys) {
-    const result = input.journeyResults.find((r) => r.journey_id === j.id);
-    if (!result) reasons.push(`Critical journey not executed: ${j.id}`);
-    else if (!result.passed) reasons.push(`Critical journey failed: ${j.id}`);
-    else {
-      if (result.console_errors.length > 0)
-        reasons.push(`Unhandled console errors in critical flow ${j.id}: ${result.console_errors.length}`);
-      if (result.network_errors.length > 0)
-        reasons.push(`Network errors (4xx/5xx) in critical flow ${j.id}: ${result.network_errors.length}`);
+  // Requirement gate: every active requirement must be covered by a journey,
+  // AND (for a first-version certification) be DONE — a PENDING requirement can
+  // never satisfy the gate just by being mapped.
+  const active = input.requirements.filter((r) => r.status !== 'CANCELLED' && r.status !== 'CARRIED');
+  for (const r of active) {
+    if (!input.journeys.some((j) => j.requirement_ids.includes(r.id))) {
+      reasons.push(`Requirement not covered by any journey: ${r.id}`);
+    }
+    if (input.firstVersion !== false && r.status !== 'DONE' && r.status !== 'DEBT') {
+      reasons.push(`Requirement ${r.id} is ${r.status}, not DONE — first-version scope incomplete.`);
     }
   }
 
+  // Journey gate: EVERY journey must pass (not only critical ones), unless it
+  // carries an explicit, auditable waiver.
+  for (const j of input.journeys) {
+    if (waived.has(j.id)) continue;
+    const result = input.journeyResults.find((r) => r.journey_id === j.id);
+    if (!result) reasons.push(`Journey not executed: ${j.id}`);
+    else if (!result.passed) reasons.push(`Journey failed: ${j.id}`);
+    else {
+      if (result.console_errors.length > 0)
+        reasons.push(`Unhandled console errors in ${j.id}: ${result.console_errors.length}`);
+      if (result.network_errors.length > 0)
+        reasons.push(`Network errors (4xx/5xx) in ${j.id}: ${result.network_errors.length}`);
+    }
+  }
+
+  // Any open blocker/critical/high finding blocks.
   for (const result of input.journeyResults) {
     for (const f of result.findings) {
       if (['blocker', 'critical', 'high'].includes(f.severity)) {

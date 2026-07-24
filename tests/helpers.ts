@@ -5,8 +5,24 @@ import { FakeAgentRunner, type RunnerCapabilities } from '../src/agents/runner.j
 import { FakeShellRunner } from '../src/core/commands.js';
 import { FakeGit } from '../src/core/git.js';
 import { silentSink } from '../src/core/progress.js';
+import { RijoPaths } from '../src/core/paths.js';
+import { readManifest } from '../src/core/manifest.js';
+import { readRequirements } from '../src/core/roadmap.js';
+import { exists } from '../src/core/fsx.js';
 import type { WorkflowDeps } from '../src/workflows/shared.js';
 import type { AgentTask, AgentResult } from '../src/agents/protocol.js';
+
+/** Requirement IDs assigned to a phase, read from the active milestone on disk. */
+export function phaseReqIds(root: string, phaseId: string): string[] {
+  const paths = new RijoPaths(root);
+  const manifest = readManifest(paths);
+  if (!manifest?.active_milestone) return [];
+  const m = manifest.milestones.find((x) => x.id === manifest.active_milestone);
+  if (!m) return [];
+  const reqPath = paths.milestoneDir(m.id, m.slug) + '/REQUIREMENTS.md';
+  if (!exists(reqPath)) return [];
+  return readRequirements(reqPath).requirements.filter((r) => r.phase === phaseId).map((r) => r.id);
+}
 
 export function tmpProject(prefix = 'rijo-test-'): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -68,15 +84,16 @@ export const EXTRACTION_PAYLOAD = {
   research_topics: [{ key: 'node-lts', topic: 'Node.js LTS recomendado', volatile: true }],
 };
 
-export function planPayloadFor(phaseId: string) {
+export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
   return {
     phase: phaseId,
     tasks: [
       {
         id: 'T01',
         name: 'Implementar módulo',
-        requirement_ids: [],
-        technical_justification: 'infra da fase',
+        // cover the phase's requirements so the bidirectional coverage lint passes
+        requirement_ids: reqIds,
+        technical_justification: reqIds.length ? null : 'infra da fase',
         files: ['src/a.ts'],
         write_scope: ['src/a.ts'],
         depends_on: [],
@@ -156,7 +173,8 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
       (t) => t.id.startsWith('plan-') && !t.id.startsWith('plan-review'),
       (t) => {
         const phaseId = t.id.match(/plan-(\d{2})/)?.[1] ?? '01';
-        return ok(t, { payload: (opts.planPayload ?? planPayloadFor)(phaseId) });
+        if (opts.planPayload) return ok(t, { payload: opts.planPayload(phaseId) });
+        return ok(t, { payload: planPayloadFor(phaseId, phaseReqIds(root, phaseId)) });
       },
     )
     .on(

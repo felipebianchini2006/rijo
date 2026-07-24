@@ -56,12 +56,27 @@ export interface PlanLintIssue {
  */
 export function lintPlan(
   plan: PhasePlan,
-  opts: { knownRequirements: Set<string> },
+  opts: { knownRequirements: Set<string>; phaseRequirements?: string[] },
 ): PlanLintIssue[] {
   const issues: PlanLintIssue[] = [];
   const ids = new Set(plan.tasks.map((t) => t.id));
   if (ids.size !== plan.tasks.length) {
     issues.push({ code: 'DUP_TASK_ID', message: 'Duplicate task IDs', fix: 'Give each task a unique T## id' });
+  }
+  // Bidirectional coverage: every requirement assigned to this phase must be
+  // implemented by at least one task. A phase requirement with no task is a
+  // silent gap that would otherwise be marked DONE without work.
+  if (opts.phaseRequirements) {
+    const covered = new Set(plan.tasks.flatMap((t) => t.requirement_ids));
+    for (const rid of opts.phaseRequirements) {
+      if (!covered.has(rid)) {
+        issues.push({
+          code: 'REQ_NOT_COVERED',
+          message: `Requirement ${rid} is assigned to this phase but no task implements it`,
+          fix: `Add a task referencing ${rid} or move the requirement to another phase`,
+        });
+      }
+    }
   }
   for (const t of plan.tasks) {
     for (const dep of t.depends_on) {

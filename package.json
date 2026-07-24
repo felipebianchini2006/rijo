@@ -1,11 +1,20 @@
 {
   "name": "rijo",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.1",
   "description": "Context and autonomous execution framework for freelance developers: closed scope in, verified code and readiness evidence out.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "bin": {
     "rijo": "dist/cli/index.js"
@@ -26,7 +35,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "adm-zip": "^0.5.16",
+    "adm-zip": "^0.5.18",
     "yaml": "^2.8.0",
     "zod": "^3.25.0"
   },

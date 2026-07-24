@@ -9,6 +9,8 @@ import { ModelRoleSchema } from '../core/schemas/index.js';
 export const AgentTaskSchema = z.object({
   id: z.string(),
   role: ModelRoleSchema,
+  /** concrete model tier resolved from config for this role (routing). */
+  tier: z.string().optional(),
   objective: z.string().min(1),
   /** canonical .rijo files the agent must read */
   canonical_files: z.array(z.string()).default([]),
@@ -46,7 +48,12 @@ export class ScopeViolationError extends Error {
   }
 }
 
-/** Validate an agent result against its task's declared write scope. */
+/**
+ * First-line scope check against the agent's self-reported files. This is a
+ * courtesy check that catches honest mistakes early; the authoritative guard
+ * is the filesystem-diff enforcement in core/scope.ts, which does not trust
+ * the agent's report at all.
+ */
 export function enforceWriteScope(task: AgentTask, result: AgentResult): void {
   const norm = (s: string) => s.replace(/\\/g, '/');
   const allowed = task.write_scope.map(norm);

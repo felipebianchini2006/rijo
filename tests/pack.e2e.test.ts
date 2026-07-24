@@ -62,14 +62,31 @@ describe('distribution E2E (npm pack + install)', () => {
 
       // ---- rijo --version
       const version = execSync(`node "${cliEntry}" --version`, { cwd: fixture, encoding: 'utf8' });
-      expect(version.trim()).toBe('0.1.0');
+      expect(version.trim()).toBe('0.1.0-alpha.1');
 
       // ---- rijo --status --json on the uninitialized fixture
       const statusOut = execSync(`node "${cliEntry}" --status --json`, { cwd: fixture, encoding: 'utf8' });
       const status = JSON.parse(statusOut);
       expect(status.initialized).toBe(false);
-      expect(status.rijo_version).toBe('0.1.0');
+      expect(status.rijo_version).toBe('0.1.0-alpha.1');
       expect(status.schema_version).toBe(1);
+
+      // ---- P0.2: the published programmatic API is importable from the tarball.
+      // The audit reproduced ERR_MODULE_NOT_FOUND here before package "exports"
+      // existed; this proves `import { runWorkflow } from 'rijo'` resolves.
+      fs.writeFileSync(
+        path.join(fixture, 'import-check.mjs'),
+        [
+          "import { runWorkflow, newWorkflow, FakeAgentRunner, serve } from 'rijo';",
+          "if (typeof runWorkflow !== 'function') { console.error('runWorkflow missing'); process.exit(1); }",
+          "if (typeof newWorkflow !== 'function') { console.error('newWorkflow missing'); process.exit(1); }",
+          "if (typeof serve !== 'function') { console.error('serve missing'); process.exit(1); }",
+          "if (typeof FakeAgentRunner !== 'function') { console.error('FakeAgentRunner missing'); process.exit(1); }",
+          "console.log('import-ok');",
+        ].join('\n'),
+      );
+      const importOut = execSync('node import-check.mjs', { cwd: fixture, encoding: 'utf8' });
+      expect(importOut.trim()).toBe('import-ok');
     } finally {
       fs.rmSync(tarball, { force: true });
       cleanup(fixture);

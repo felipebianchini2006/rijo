@@ -33,6 +33,32 @@ export function rijoInstructionBlock(): string {
     '4. Carregue `.rijo/PROJECT.md`, `.rijo/STACK.md` e o `REQUIREMENTS.md` do milestone ativo somente quando a tarefa exigir.',
     '5. Não marque trabalho como concluído sem evidência.',
     '6. Após uma tarefa verificada, atualize o estado por meio do protocolo RIJO (CLI `rijo`).',
+    '',
+    hostBridgeNote(),
+  ].join('\n');
+}
+
+/**
+ * Host↔core bridge instructions injected into every adapter instruction block.
+ * A host that wants to run RIJO autonomously spawns `npx rijo serve --stdio`
+ * and speaks the line-delimited JSON-RPC protocol described here.
+ */
+export function hostBridgeNote(): string {
+  return [
+    '## Host bridge (execução autônoma)',
+    '',
+    'Para operar o RIJO de ponta a ponta, inicie o processo bridge e fale JSON-RPC (uma mensagem JSON por linha) sobre stdio:',
+    '',
+    '```',
+    'npx rijo serve --stdio',
+    '```',
+    '',
+    '- Dispare um workflow enviando um request, ex.: `{"type":"request","method":"workflow.run","id":1,"params":{"target":"all"}}`',
+    '  (métodos: `workflow.new|run|ui|fix|check`; `params` carrega as opções do workflow e um `capabilities` opcional).',
+    '- O core responde cada tarefa com `{"type":"request","method":"agent.runTask","id":<n>,"params":<AgentTask>}`.',
+    '  Execute o subagente descrito e responda `{"type":"response","id":<n>,"result":{...AgentResult...}}` na mesma pipe.',
+    '- Progresso chega como `{"type":"notification","method":"progress","params":{"line":"..."}}` — nada não-JSON trafega no stdout.',
+    '- Ao final, o core envia `{"type":"response","id":<id-do-workflow>,"result":<WorkflowOutcome>}`.',
   ].join('\n');
 }
 

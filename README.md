@@ -13,18 +13,52 @@ segura após interrupções · independência de provedor · greenfield e brownf
 
 Requisitos: Node.js ≥ 22 (Node 24 LTS recomendado) e Git.
 
+> **Status: `0.1.0-alpha.1`.** Endurecido após auditoria de prontidão (ponte
+> host-core, política de comandos sem shell, escopo por diff real, evidência
+> obrigatória, milestones transacionais). Ainda alpha: use em projetos reais com
+> revisão humana dos commits. Veja `docs/readiness.md`.
+
 ```bash
 # primeira execução sem instalação global
-npx rijo@0.1.0 new @PLANO.md
+npx rijo@0.1.0-alpha.1 new @PLANO.md
 
 # recomendado: dependência local fixada no lockfile
-npm install --save-dev rijo
+npm install --save-dev rijo@alpha
 npx rijo run
 
 # conveniência pessoal (não define a versão canônica do projeto)
-npm install --global rijo
+npm install --global rijo@alpha
 rijo --status
 ```
+
+## Execução autônoma (ponte host-core)
+
+O RIJO não embarca um SDK de provedor. Para operá-lo de ponta a ponta dentro de
+um host de agentes (Claude Code, Codex ou o seu), inicie a ponte JSON-RPC:
+
+```bash
+npx rijo serve --stdio
+```
+
+O host dispara um workflow e responde cada tarefa do orquestrador:
+
+```text
+host → core : {"type":"request","method":"workflow.run","id":1,"params":{"target":"all"}}
+core → host : {"type":"request","method":"agent.runTask","id":7,"params":<AgentTask>}
+host → core : {"type":"response","id":7,"result":<AgentResult>}
+core → host : {"type":"notification","method":"progress","params":{"line":"[RIJO M001 F01/02] EXECUTE ..."}}
+core → host : {"type":"response","id":1,"result":<WorkflowOutcome>}
+```
+
+Ou embarque programaticamente injetando um `AgentRunner`:
+
+```ts
+import { runWorkflow, type AgentRunner } from 'rijo';
+const outcome = await runWorkflow(process.cwd(), { target: 'all' }, { runner: myRunner });
+```
+
+Sem runtime vinculado, os workflows param com diagnóstico preciso — nunca
+simulam trabalho de agente.
 
 Antes da publicação no npm, instale por tag Git — mesmo CLI, mesmo layout:
 

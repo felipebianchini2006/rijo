@@ -1,27 +1,40 @@
 import * as path from 'node:path';
 import { ensureDir, exists, readTextIfExists, readJsonIfExists, writeFileAtomic, writeJsonAtomic } from '../core/fsx.js';
+import { loadConfig } from '../core/config.js';
+import { RijoPaths } from '../core/paths.js';
+import type { ModelRole } from '../core/schemas/index.js';
 import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
 
 const SKILLS = ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
 
-const AGENT_DEFS: Array<{ name: string; description: string; body: string }> = [
+/**
+ * Specialized Claude Code agents. Each carries the RIJO `role` it fills so the
+ * generated `.claude/agents/*.md` files can be stamped with the concrete model
+ * tier resolved from `.rijo/config.yml` — routing is operational, not just
+ * declarative (the same tier the orchestrator puts on each AgentTask).
+ */
+const AGENT_DEFS: Array<{ name: string; role: ModelRole; description: string; body: string }> = [
   {
     name: 'rijo-worker',
+    role: 'worker',
     description: 'Economical implementation worker for one RIJO task with a strict write scope.',
     body: 'Implement exactly one RIJO task. Read only the files listed in your brief. Never write outside your declared write scope; if you need to, stop and request a new allocation. Follow TDD when the task says so (RED, GREEN, REFACTOR). Return a one-line summary plus the JSON payload the brief demands — never your private reasoning.',
   },
   {
     name: 'rijo-reviewer',
+    role: 'reviewer',
     description: 'Independent reviewer: receives spec, diff and evidence, never the author reasoning.',
     body: 'Review the artifact against the spec and rules. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject. Evidence beats claims: an agent summary is not evidence. Return the JSON verdict payload only.',
   },
   {
     name: 'rijo-researcher',
+    role: 'researcher',
     description: 'Economical researcher: official sources only, claim+url+date for every volatile fact.',
     body: 'Research the given topic using official documentation, release/LTS pages, changelogs, advisories and registries. Never assume newest is best. Separate fact, inference and recommendation. Return the JSON payload with summary and sources (claim, source, url, checked_at, version, confidence).',
   },
   {
     name: 'rijo-qa',
+    role: 'qa',
     description: 'Browser QA agent: executes one journey as a real user and reports structured results.',
     body: 'Execute the journey end-to-end as a real user. Observe console, network, error states, keyboard navigation. Capture screenshots into your write scope on failure. Return the JSON journey result payload only.',
   },
@@ -47,13 +60,19 @@ export function generateClaudeAdapter(projectRoot: string): AdapterReport {
     report.generated.push(`.claude/skills/${skill}/SKILL.md`);
   }
 
-  // specialized agents
+  // specialized agents — stamped with the model tier of their RIJO role so the
+  // generated files carry operational routing (tier from .rijo/config.yml).
+  const config = loadConfig(new RijoPaths(projectRoot));
   for (const agent of AGENT_DEFS) {
     const dir = path.join(projectRoot, '.claude', 'agents');
     ensureDir(dir);
+    const tier = config.models[agent.role];
     writeFileAtomic(
       path.join(dir, `${agent.name}.md`),
-      `---\nname: ${agent.name}\ndescription: ${agent.description}\n---\n\n${agent.body}\n`,
+      // `model` is the RIJO role tier (e.g. "economical-coding"). The host maps
+      // that placeholder tier to a concrete Claude model; the tier is the same
+      // value the orchestrator sets on each AgentTask for role `${agent.role}`.
+      `---\nname: ${agent.name}\ndescription: ${agent.description}\nrole: ${agent.role}\nmodel: ${tier}\n---\n\n${agent.body}\n`,
     );
     report.generated.push(`.claude/agents/${agent.name}.md`);
   }

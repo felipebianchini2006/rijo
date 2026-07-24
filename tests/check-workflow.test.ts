@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
+import { runWorkflow } from '../src/workflows/run.js';
 import { checkWorkflow } from '../src/workflows/check.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
@@ -9,6 +10,18 @@ import { decideReadiness } from '../src/qa/readiness.js';
 import { deriveJourneys } from '../src/qa/journeys.js';
 import { RequirementSchema } from '../src/core/schemas/index.js';
 import { tmpProject, cleanup, writePlanFile, deps, ok } from './helpers.js';
+
+/** A project whose gates can pass: a build/test script and a passing ui-smoke. */
+function prepareReadyProject(root: string, d: ReturnType<typeof deps>) {
+  fs.writeFileSync(
+    path.join(root, 'package.json'),
+    JSON.stringify({ name: 'app', scripts: { build: 'echo build', test: 'echo test' } }),
+  );
+  d.runner.on(
+    (t) => t.id.startsWith('ui-smoke-'),
+    (t) => ok(t, { payload: { passed: true, console_errors: [], network_errors: [], screenshot: null, notes: '' } }),
+  );
+}
 
 function readinessPath(root: string): string {
   const paths = new RijoPaths(root);
@@ -47,11 +60,12 @@ describe('rijo check', () => {
 
   it('all valid gates produce READY with pinned commit and evidence', async () => {
     const d = deps(root, { capabilities: { browser: true } });
+    prepareReadyProject(root, d);
     await newWorkflow(root, { planFile: '@PLANO.md' }, d);
-    d.git.commitAll(root, 'baseline');
+    await runWorkflow(root, { target: 'all' }, d); // requirements become DONE
     wireJourneys(d, () => ({}));
     const outcome = await checkWorkflow(root, {}, d);
-    expect(outcome.ok, outcome.message).toBe(true);
+    expect(outcome.ok, outcome.message + ' :: ' + (outcome.details ?? []).join(' | ')).toBe(true);
     const report = fs.readFileSync(readinessPath(root), 'utf8');
     expect(report).toContain('status: READY');
     expect(report).toContain(d.git.headCommit()!);
@@ -95,7 +109,9 @@ describe('rijo check', () => {
 
   it('--fix groups failures and re-runs only failing journeys, bounded at 2 rounds', async () => {
     const d = deps(root, { capabilities: { browser: true } });
+    prepareReadyProject(root, d);
     await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await runWorkflow(root, { target: 'all' }, d);
     let fixed = false;
     d.runner.on(
       (t) => t.id.startsWith('journey-'),

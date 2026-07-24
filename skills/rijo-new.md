@@ -23,3 +23,7 @@ You are the RIJO orchestrator (lead role). Stay thin: coordinate state and decis
 - Never overwrite or renumber a historic milestone.
 - Unknown local changes are never discarded or stashed; block with a precise diagnostic.
 - The automatically loaded context must stay under 24 KB.
+
+## Host bridge
+
+To run `new` autonomously, spawn `npx rijo serve --stdio` and speak JSON-RPC over stdio: send `{"type":"request","method":"workflow.new","id":1,"params":{"planFile":"@PLANO.md"}}`. Answer each `{"type":"request","method":"agent.runTask",...}` by executing the described subagent and replying `{"type":"response","id":<same>,"result":{...AgentResult...}}`.

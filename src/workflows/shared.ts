@@ -2,9 +2,14 @@ import { RijoPaths } from '../core/paths.js';
 import { loadConfig } from '../core/config.js';
 import { ProgressBus, consoleSink, newRunId, type ProgressSink } from '../core/progress.js';
 import { acquireLock, releaseLock } from '../core/locks.js';
+import { readState, writeState } from '../core/state.js';
+import { checkSchemaCompatibility, SchemaMismatchError, touchManifest } from '../core/manifest.js';
+import { exists } from '../core/fsx.js';
 import type { RijoConfig } from '../core/schemas/index.js';
 import type { AgentRunner } from '../agents/runner.js';
-import { UnboundAgentRunner } from '../agents/runner.js';
+import { UnboundAgentRunner, runBatch, runValidated } from '../agents/runner.js';
+import { tierFor } from '../agents/roles.js';
+import type { AgentTask, AgentResult } from '../agents/protocol.js';
 import type { ShellRunner } from '../core/commands.js';
 import { SystemShellRunner } from '../core/commands.js';
 import type { GitOps } from '../core/git.js';
@@ -54,6 +59,20 @@ export class BlockedError extends Error {
   }
 }
 
+/**
+ * Guard against running against an incompatible on-disk schema. Returns a
+ * blocked outcome if the manifest schema_version differs from this build.
+ */
+export function guardSchema(ctx: WorkflowContext): WorkflowOutcome | null {
+  try {
+    checkSchemaCompatibility(ctx.paths);
+    return null;
+  } catch (err) {
+    if (err instanceof SchemaMismatchError) return blocked(ctx, 'Schema version mismatch.', [err.message]);
+    throw err;
+  }
+}
+
 /** Run a workflow body under the runtime lock; always releases. */
 export async function withLock<T>(ctx: WorkflowContext, body: () => Promise<T>): Promise<T> {
   acquireLock(ctx.paths.lock, ctx.bus.runId, ctx.now);
@@ -71,8 +90,42 @@ export interface WorkflowOutcome {
   details?: string[];
 }
 
+/**
+ * Inject the role's configured model tier into a task and run it. This is how
+ * model routing becomes operational: the deterministic core resolves tier from
+ * config.yml and the runner (or host bridge) receives it on every task.
+ */
+export async function dispatch(ctx: WorkflowContext, task: AgentTask): Promise<AgentResult> {
+  return runValidated(ctx.runner, { ...task, tier: task.tier ?? tierFor(ctx.config, task.role) });
+}
+
+export async function dispatchBatch(ctx: WorkflowContext, tasks: AgentTask[], max?: number): Promise<AgentResult[]> {
+  const withTier = tasks.map((t) => ({ ...t, tier: t.tier ?? tierFor(ctx.config, t.role) }));
+  return runBatch(ctx.runner, withTier, max ?? ctx.config.limits.max_parallel_agents);
+}
+
 export function blocked(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
   ctx.bus.emit('workflow.blocked', { status: 'blocked', message }, { details });
+  // Persist the blocked state durably ONLY when a run is actually in progress
+  // (a phase is active) — so a later `rijo --status` and the next run see the
+  // true situation. Pure input-validation refusals (no project, wrong flags,
+  // re-init without --next) must stay fully non-destructive and never touch state.
+  try {
+    if (exists(ctx.paths.state)) {
+      const prev = readState(ctx.paths);
+      if (prev && prev.phase !== null) {
+        writeState(
+          ctx.paths,
+          { ...prev, blocked: true, blocked_reason: message, updated_at: ctx.now().toISOString() },
+          `BLOCKED: ${message}`,
+        );
+        // refresh manifest hashes so this state write is not later seen as drift
+        touchManifest(ctx.paths, () => {}, ctx.now);
+      }
+    }
+  } catch {
+    /* never let checkpoint persistence mask the original blocker */
+  }
   return { ok: false, status: 'blocked', message, details };
 }
 

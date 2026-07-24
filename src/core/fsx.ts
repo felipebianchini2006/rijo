@@ -31,24 +31,48 @@ export function readJsonIfExists<T = unknown>(p: string): T | null {
   return fs.existsSync(p) ? (JSON.parse(fs.readFileSync(p, 'utf8')) as T) : null;
 }
 
-/** Write via temp file + rename in the same directory (atomic on POSIX and NTFS). */
+/**
+ * Write via temp file + fsync + rename in the same directory (atomic on POSIX
+ * and NTFS). The temp file is flushed to disk before the rename so a crash
+ * cannot leave a torn file, and the existing target is never destroyed until
+ * its replacement is safely in place — if anything fails, the original stays.
+ */
 export function writeFileAtomic(p: string, content: string): void {
   ensureDir(path.dirname(p));
-  const tmp = path.join(
-    path.dirname(p),
-    `.${path.basename(p)}.${process.pid}.${Math.floor(Math.random() * 1e9).toString(36)}.tmp`,
-  );
-  fs.writeFileSync(tmp, content, 'utf8');
+  const suffix = `${process.pid}.${Math.floor(Math.random() * 1e9).toString(36)}`;
+  const tmp = path.join(path.dirname(p), `.${path.basename(p)}.${suffix}.tmp`);
+  // write + flush the temp file durably
+  const fd = fs.openSync(tmp, 'w');
+  try {
+    fs.writeFileSync(fd, content, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   try {
     fs.renameSync(tmp, p);
+    return;
   } catch (err) {
-    // Windows rename over an existing open file can fail; retry once after unlink.
-    try {
-      fs.rmSync(p, { force: true });
-      fs.renameSync(tmp, p);
-    } catch {
+    // Windows can refuse rename over an existing/locked target. Move the
+    // original aside first so it is recoverable if the second rename fails.
+    if (!fs.existsSync(p)) {
       fs.rmSync(tmp, { force: true });
       throw err;
+    }
+    const backup = path.join(path.dirname(p), `.${path.basename(p)}.${suffix}.bak`);
+    fs.renameSync(p, backup); // original preserved as backup
+    try {
+      fs.renameSync(tmp, p);
+      fs.rmSync(backup, { force: true });
+    } catch (err2) {
+      // restore the original; leave the tree exactly as it was
+      try {
+        fs.renameSync(backup, p);
+      } catch {
+        /* backup is the only survivor; surface the failure */
+      }
+      fs.rmSync(tmp, { force: true });
+      throw err2;
     }
   }
 }

@@ -7,13 +7,15 @@ import type { CommandEvidence } from '../core/commands.js';
 import { deriveJourneys, JourneyResultSchema, type Journey, type JourneyResult } from '../qa/journeys.js';
 import { generatePlaywrightSpecs } from '../qa/playwright.js';
 import { decideReadiness } from '../qa/readiness.js';
-import { runBatch, runValidated } from '../agents/runner.js';
 import type { AgentTask } from '../agents/protocol.js';
 import {
   createContext,
   withLock,
   completed,
   failed,
+  dispatch,
+  dispatchBatch,
+  guardSchema,
   type WorkflowContext,
   type WorkflowDeps,
   type WorkflowOutcome,
@@ -37,6 +39,8 @@ export async function checkWorkflow(
   const ctx = createContext(projectRoot, deps);
   const { paths, bus, config, now } = ctx;
   if (!exists(paths.manifest)) return failed(ctx, 'No RIJO project here. Run `rijo new @PLAN.md` first.');
+  const schemaGuard = guardSchema(ctx);
+  if (schemaGuard) return schemaGuard;
   const milestone = activeMilestone(paths);
   if (!milestone) return failed(ctx, 'No active milestone.');
 
@@ -52,16 +56,18 @@ export async function checkWorkflow(
     });
 
     // ---- 2-3: deterministic checks (only those that exist in the project)
-    const checks = runDeterministicChecks(ctx);
-    const failedChecks = checks.filter((c) => c.exit_code !== 0);
-    bus.emit('check.deterministic', { message: `${checks.length} verificações, ${failedChecks.length} falhas` });
+    let checks = runDeterministicChecks(ctx);
+    const hasBuild = detectHasBuild(ctx);
+    const fixesApplied: string[] = [];
+    bus.emit('check.deterministic', { message: `${checks.length} verificações, ${checks.filter((c) => c.exit_code !== 0).length} falhas` });
 
     // ---- 4-6: journeys derived from requirements
     const reqDoc = readRequirements(milestone.paths.requirements);
     const journeys = deriveJourneys(reqDoc.requirements);
     writeJourneysDoc(milestone.paths.qaDir, journeys, now);
-    // Playwright specs: deterministic codegen, one per journey, run by QA agents or CI
-    const specs = generatePlaywrightSpecs(journeys, path.join(milestone.paths.qaDir, 'journeys'));
+    // Playwright specs: deterministic codegen with acceptance scenarios as steps.
+    const acceptanceById = Object.fromEntries(reqDoc.requirements.map((r) => [r.id, r.acceptance]));
+    const specs = generatePlaywrightSpecs(journeys, path.join(milestone.paths.qaDir, 'journeys'), 'http://localhost:3000', acceptanceById);
     bus.emit('check.playwright', { message: `${specs.length} specs Playwright gerados em qa/journeys/` });
 
     // ---- 7-9: browser journeys (isolated agents), honest about capability
@@ -74,29 +80,36 @@ export async function checkWorkflow(
       bus.emit('check.journeys', { stage: 'JOURNEYS', message: `executando ${journeys.length} jornadas em agentes isolados` });
       journeyResults = await runJourneys(ctx, milestone.paths.qaDir, journeys);
 
-      // ---- 12: --fix loop (bounded)
+      // ---- 12: --fix loop (bounded). After each repair the WHOLE matrix is
+      // re-run — deterministic checks (build/lint/typecheck/test) AND the
+      // failing journeys — so READY reflects the repaired state, not the old one.
       if (opts.fix) {
         for (let round = 1; round <= config.limits.qa_fix_loops; round++) {
-          const failing = journeyResults.filter((r) => !r.passed);
-          if (failing.length === 0) break;
-          bus.emit('check.fix', { stage: 'REPAIR', message: `rodada ${round}: corrigindo ${failing.length} jornadas por causa raiz` });
+          const failingJourneys = journeyResults.filter((r) => !r.passed);
+          const failingChecks = checks.filter((c) => c.exit_code !== 0);
+          if (failingJourneys.length === 0 && failingChecks.length === 0) break;
+          bus.emit('check.fix', { stage: 'REPAIR', message: `rodada ${round}: corrigindo por causa raiz` });
           const fixTask: AgentTask = {
             id: `check-fix-${round}`,
             role: 'worker',
-            objective: 'Group the failing journey findings by root cause and fix them in limited scope. Do not fix symptoms individually when one cause explains several failures.',
+            objective: 'Group the failing checks and journey findings by root cause and fix them in limited scope. Do not fix symptoms individually when one cause explains several failures.',
             canonical_files: [paths.rules].filter(exists),
             code_files: [],
             write_scope: ['**'],
-            acceptance_criteria: ['Failing journeys pass on re-run'],
+            acceptance_criteria: ['Failing journeys and checks pass on re-run'],
             verification_commands: [],
             return_format: 'JSON payload: {done: boolean, notes: string}',
-            notes: failing
-              .map((f) => `${f.journey_id}: ${f.findings.map((x) => `${x.severity} ${x.description}`).join('; ')}`)
-              .join('\n'),
+            notes: [
+              ...failingChecks.map((c) => `check ${c.command} → exit ${c.exit_code}`),
+              ...failingJourneys.map((f) => `${f.journey_id}: ${f.findings.map((x) => `${x.severity} ${x.description}`).join('; ')}`),
+            ].join('\n'),
           };
-          const fixRes = await runValidated(ctx.runner, fixTask);
+          const fixRes = await dispatch(ctx, fixTask);
           if (!fixRes.ok) break;
-          const rerun = await runJourneys(ctx, milestone.paths.qaDir, journeys.filter((j) => failing.some((f) => f.journey_id === j.id)));
+          fixesApplied.push(`round ${round}: ${fixRes.summary}`);
+          // re-run the entire deterministic matrix, not only the failing subset
+          checks = runDeterministicChecks(ctx);
+          const rerun = await runJourneys(ctx, milestone.paths.qaDir, journeys.filter((j) => failingJourneys.some((f) => f.journey_id === j.id)));
           journeyResults = journeyResults.map((r) => rerun.find((x) => x.journey_id === r.journey_id) ?? r);
         }
       }
@@ -116,7 +129,7 @@ export async function checkWorkflow(
         return_format: 'JSON payload: {findings: [{severity, description, evidence}]}',
         notes: '',
       };
-      const visualRes = await runValidated(ctx.runner, visualTask);
+      const visualRes = await dispatch(ctx, visualTask);
       if (visualRes.ok && visualRes.payload) {
         const parsed = JourneyResultSchema.pick({ findings: true }).safeParse(visualRes.payload);
         if (parsed.success && journeyResults.length > 0) {
@@ -124,6 +137,12 @@ export async function checkWorkflow(
         }
       }
     }
+
+    // The report must reference the exact state it tested. If --fix modified the
+    // working tree, that state is uncommitted and cannot be certified until the
+    // changes are committed and check is re-run against a clean commit.
+    const finalStatus = ctx.git.status(projectRoot);
+    const dirtyAfterFix = fixesApplied.length > 0 && finalStatus.isRepo && finalStatus.dirtyFiles.length > 0;
 
     // ---- 13-15: readiness decision and report
     const decision = decideReadiness({
@@ -134,8 +153,16 @@ export async function checkWorkflow(
       journeys,
       journeyResults,
       missingCapabilities,
-      fixesApplied: [],
+      fixesApplied,
+      hasBuild,
+      firstVersion: true,
     });
+    if (dirtyAfterFix && decision.status === 'READY') {
+      decision.status = 'NOT_READY';
+      decision.reasons = [
+        'Working tree was modified by --fix but not committed; commit the fixes and re-run `rijo check` to certify a clean commit.',
+      ];
+    }
     writeFileAtomic(
       milestone.paths.readiness,
       serializeFrontmatter(
@@ -144,9 +171,10 @@ export async function checkWorkflow(
           commit,
           environment,
           checked_at: now().toISOString(),
-          commands: checks.map((c) => ({ command: c.command, exit_code: c.exit_code })),
+          commands: checks.map((c) => ({ command: c.command, exit_code: c.exit_code, blocked: c.blocked })),
           journeys_executed: journeyResults.map((r) => ({ id: r.journey_id, passed: r.passed })),
           missing_capabilities: missingCapabilities,
+          fixes_applied: fixesApplied,
         },
         [
           `# Production readiness — ${milestone.id}`,
@@ -194,15 +222,33 @@ export async function checkWorkflow(
   });
 }
 
+function detectHasBuild(ctx: WorkflowContext): boolean {
+  const pkgPath = path.join(ctx.projectRoot, 'package.json');
+  if (!exists(pkgPath)) return false;
+  try {
+    const pkg = JSON.parse(readText(pkgPath)) as { scripts?: Record<string, string> };
+    return Boolean(pkg.scripts?.['build']);
+  } catch {
+    return false;
+  }
+}
+
 function runDeterministicChecks(ctx: WorkflowContext): CommandEvidence[] {
   const commands: string[] = [];
   const pkgPath = path.join(ctx.projectRoot, 'package.json');
   if (exists(pkgPath)) {
     try {
-      const pkg = JSON.parse(readText(pkgPath)) as { scripts?: Record<string, string> };
+      const pkg = JSON.parse(readText(pkgPath)) as { scripts?: Record<string, string>; devDependencies?: Record<string, string>; dependencies?: Record<string, string> };
       // ordered: format, lint, typecheck, production build, tests, e2e, audit
       for (const s of ['format:check', 'lint', 'typecheck', 'build', 'test', 'test:integration', 'test:e2e']) {
         if (pkg.scripts?.[s]) commands.push(`npm run ${s}`);
+      }
+      // Real Playwright execution when the project actually declares it and a
+      // config exists — the generated specs are run, not just written.
+      const hasPlaywright = Boolean(pkg.devDependencies?.['@playwright/test'] || pkg.dependencies?.['@playwright/test']);
+      const hasConfig = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs'].some((f) => exists(path.join(ctx.projectRoot, f)));
+      if (hasPlaywright && hasConfig && ctx.runner.capabilities.browser) {
+        commands.push('npx playwright test');
       }
       commands.push('npm audit --omit=dev --audit-level=high');
     } catch {
@@ -235,7 +281,7 @@ async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journe
       'JSON payload: {journey_id, passed, steps[], console_errors[], network_errors[], findings[{severity,description,evidence}], screenshots[]}',
     notes: `Requirements covered: ${j.requirement_ids.join(', ')}`,
   }));
-  const results = await runBatch(ctx.runner, tasks, ctx.config.limits.max_parallel_agents);
+  const results = await dispatchBatch(ctx, tasks);
   const out: JourneyResult[] = [];
   for (let i = 0; i < results.length; i++) {
     const r = results[i]!;

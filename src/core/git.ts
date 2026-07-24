@@ -9,7 +9,8 @@ export interface GitStatus {
 export interface GitOps {
   status(cwd: string): GitStatus;
   headCommit(cwd: string): string | null;
-  commitAll(cwd: string, message: string): string | null;
+  /** Commit only the given paths (staged individually). Never `git add -A`. */
+  commitPaths(cwd: string, message: string, paths: string[]): string | null;
   tag(cwd: string, name: string, message: string): boolean;
   init(cwd: string): boolean;
 }
@@ -24,11 +25,11 @@ export class SystemGit implements GitOps {
     const inside = git(cwd, ['rev-parse', '--is-inside-work-tree']);
     if (inside.code !== 0 || inside.out !== 'true') return { isRepo: false, branch: null, dirtyFiles: [] };
     const branch = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
-    const porcelain = git(cwd, ['status', '--porcelain']);
+    const porcelain = git(cwd, ['status', '--porcelain', '-uall']);
     return {
       isRepo: true,
       branch: branch.code === 0 ? branch.out : null,
-      dirtyFiles: porcelain.out ? porcelain.out.split('\n').map((l) => l.slice(3)) : [],
+      dirtyFiles: porcelain.out ? porcelain.out.split('\n').map((l) => l.slice(3).replace(/^"|"$/g, '')) : [],
     };
   }
 
@@ -37,9 +38,17 @@ export class SystemGit implements GitOps {
     return r.code === 0 ? r.out : null;
   }
 
-  commitAll(cwd: string, message: string): string | null {
-    if (git(cwd, ['add', '-A']).code !== 0) return null;
-    if (git(cwd, ['commit', '-m', message]).code !== 0) return null;
+  /**
+   * Stage the exact paths given (and nothing else) and commit them. Pre-existing
+   * unrelated changes in the working tree are left untouched, so an automatic
+   * commit can never sweep in the user's own edits.
+   */
+  commitPaths(cwd: string, message: string, paths: string[]): string | null {
+    if (paths.length === 0) return null;
+    // stage each path explicitly; -A/. are deliberately never used
+    if (git(cwd, ['add', '--', ...paths]).code !== 0) return null;
+    // commit only the staged index for these paths
+    if (git(cwd, ['commit', '-m', message, '--', ...paths]).code !== 0) return null;
     return this.headCommit(cwd);
   }
 
@@ -52,9 +61,9 @@ export class SystemGit implements GitOps {
   }
 }
 
-/** Test double: in-memory git. */
+/** Test double: in-memory git. Tracks which paths were committed. */
 export class FakeGit implements GitOps {
-  public commits: Array<{ message: string; hash: string }> = [];
+  public commits: Array<{ message: string; hash: string; paths: string[] }> = [];
   public tags: string[] = [];
   public dirty: string[] = [];
   public repo = true;
@@ -66,11 +75,12 @@ export class FakeGit implements GitOps {
   headCommit(): string | null {
     return this.commits.length ? this.commits[this.commits.length - 1]!.hash : null;
   }
-  commitAll(_cwd: string, message: string): string | null {
-    if (!this.repo) return null;
+  commitPaths(_cwd: string, message: string, paths: string[]): string | null {
+    if (!this.repo || paths.length === 0) return null;
     const hash = `fake${String(++this.counter).padStart(6, '0')}`;
-    this.commits.push({ message, hash });
-    this.dirty = [];
+    this.commits.push({ message, hash, paths: [...paths] });
+    // only the committed paths leave the dirty set
+    this.dirty = this.dirty.filter((f) => !paths.includes(f));
     return hash;
   }
   tag(_cwd: string, name: string): boolean {

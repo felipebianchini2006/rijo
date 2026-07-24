@@ -44,6 +44,7 @@ const GOLDEN_REQUIREMENTS = [
   '    status: PENDING',
   '    classification: NEW',
   '    carried_from: null',
+  '    resolves: null',
   '    tests: []',
   '    evidence: null',
   '    no_test_justification: null',

@@ -5,8 +5,8 @@ import { exists, ensureDir, writeFileAtomic, inventory, readTextIfExists } from 
 import { serializeFrontmatter } from '../core/frontmatter.js';
 import { extractZipSafely, UnsafeZipError, type ZipInspection } from '../security/zip.js';
 import { activeMilestone } from '../core/milestones.js';
+import { touchManifest } from '../core/manifest.js';
 import { readState, writeState, initialState } from '../core/state.js';
-import { runValidated } from '../agents/runner.js';
 import type { AgentTask } from '../agents/protocol.js';
 import {
   createContext,
@@ -14,6 +14,9 @@ import {
   blocked,
   completed,
   failed,
+  dispatch,
+  guardSchema,
+  type WorkflowContext,
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
@@ -44,13 +47,19 @@ export async function uiWorkflow(
   deps: WorkflowDeps = {},
 ): Promise<WorkflowOutcome> {
   const ctx = createContext(projectRoot, deps);
-  const { paths, bus, now } = ctx;
-  if (!exists(paths.manifest)) return failed(ctx, 'No RIJO project here. Run `rijo new @PLAN.md` first.');
+  if (!exists(ctx.paths.manifest)) return failed(ctx, 'No RIJO project here. Run `rijo new @PLAN.md` first.');
+  const schemaGuard = guardSchema(ctx);
+  if (schemaGuard) return schemaGuard;
+  return withLock(ctx, () => uiCore(ctx, opts));
+}
 
+/** Import a design using an existing context and lock (composes with `new`). */
+export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<WorkflowOutcome> {
+  const { projectRoot, paths, bus, now } = ctx;
   const inputPath = path.resolve(projectRoot, opts.input.replace(/^@/, ''));
   if (!exists(inputPath)) return failed(ctx, `Design input not found: ${opts.input}`);
 
-  return withLock(ctx, async () => {
+  {
     const importId = now().toISOString().replace(/[-:.TZ]/g, '').slice(0, 12);
     const importDir = path.join(paths.importsDir, importId);
     const stagingDir = path.join(importDir, 'staging');
@@ -132,7 +141,7 @@ export async function uiWorkflow(
         'JSON payload: {converted, components_created[], routes_mapped[{from,to}], mocks_removed[], remaining_mocks[], api_contracts[], notes}',
       notes: `Target stack hints: ${targetHints.join(', ') || 'see STACK.md'}\n${stackNote.slice(0, 1500)}`,
     };
-    const res = await runValidated(ctx.runner, convertTask);
+    const res = await dispatch(ctx, convertTask);
     const conv = ConversionSchema.safeParse(res.payload);
     if (!res.ok || !conv.success || !conv.data.converted) {
       return blocked(ctx, 'UI conversion failed.', [res.summary]);
@@ -161,7 +170,7 @@ export async function uiWorkflow(
         return_format: 'JSON payload: {passed: boolean, notes: string}',
         notes: '',
       };
-      const vres = await runValidated(ctx.runner, validateTask);
+      const vres = await dispatch(ctx, validateTask);
       const vparsed = z.object({ passed: z.boolean(), notes: z.string().default('') }).safeParse(vres.payload);
       if (!vres.ok || !vparsed.success || !vparsed.data.passed) {
         return blocked(ctx, 'UI validation failed.', [vres.summary]);
@@ -200,12 +209,15 @@ export async function uiWorkflow(
       { ...prev, milestone: milestone?.id ?? prev.milestone, next_step: 'rijo run', updated_at: now().toISOString() },
       `UI import ${importId} completed: ${conv.data.components_created.length} components, ${conv.data.routes_mapped.length} routes mapped. ${validationNote}`,
     );
+    // STATE.md is hash-tracked: refresh the manifest so the next run does not
+    // block on drift caused by RIJO's own state write.
+    touchManifest(paths, () => {}, now);
     bus.emit('ui.done', { status: 'completed', message: `importação ${importId} concluída` });
     return completed(ctx, `UI import ${importId} done: ${conv.data.components_created.length} components, ${conv.data.routes_mapped.length} routes.`, [
       `Mapping: ${rel(projectRoot, mappingPath)}`,
       validationNote,
     ]);
-  });
+  }
 }
 
 function buildInventory(inspection: ZipInspection): string {

@@ -144,6 +144,8 @@ export const RequirementSchema = z.object({
     .enum(['NEW', 'CHANGE', 'REMOVE', 'CARRYOVER', 'UNCHANGED_DEPENDENCY'])
     .default('NEW'),
   carried_from: z.string().nullable().default(null),
+  /** Set on a successor requirement to mark the ancestor as terminally resolved. */
+  resolves: z.string().nullable().default(null),
   tests: z.array(z.string()).default([]),
   evidence: z.string().nullable().default(null),
   no_test_justification: z.string().nullable().default(null),
@@ -162,6 +164,13 @@ export const PlanTaskSchema = z.object({
   tdd: z.boolean().default(false),
   tests: z.array(z.string()).default([]),
   evidence_expected: z.string().min(1),
+  /**
+   * Explicit, auditable justification that this task genuinely cannot be
+   * verified by an executable command (e.g. a pure documentation edit). Only
+   * with this set may a task contribute zero verification commands without
+   * blocking the phase. Everything else must produce real command evidence.
+   */
+  no_execution_justification: z.string().nullable().default(null),
   done: z.boolean().default(false),
 });
 export type PlanTask = z.infer<typeof PlanTaskSchema>;

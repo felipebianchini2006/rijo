@@ -9,7 +9,7 @@ import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { readPlan } from '../src/core/plan.js';
 import { FakeShellRunner } from '../src/core/commands.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds } from './helpers.js';
 
 function milestoneDir(root: string): string {
   const paths = new RijoPaths(root);
@@ -41,10 +41,15 @@ describe('rijo run', () => {
     const verification = fs.readFileSync(path.join(phaseDir, 'VERIFICATION.md'), 'utf8');
     expect(verification).toContain('echo test-a');
     expect(verification).toContain('exit 0');
-    // roadmap updated with commit
+    // roadmap updated with the implementation commit (a second metadata commit
+    // syncs the hash cross-reference, so HEAD is the metadata commit)
     const roadmap = readRoadmap(path.join(mdir, 'ROADMAP.md'));
     expect(roadmap.phases[0]!.status).toBe('DONE');
-    expect(roadmap.phases[0]!.commit).toBe(d.git.headCommit());
+    const implCommit = d.git.commits.find((c) => c.message.includes('verified'))!;
+    expect(roadmap.phases[0]!.commit).toBe(implCommit.hash);
+    // the phase commit staged only authorized files, never `git add -A`
+    expect(implCommit.paths.length).toBeGreaterThan(0);
+    expect(implCommit.paths.some((p) => p.includes('src/a.ts'))).toBe(true);
     // requirements of phase 01 done with evidence
     const reqs = readRequirements(path.join(mdir, 'REQUIREMENTS.md'));
     const r1 = reqs.requirements.find((r) => r.phase === '01')!;
@@ -53,7 +58,7 @@ describe('rijo run', () => {
     // state checkpoint advanced
     const state = readState(new RijoPaths(root))!;
     expect(state.stage).toBe('DONE');
-    expect(state.last_commit).toBe(d.git.headCommit());
+    expect(state.last_commit).toBe(d.git.commits.find((c) => c.message.includes('verified'))!.hash);
     // workers ran with fresh briefs and strict scopes
     const workers = d.runner.executed.filter((t) => t.id.startsWith('exec-01-'));
     expect(workers).toHaveLength(2);
@@ -180,7 +185,7 @@ describe('rijo run', () => {
       planPayload: (phaseId) => ({
         phase: phaseId,
         tasks: [
-          { id: 'T01', name: 'a', requirement_ids: [], technical_justification: 'x', files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
+          { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
           { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
         ],
       }),

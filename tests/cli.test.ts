@@ -44,10 +44,10 @@ describe('runCli', () => {
     expect(code).toBe(2);
   });
 
-  it('--version prints 0.1.0', async () => {
+  it('--version prints 0.1.0-alpha.1', async () => {
     const code = await runCli(['--version'], {}, root);
     expect(code).toBe(0);
-    expect(logged().trim()).toBe('0.1.0');
+    expect(logged().trim()).toBe('0.1.0-alpha.1');
   });
 
   it('--status --json after init is schema-stable', async () => {
@@ -64,7 +64,7 @@ describe('runCli', () => {
       ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'milestones', 'runtime', 'checkpoint'].sort(),
     );
     expect(parsed.schema_version).toBe(1);
-    expect(parsed.rijo_version).toBe('0.1.0');
+    expect(parsed.rijo_version).toBe('0.1.0-alpha.1');
     expect(parsed.initialized).toBe(true);
     expect(parsed.active_milestone).toBe('M001');
     expect(Array.isArray(parsed.milestones)).toBe(true);

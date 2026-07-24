@@ -9,6 +9,7 @@ import { runWorkflow } from '../workflows/run.js';
 import { uiWorkflow } from '../workflows/ui.js';
 import { fixWorkflow } from '../workflows/fix.js';
 import { checkWorkflow } from '../workflows/check.js';
+import { serve } from './serve.js';
 import { generateAdapters, type AdapterName } from '../adapters/index.js';
 import type { WorkflowDeps, WorkflowOutcome } from '../workflows/shared.js';
 
@@ -70,6 +71,12 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         options: { fix: { type: 'boolean' }, production: { type: 'boolean' } },
       });
       return report(await checkWorkflow(cwd, { fix: values.fix, production: values.production }, deps));
+    }
+    case 'serve': {
+      // Host↔core JSON-RPC bridge over stdio (the default and only mode).
+      // A host speaks the protocol to drive workflows and answer agent.runTask.
+      await serve();
+      return 0;
     }
     case 'adapters': {
       // maintenance command (informational for workflows; regenerates adapter files)

@@ -33,6 +33,7 @@ export function generateCodexAdapter(projectRoot: string): AdapterReport {
     '- Use subagentes e threads nativos quando disponíveis; mantenha-os inspecionáveis.',
     '- Com App Server disponível, aproveite streaming de itens e tool progress; sem ele, use chat, stdout e `.rijo/runtime/status.json`.',
     '- Nunca afirme que uma integração nativa foi usada quando não estava disponível.',
+    '- Host bridge: para execução autônoma, gere `npx rijo serve --stdio` e fale o JSON-RPC descrito acima (veja a seção "Host bridge") — dispare `workflow.*` e responda cada `agent.runTask` com um AgentResult.',
   ].join('\n');
   upsertMarkerFile(path.join(projectRoot, 'AGENTS.md'), codexNotes);
   report.generated.push('AGENTS.md (RIJO block)');

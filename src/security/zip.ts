@@ -20,9 +20,16 @@ export class UnsafeZipError extends Error {
   }
 }
 
-const MAX_ENTRY_BYTES = 50 * 1024 * 1024;
-const MAX_TOTAL_BYTES = 500 * 1024 * 1024;
-const MAX_ENTRIES = 20000;
+/** Per-entry uncompressed size ceiling — rejects decompression bombs by the
+ *  DECLARED size before any large allocation (CVE-2026-39244 class). */
+export const MAX_ENTRY_BYTES = 50 * 1024 * 1024;
+export const MAX_TOTAL_BYTES = 500 * 1024 * 1024;
+export const MAX_ENTRIES = 20000;
+
+/** True when an entry's declared uncompressed size is within the safe ceiling. */
+export function isEntrySizeSafe(declaredSize: number): boolean {
+  return declaredSize <= MAX_ENTRY_BYTES;
+}
 const EXECUTABLE_EXT = new Set(['.exe', '.dll', '.so', '.dylib', '.bat', '.cmd', '.ps1', '.sh', '.msi', '.com', '.scr']);
 const INSTALL_SCRIPTS = new Set(['postinstall', 'preinstall', 'install']);
 
@@ -61,8 +68,8 @@ export function extractZipSafely(zipPath: string, destDir: string): ZipInspectio
     if (entry.isDirectory) continue;
 
     const size = entry.header.size;
-    if (size > MAX_ENTRY_BYTES) {
-      throw new UnsafeZipError(`Entry too large (${size} bytes): ${name}`, name);
+    if (!isEntrySizeSafe(size)) {
+      throw new UnsafeZipError(`Entry declares too large an uncompressed size (${size} bytes): ${name}`, name);
     }
     total += size;
     if (total > MAX_TOTAL_BYTES) {

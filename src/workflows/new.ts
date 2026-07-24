@@ -17,6 +17,7 @@ import {
   activeMilestone,
   carryRequirement,
   createMilestone,
+  nextMilestoneId,
   sealMilestone,
   updateMilestonesIndex,
   type CarryoverItem,
@@ -25,7 +26,6 @@ import { writeRequirements, writeRoadmap, readRequirements } from '../core/roadm
 import { validateTraceability } from '../core/traceability.js';
 import { RequirementSchema, RoadmapPhaseSchema } from '../core/schemas/index.js';
 import { ResearchStore } from '../research/cache.js';
-import { runBatch, runValidated } from '../agents/runner.js';
 import { renderBrief } from '../agents/prompts.js';
 import type { AgentTask } from '../agents/protocol.js';
 import { generateAdapters } from '../adapters/index.js';
@@ -35,10 +35,13 @@ import {
   blocked,
   completed,
   failed,
+  dispatch,
+  dispatchBatch,
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
-import { runWorkflow } from './run.js';
+import { runCore } from './run.js';
+import { uiCore } from './ui.js';
 
 export interface NewOptions {
   planFile: string;
@@ -120,7 +123,11 @@ export async function newWorkflow(
       gitStatus = ctx.git.status(projectRoot);
     }
 
-    // ---- milestone transition (--next)
+    // ---- milestone transition pre-checks (--next). The previous milestone is
+    // NOT sealed here: sealing is deferred until the new plan has been
+    // extracted and fully validated, so a planner or validation failure can
+    // never corrupt the historic contract.
+    const activePrev = opts.next ? activeMilestone(paths) : null;
     if (opts.next) {
       const prevState = readState(paths);
       if (prevState?.stage && prevState.stage !== 'DONE' && prevState.phase) {
@@ -134,35 +141,6 @@ export async function newWorkflow(
           `Dirty files: ${gitStatus.dirtyFiles.slice(0, 20).join(', ')}`,
           'Commit or intentionally revert them, then re-run.',
         ]);
-      }
-      const active = activeMilestone(paths);
-      if (active) {
-        const reqDoc = exists(active.paths.requirements) ? readRequirements(active.paths.requirements) : null;
-        const undone = reqDoc?.requirements.filter((r) => r.status !== 'DONE') ?? [];
-        const carryover: CarryoverItem[] = undone.map((r) => ({
-          requirement: r,
-          disposition: r.status === 'BLOCKED' ? 'blocked' : 'carried',
-        }));
-        const allDone = undone.length === 0;
-        sealMilestone(
-          paths,
-          active,
-          {
-            status: allDone ? 'COMPLETE' : 'PARTIAL',
-            baselineCommit: ctx.git.headCommit(projectRoot),
-            baselineBranch: gitStatus.branch,
-            deliveredVersion: null,
-            carryover,
-            evidence: [],
-            residualRisks: [],
-            productionState: 'see qa/production-readiness.md if present',
-          },
-          now,
-        );
-        if (config.git.tag_milestones && gitStatus.isRepo) {
-          ctx.git.tag(projectRoot, `rijo/${active.id}`, `RIJO milestone ${active.id} sealed`);
-        }
-        bus.emit('milestone.sealed', { message: `milestone ${active.id} selado (${allDone ? 'COMPLETE' : 'PARTIAL'})` }, { milestone: active.id });
       }
     }
 
@@ -193,7 +171,7 @@ export async function newWorkflow(
         'JSON payload matching the PlanExtraction schema: {project_name, project_summary, stack_summary, rules[], out_of_scope[], acceptance[], requirements[{description, acceptance, non_functional, classification}], phases[{name, requirement_indexes[], depends_on_indexes[], ui_surface}], research_topics[{key, topic, volatile}]}',
       notes: [previousContext, brown.stackNotes.join('\n')].filter(Boolean).join('\n\n') + `\n\nPLAN CONTENT:\n${planContent}`,
     };
-    const extractResult = await runValidated(ctx.runner, extractTask);
+    const extractResult = await dispatch(ctx, extractTask);
     if (!extractResult.ok || !extractResult.payload) {
       return blocked(ctx, 'Plan extraction failed.', [extractResult.summary, `Brief was:\n${renderBrief(extractTask).slice(0, 400)}…`]);
     }
@@ -203,7 +181,9 @@ export async function newWorkflow(
     }
     const extraction = parsed.data;
 
-    // ---- initialize .rijo skeleton (greenfield) and milestone
+    // ---- STAGING: build the new milestone entirely in memory and validate it
+    // BEFORE any durable mutation. The prospective ID is deterministic; sealing
+    // and createMilestone happen only after validation passes.
     if (!hasRijo) {
       ensureDir(paths.root);
       ensureDir(paths.runtimeDir);
@@ -214,14 +194,12 @@ export async function newWorkflow(
       saveConfig(paths, defaultConfig());
       writeManifest(paths, newManifest(now));
     }
-    const milestone = createMilestone(paths, extraction.project_name, now);
-    const mp = milestonePaths(milestone.dir);
+    const newId = nextMilestoneId(readManifest(paths));
 
-    // ---- requirements with namespaced IDs (+ carryover from previous milestone)
     let seq = 0;
     const requirements = extraction.requirements.map((r) =>
       RequirementSchema.parse({
-        id: `${milestone.id}-REQ-${String(++seq).padStart(3, '0')}`,
+        id: `${newId}-REQ-${String(++seq).padStart(3, '0')}`,
         description: r.description,
         acceptance: r.acceptance,
         phase: null,
@@ -230,13 +208,23 @@ export async function newWorkflow(
         carried_from: null,
       }),
     );
-    if (opts.next) {
-      for (const item of pendingCarryovers(ctx, milestone.id)) {
-        requirements.push(carryRequirement(item, milestone.id, ++seq));
+    // Carryover ONLY from the immediately-previous active milestone's unfinished
+    // requirements. Each successor `resolves` its immediate predecessor, forming
+    // a terminal chain: an original requirement is carried at most once (into the
+    // very next milestone) and never re-carried from older history — because we
+    // never scan beyond the immediate previous milestone.
+    const carryoverItems: CarryoverItem[] = [];
+    if (opts.next && activePrev && exists(activePrev.paths.requirements)) {
+      const prevReqs = readRequirements(activePrev.paths.requirements).requirements;
+      const undone = prevReqs.filter((r) => r.status !== 'DONE' && r.status !== 'CANCELLED');
+      for (const item of undone) {
+        const carried = carryRequirement(item, newId, ++seq);
+        carried.resolves = item.id;
+        requirements.push(carried);
+        carryoverItems.push({ requirement: item, disposition: item.status === 'BLOCKED' ? 'blocked' : 'carried' });
       }
     }
 
-    // ---- phases (vertical slices), map requirements to exactly one phase
     const phases = extraction.phases.map((p, i) =>
       RoadmapPhaseSchema.parse({
         id: String(i + 1).padStart(2, '0'),
@@ -257,7 +245,6 @@ export async function newWorkflow(
         }
       }
     });
-    // carryovers without a phase: attach to the first phase (conservative default, recorded)
     const decisions: string[] = [];
     for (const req of requirements) {
       if (!req.phase && phases.length > 0) {
@@ -269,8 +256,40 @@ export async function newWorkflow(
 
     const traceIssues = validateTraceability({ requirements, phases });
     if (traceIssues.some((i) => i.severity === 'error')) {
+      // Nothing durable was mutated for a --next transition: the previous
+      // milestone and the active pointer are untouched.
       return failed(ctx, 'Traceability validation failed for the generated roadmap.', traceIssues.map((i) => `${i.code}: ${i.message} — ${i.fix}`));
     }
+
+    // ---- COMMIT POINT: validation passed. Seal the previous milestone (if any)
+    // then create the new one. createMilestone yields the same deterministic ID.
+    if (opts.next && activePrev) {
+      const allDone = carryoverItems.length === 0;
+      sealMilestone(
+        paths,
+        activePrev,
+        {
+          status: allDone ? 'COMPLETE' : 'PARTIAL',
+          baselineCommit: ctx.git.headCommit(projectRoot),
+          baselineBranch: gitStatus.branch,
+          deliveredVersion: null,
+          carryover: carryoverItems,
+          evidence: [],
+          residualRisks: [],
+          productionState: 'see qa/production-readiness.md if present',
+        },
+        now,
+      );
+      if (config.git.tag_milestones && gitStatus.isRepo) {
+        ctx.git.tag(projectRoot, `rijo/${activePrev.id}`, `RIJO milestone ${activePrev.id} sealed`);
+      }
+      bus.emit('milestone.sealed', { message: `milestone ${activePrev.id} selado (${allDone ? 'COMPLETE' : 'PARTIAL'})` }, { milestone: activePrev.id });
+    }
+    const milestone = createMilestone(paths, extraction.project_name, now);
+    if (milestone.id !== newId) {
+      return failed(ctx, 'Milestone ID drift during transaction.', [`expected ${newId}, got ${milestone.id}`]);
+    }
+    const mp = milestonePaths(milestone.dir);
 
     // ---- research (parallel on first milestone, delta afterwards)
     bus.emit('new.research', { stage: 'RESEARCH', message: 'pesquisa técnica (delta quando possível)' });
@@ -293,7 +312,7 @@ export async function newWorkflow(
           'JSON payload: {summary: string, sources: [{claim, source, url, checked_at, version, confidence}]}',
         notes: '',
       }));
-      const results = await runBatch(ctx.runner, tasks, config.limits.max_parallel_agents);
+      const results = await dispatchBatch(ctx, tasks);
       for (let i = 0; i < results.length; i++) {
         const r = results[i]!;
         const topic = toResearch[i]!;
@@ -315,7 +334,10 @@ export async function newWorkflow(
               .default([]),
           })
           .safeParse(r.payload);
-        if (!payload.success) continue;
+        if (!payload.success) {
+          decisions.push(`Research for "${topic.topic}" returned an unparseable result; proceeding with a conservative assumption (revalidate before production).`);
+          continue;
+        }
         for (const s of payload.data.sources) {
           store.addSource({ ...s, used_by: ['STACK.md', `${milestone.id}/RESEARCH.md`] });
         }
@@ -326,6 +348,15 @@ export async function newWorkflow(
           volatile: topic.volatile,
           sources: payload.data.sources.map((s) => s.url),
         });
+        // Wire the volatile-source rule into the main path: a volatile decision
+        // with no verifiable source is recorded as an auditable assumption
+        // rather than silently trusted.
+        if (topic.volatile) {
+          const verdict = store.validateVolatileDecision(topic.topic, payload.data.sources.map((s) => s.url));
+          if (!verdict.valid) {
+            decisions.push(`Volatile research "${topic.topic}" lacks a verifiable source (${verdict.reason}); proceeding with a conservative assumption (revalidate before production).`);
+          }
+        }
         researchSummaries.push(`- ${topic.topic}: ${payload.data.summary}`);
       }
     }
@@ -390,8 +421,14 @@ export async function newWorkflow(
       { requirements: requirements.length, phases: phases.length },
     );
 
+    // ---- composition new → ui → run, all under this single lock/context.
+    if (opts.ui) {
+      bus.emit('new.ui', { stage: 'IMPORT', message: `importando design ${opts.ui}` });
+      const uiOutcome = await uiCore(ctx, { input: opts.ui });
+      if (!uiOutcome.ok) return uiOutcome;
+    }
     if (opts.run) {
-      return runWorkflow(projectRoot, { target: 'all' }, deps);
+      return runCore(ctx, { target: 'all' });
     }
     return completed(ctx, `Milestone ${milestone.id} created (${requirements.length} requirements, ${phases.length} phases).`);
   });
@@ -493,25 +530,6 @@ function summarizePreviousMilestones(ctx: { paths: import('../core/paths.js').Ri
   const decisions = readTextIfExists(ctx.paths.decisions);
   if (decisions) lines.push('', 'GLOBAL DECISIONS:', decisions.slice(0, 2000));
   return lines.join('\n');
-}
-
-/** Requirements from the previous milestone that were classified as carried. */
-function pendingCarryovers(
-  ctx: { paths: import('../core/paths.js').RijoPaths },
-  newMilestoneId: string,
-): import('../core/schemas/index.js').Requirement[] {
-  const manifest = readManifest(ctx.paths);
-  if (!manifest) return [];
-  const previous = manifest.milestones.filter((m) => m.id !== newMilestoneId);
-  const out: import('../core/schemas/index.js').Requirement[] = [];
-  for (const m of previous) {
-    const dir = ctx.paths.milestoneDir(m.id, m.slug);
-    const reqPath = path.join(dir, 'REQUIREMENTS.md');
-    if (!exists(reqPath)) continue;
-    const doc = readRequirements(reqPath);
-    out.push(...doc.requirements.filter((r) => r.status === 'CARRIED'));
-  }
-  return out;
 }
 
 function slugName(name: string): string {

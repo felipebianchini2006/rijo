@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import { z } from 'zod';
 import { exists, writeFileAtomic, readText } from '../core/fsx.js';
 import { serializeFrontmatter, parseFrontmatter } from '../core/frontmatter.js';
-import { runValidated } from '../agents/runner.js';
+import { snapshotFiles, diffSnapshots, pathInScope } from '../core/scope.js';
 import type { AgentTask } from '../agents/protocol.js';
 import {
   createContext,
@@ -10,6 +10,8 @@ import {
   blocked,
   completed,
   failed,
+  dispatch,
+  guardSchema,
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
@@ -51,6 +53,8 @@ export async function fixWorkflow(
   const { paths, bus, config, now } = ctx;
   if (!exists(paths.manifest)) return failed(ctx, 'No RIJO project here. Run `rijo new @PLAN.md` first.');
   if (!opts.description.trim()) return failed(ctx, 'rijo fix requires a problem description.');
+  const schemaGuard = guardSchema(ctx);
+  if (schemaGuard) return schemaGuard;
 
   return withLock(ctx, async () => {
     const ts = now();
@@ -91,7 +95,7 @@ export async function fixWorkflow(
           'JSON payload: {reproduced, reproduction_steps, hypothesis, root_cause, escalate, escalate_reason}',
         notes: '',
       };
-      const res = await runValidated(ctx.runner, diagTask);
+      const res = await dispatch(ctx, diagTask);
       const parsed = DiagnosisSchema.safeParse(res.payload);
       if (!res.ok || !parsed.success) {
         appendLog(`diagnose attempt ${attempt} failed: ${res.summary}`);
@@ -116,6 +120,8 @@ export async function fixWorkflow(
 
     // ---- repair (bounded by fix_attempts) with regression test
     bus.emit('fix.repair', { stage: 'REPAIR', message: 'aplicando a menor correção coerente' });
+    // baseline before any edit, so the commit stages only what the fix changed
+    const fixBaseline = snapshotFiles(projectRoot);
     let repair: z.infer<typeof RepairSchema> | null = null;
     for (let attempt = 1; attempt <= config.limits.fix_attempts; attempt++) {
       const repairTask: AgentTask = {
@@ -131,16 +137,25 @@ export async function fixWorkflow(
           'JSON payload: {fixed, root_cause, change_summary, regression_test, regression_test_impossible_reason, verification_commands[], residual_risk}',
         notes: '',
       };
-      const res = await runValidated(ctx.runner, repairTask);
+      const res = await dispatch(ctx, repairTask);
       const parsed = RepairSchema.safeParse(res.payload);
       if (!res.ok || !parsed.success || !parsed.data.fixed) {
         appendLog(`repair attempt ${attempt} failed: ${res.summary}`);
         continue;
       }
-      // verify with real commands
-      const failures = parsed.data.verification_commands
-        .map((c) => ctx.shell.run(c, { cwd: projectRoot }))
-        .filter((e) => e.exit_code !== 0);
+      // Evidence gate: a fix must run at least one post-fix verification
+      // command. A repair claiming success with zero commands is never accepted.
+      if (parsed.data.verification_commands.length === 0) {
+        appendLog(`repair attempt ${attempt}: rejected — no post-fix verification command (NO_VERIFICATION_EVIDENCE)`);
+        continue;
+      }
+      const evidences = parsed.data.verification_commands.map((c) => ctx.shell.run(c, { cwd: projectRoot }));
+      const policyBlocked = evidences.filter((e) => e.blocked);
+      if (policyBlocked.length > 0) {
+        appendLog(`repair attempt ${attempt}: verification command blocked by policy (${policyBlocked.map((e) => e.command).join(', ')})`);
+        continue;
+      }
+      const failures = evidences.filter((e) => e.exit_code !== 0);
       if (failures.length > 0) {
         appendLog(`repair attempt ${attempt}: verification failed (${failures.map((f) => f.command).join(', ')})`);
         continue;
@@ -154,30 +169,36 @@ export async function fixWorkflow(
       return blocked(ctx, `Fix escalated after ${config.limits.fix_attempts} failed attempts.`, []);
     }
 
-    // ---- commit + closeout
-    let commit: string | null = null;
-    if (config.git.commit && ctx.git.status(projectRoot).isRepo) {
-      commit = ctx.git.commitAll(projectRoot, `rijo(fix): ${slug || 'fix'} — ${repair.change_summary.slice(0, 60)}`);
-    }
-    const { data } = parseFrontmatter(readText(fixPath));
-    writeFileAtomic(
-      fixPath,
+    // ---- closeout THEN commit. Finalize the record first so the commit that
+    // represents the fix actually contains it; the hash is written back after.
+    const buildRecord = (commit: string | null) =>
       serializeFrontmatter(
-        { ...(data as Record<string, unknown>), status: 'DONE', commit, closed_at: now().toISOString() },
+        { ...(parseFrontmatter(readText(fixPath)).data as Record<string, unknown>), status: 'DONE', commit, closed_at: now().toISOString() },
         [
           `# Fix — ${opts.description}`,
           '',
           `- Symptom: ${opts.description}`,
-          `- Root cause: ${repair.root_cause || diagnosis.root_cause}`,
-          `- Fix: ${repair.change_summary}`,
-          `- Regression test: ${repair.regression_test ?? `none (${repair.regression_test_impossible_reason ?? 'not justified'})`}`,
-          `- Evidence: ${repair.verification_commands.map((c) => `\`${c}\` exit 0`).join(', ') || 'none'}`,
-          `- Residual risk: ${repair.residual_risk}`,
+          `- Root cause: ${repair!.root_cause || diagnosis.root_cause}`,
+          `- Fix: ${repair!.change_summary}`,
+          `- Regression test: ${repair!.regression_test ?? `none (${repair!.regression_test_impossible_reason ?? 'not justified'})`}`,
+          `- Evidence: ${repair!.verification_commands.map((c) => `\`${c}\` exit 0`).join(', ')}`,
+          `- Residual risk: ${repair!.residual_risk}`,
           commit ? `- Commit: ${commit}` : '- Commit: no VCS or disabled',
           '',
         ].join('\n'),
-      ),
-    );
+      );
+    writeFileAtomic(fixPath, buildRecord(null));
+
+    let commit: string | null = null;
+    if (config.git.commit && ctx.git.status(projectRoot).isRepo) {
+      // stage only the files the fix actually changed, plus the fix record —
+      // never `git add -A`, so pre-existing user edits are not swept in.
+      const changed = diffSnapshots(fixBaseline, snapshotFiles(projectRoot)).changed;
+      const rel = path.relative(projectRoot, fixPath).split(path.sep).join('/');
+      const toCommit = [...new Set([...changed.filter((p) => pathInScope(p, ['**'])), rel])];
+      commit = ctx.git.commitPaths(projectRoot, `rijo(fix): ${slug || 'fix'} — ${repair.change_summary.slice(0, 60)}`, toCommit);
+      if (commit) writeFileAtomic(fixPath, buildRecord(commit));
+    }
     bus.emit('fix.done', { status: 'completed', message: `correção verificada${commit ? ` (commit ${commit.slice(0, 8)})` : ''}` });
     return completed(ctx, `Fix done: ${repair.change_summary}${commit ? ` (commit ${commit})` : ''}.`, [
       `Record: ${path.relative(projectRoot, fixPath)}`,

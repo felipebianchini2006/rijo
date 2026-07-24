@@ -3,7 +3,7 @@ import { ManifestSchema, SCHEMA_VERSION, type Manifest, type MilestoneStatus } f
 import { exists, readJsonIfExists, sha256File, writeJsonAtomic } from './fsx.js';
 import type { RijoPaths } from './paths.js';
 
-export const RIJO_VERSION = '0.1.0';
+export const RIJO_VERSION = '0.1.0-alpha.1';
 
 /** Files tracked for drift detection, relative to .rijo/. */
 const TRACKED = ['PROJECT.md', 'RULES.md', 'STACK.md', 'MILESTONES.md', 'STATE.md', 'DECISIONS.md', 'config.yml'];
@@ -23,6 +23,32 @@ export function readManifest(paths: RijoPaths): Manifest | null {
   const parsed = ManifestSchema.safeParse(raw);
   if (!parsed.success) throw new Error(`manifest.json is invalid: ${parsed.error.message}`);
   return parsed.data;
+}
+
+export class SchemaMismatchError extends Error {
+  constructor(
+    public readonly found: number,
+    public readonly supported: number,
+  ) {
+    super(
+      `manifest schema_version ${found} is not supported by this RIJO build (supports ${supported}). ` +
+        `Back up .rijo/, run a migration, and re-validate before continuing.`,
+    );
+    this.name = 'SchemaMismatchError';
+  }
+}
+
+/**
+ * Compare the on-disk schema version with the version this build supports.
+ * A newer schema must not be run by an older build; an older schema is a
+ * migration point. Callers surface this before mutating any workflow state.
+ */
+export function checkSchemaCompatibility(paths: RijoPaths): void {
+  const raw = readJsonIfExists<{ schema_version?: number }>(paths.manifest);
+  if (raw === null) return;
+  if (typeof raw.schema_version === 'number' && raw.schema_version !== SCHEMA_VERSION) {
+    throw new SchemaMismatchError(raw.schema_version, SCHEMA_VERSION);
+  }
 }
 
 export function writeManifest(paths: RijoPaths, manifest: Manifest): void {

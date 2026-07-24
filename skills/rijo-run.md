@@ -26,3 +26,7 @@ LOAD → RESEARCH_DELTA → SPEC_READY → PLAN → PLAN_LINT → PLAN_REVIEW �
 Emit one short line per stage change, task start/finish, blocker, phase completion:
 `[RIJO M002 F03/05] EXECUTE T02/04  integrando gateway de pagamento`
 No heartbeats, no percentages the state machine cannot compute, no private reasoning.
+
+## Host bridge
+
+To run phases autonomously, spawn `npx rijo serve --stdio` and speak JSON-RPC over stdio: send `{"type":"request","method":"workflow.run","id":1,"params":{"target":"all"}}`. Answer each `{"type":"request","method":"agent.runTask",...}` by executing the described subagent and replying `{"type":"response","id":<same>,"result":{...AgentResult...}}`. Progress arrives as `progress` notifications.
