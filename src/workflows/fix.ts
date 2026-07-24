@@ -10,7 +10,9 @@ import {
   blocked,
   completed,
   failed,
+  dispatchReadOnly,
   dispatch,
+  prepareAttempt,
   guardSchema,
   type WorkflowDeps,
   type WorkflowOutcome,
@@ -95,7 +97,10 @@ export async function fixWorkflow(
           'JSON payload: {reproduced, reproduction_steps, hypothesis, root_cause, escalate, escalate_reason}',
         notes: '',
       };
-      const res = await dispatch(ctx, diagTask);
+      const { result: res, violation } = await dispatchReadOnly(ctx, diagTask);
+      if (violation.length > 0) {
+        return blocked(ctx, 'Fix diagnosis (read-only) modified the checkout.', violation);
+      }
       const parsed = DiagnosisSchema.safeParse(res.payload);
       if (!res.ok || !parsed.success) {
         appendLog(`diagnose attempt ${attempt} failed: ${res.summary}`);
@@ -137,43 +142,68 @@ export async function fixWorkflow(
           'JSON payload: {fixed, root_cause, change_summary, regression_test, regression_test_impossible_reason, verification_commands[], residual_risk}',
         notes: '',
       };
-      const res = await dispatch(ctx, repairTask);
-      const parsed = RepairSchema.safeParse(res.payload);
-      if (!res.ok || !parsed.success || !parsed.data.fixed) {
-        appendLog(`repair attempt ${attempt} failed: ${res.summary}`);
+      // Each repair attempt runs in its OWN isolated workspace; the patch is
+      // verified INSIDE the workspace and only applied to the checkout after
+      // every gate passes. A failed attempt is discarded whole.
+      const attemptWs = prepareAttempt(ctx, repairTask);
+      let applied = false;
+      try {
+        const res = await dispatch(ctx, attemptWs.task);
+        const parsed = RepairSchema.safeParse(res.payload);
+        if (!res.ok || !parsed.success || !parsed.data.fixed) {
+          appendLog(`repair attempt ${attempt} failed: ${res.summary}`);
+          continue;
+        }
+        // Evidence gate: a fix must run at least one post-fix verification
+        // command. A repair claiming success with zero commands is never accepted.
+        if (parsed.data.verification_commands.length === 0) {
+          appendLog(`repair attempt ${attempt}: rejected — no post-fix verification command (NO_VERIFICATION_EVIDENCE)`);
+          continue;
+        }
+        const evidences = parsed.data.verification_commands.map((c) => ctx.shell.run(c, { cwd: attemptWs.workspace.root }));
+        const policyBlocked = evidences.filter((e) => e.blocked);
+        if (policyBlocked.length > 0) {
+          appendLog(`repair attempt ${attempt}: verification command blocked by policy (${policyBlocked.map((e) => e.command).join(', ')})`);
+          continue;
+        }
+        const failures = evidences.filter((e) => e.exit_code !== 0);
+        if (failures.length > 0) {
+          appendLog(`repair attempt ${attempt}: verification failed (${failures.map((f) => f.command).join(', ')})`);
+          continue;
+        }
+        attemptWs.workspace.applyVerifiedPatch();
+        applied = true;
+        repair = parsed.data;
+        appendLog(`repair attempt ${attempt}: verified in isolated workspace (${parsed.data.verification_commands.length} commands exit 0)`);
+        break;
+      } catch (err) {
+        appendLog(`repair attempt ${attempt}: discarded — ${(err as Error).message}`);
         continue;
+      } finally {
+        attemptWs.workspace.discard();
+        void applied;
       }
-      // Evidence gate: a fix must run at least one post-fix verification
-      // command. A repair claiming success with zero commands is never accepted.
-      if (parsed.data.verification_commands.length === 0) {
-        appendLog(`repair attempt ${attempt}: rejected — no post-fix verification command (NO_VERIFICATION_EVIDENCE)`);
-        continue;
-      }
-      const evidences = parsed.data.verification_commands.map((c) => ctx.shell.run(c, { cwd: projectRoot }));
-      const policyBlocked = evidences.filter((e) => e.blocked);
-      if (policyBlocked.length > 0) {
-        appendLog(`repair attempt ${attempt}: verification command blocked by policy (${policyBlocked.map((e) => e.command).join(', ')})`);
-        continue;
-      }
-      const failures = evidences.filter((e) => e.exit_code !== 0);
-      if (failures.length > 0) {
-        appendLog(`repair attempt ${attempt}: verification failed (${failures.map((f) => f.command).join(', ')})`);
-        continue;
-      }
-      repair = parsed.data;
-      appendLog(`repair attempt ${attempt}: verified (${parsed.data.verification_commands.length} commands exit 0)`);
-      break;
     }
     if (!repair) {
       finalize(fixPath, 'ESCALATED', `Fix not verified after ${config.limits.fix_attempts} attempts; escalate to a normal phase.`, now);
       return blocked(ctx, `Fix escalated after ${config.limits.fix_attempts} failed attempts.`, []);
     }
 
-    // ---- closeout THEN commit. Finalize the record first so the commit that
-    // represents the fix actually contains it; the hash is written back after.
-    const buildRecord = (commit: string | null) =>
+    // ---- closeout THEN commit, following the same two-commit model as run:
+    // C1 contains the code changes + the fix record WITHOUT any self-hash;
+    // C2 (evidence) only updates the record to point at C1 and is verified to
+    // touch nothing else. No VCS → vcs: disabled and no hash is ever invented.
+    const vcsEnabled = config.git.commit && ctx.git.status(projectRoot).isRepo;
+    const buildRecord = (testedCommit: string | null, evidenceCommit: string | null) =>
       serializeFrontmatter(
-        { ...(parseFrontmatter(readText(fixPath)).data as Record<string, unknown>), status: 'DONE', commit, closed_at: now().toISOString() },
+        {
+          ...(parseFrontmatter(readText(fixPath)).data as Record<string, unknown>),
+          status: 'DONE',
+          tested_commit: testedCommit,
+          evidence_commit: evidenceCommit,
+          vcs: vcsEnabled ? 'git' : 'disabled',
+          closed_at: now().toISOString(),
+        },
         [
           `# Fix — ${opts.description}`,
           '',
@@ -183,24 +213,38 @@ export async function fixWorkflow(
           `- Regression test: ${repair!.regression_test ?? `none (${repair!.regression_test_impossible_reason ?? 'not justified'})`}`,
           `- Evidence: ${repair!.verification_commands.map((c) => `\`${c}\` exit 0`).join(', ')}`,
           `- Residual risk: ${repair!.residual_risk}`,
-          commit ? `- Commit: ${commit}` : '- Commit: no VCS or disabled',
+          testedCommit ? `- Tested commit: ${testedCommit}` : '- Tested commit: no VCS (vcs: disabled)',
           '',
         ].join('\n'),
       );
-    writeFileAtomic(fixPath, buildRecord(null));
+    writeFileAtomic(fixPath, buildRecord(null, null));
 
     let commit: string | null = null;
-    if (config.git.commit && ctx.git.status(projectRoot).isRepo) {
+    if (vcsEnabled) {
       // stage only the files the fix actually changed, plus the fix record —
       // never `git add -A`, so pre-existing user edits are not swept in.
       const changed = diffSnapshots(fixBaseline, snapshotFiles(projectRoot)).changed;
       const rel = path.relative(projectRoot, fixPath).split(path.sep).join('/');
       const toCommit = [...new Set([...changed.filter((p) => pathInScope(p, ['**'])), rel])];
       commit = ctx.git.commitPaths(projectRoot, `rijo(fix): ${slug || 'fix'} — ${repair.change_summary.slice(0, 60)}`, toCommit);
-      if (commit) writeFileAtomic(fixPath, buildRecord(commit));
+      if (!commit) {
+        return blocked(ctx, 'Fix commit (C1) failed while git commits are enabled.', [
+          'The verified fix is on disk but the commit did not complete.',
+        ]);
+      }
+      writeFileAtomic(fixPath, buildRecord(commit, null));
+      const evidenceCommit = ctx.git.commitPaths(projectRoot, `rijo(fix): evidence for ${commit.slice(0, 12)}`, [rel]);
+      if (!evidenceCommit) {
+        return blocked(ctx, 'Fix evidence commit (C2) failed.', [`Fix commit ${commit} exists but its evidence metadata is uncommitted.`]);
+      }
+      const rangeFiles = ctx.git.diffNames(projectRoot, commit, evidenceCommit);
+      const illegal = rangeFiles.filter((f) => f !== rel);
+      if (illegal.length > 0) {
+        return blocked(ctx, 'Fix evidence commit touched non-evidence paths.', illegal);
+      }
     }
     bus.emit('fix.done', { status: 'completed', message: `correção verificada${commit ? ` (commit ${commit.slice(0, 8)})` : ''}` });
-    return completed(ctx, `Fix done: ${repair.change_summary}${commit ? ` (commit ${commit})` : ''}.`, [
+    return completed(ctx, `Fix done: ${repair.change_summary}${commit ? ` (tested commit ${commit})` : ''}.`, [
       `Record: ${path.relative(projectRoot, fixPath)}`,
     ]);
   });

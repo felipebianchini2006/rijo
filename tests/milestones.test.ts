@@ -37,6 +37,7 @@ describe('milestone cycle', () => {
     const scopeBefore = fs.readFileSync(path.join(m1dir, 'SCOPE.md'), 'utf8');
     const roadmapBefore = fs.readFileSync(path.join(m1dir, 'ROADMAP.md'), 'utf8');
 
+    const headBeforeNext = d.git.headCommit()!;
     const d2 = { ...deps(root, { extraction: M2_EXTRACTION }), git: d.git };
     const outcome = await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, d2);
     expect(outcome.ok, outcome.message).toBe(true);
@@ -48,8 +49,8 @@ describe('milestone cycle', () => {
     expect(fs.readFileSync(path.join(m1dir, 'SCOPE.md'), 'utf8')).toBe(scopeBefore);
     expect(fs.readFileSync(path.join(m1dir, 'ROADMAP.md'), 'utf8')).toBe(roadmapBefore);
     expect(fs.existsSync(path.join(m1dir, 'CLOSEOUT.md'))).toBe(true);
-    // baseline commit recorded
-    expect(fs.readFileSync(path.join(m1dir, 'CLOSEOUT.md'), 'utf8')).toContain(d.git.headCommit()!);
+    // baseline commit recorded (the HEAD at seal time, before M002's baseline commit)
+    expect(fs.readFileSync(path.join(m1dir, 'CLOSEOUT.md'), 'utf8')).toContain(headBeforeNext);
     // git tag created locally, never pushed (FakeGit only records)
     expect(d2.git.tags).toContain('rijo/M001');
   });

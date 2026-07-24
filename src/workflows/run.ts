@@ -34,6 +34,9 @@ import {
   dispatch,
   dispatchBatch,
   guardSchema,
+  prepareAttempt,
+  dispatchReadOnly,
+  type Attempt,
   type WorkflowContext,
   type WorkflowDeps,
   type WorkflowOutcome,
@@ -170,58 +173,6 @@ function resolveTargets(ctx: WorkflowContext, roadmap: RoadmapDoc, target?: stri
   }
   const np = nextPhase(roadmap);
   return np ? [np] : [];
-}
-
-/** Attempt bundle: the dispatched task plus its isolated workspace. */
-interface Attempt {
-  task: AgentTask;
-  workspace: AttemptWorkspace;
-}
-
-/**
- * Prepare an isolated attempt: create the workspace, remap the brief's file
- * references into it and stamp the canonical baseline. The agent only ever
- * sees (and writes) the workspace copy.
- */
-function prepareAttempt(
-  ctx: WorkflowContext,
-  task: AgentTask,
-  opts: { canonicalWriteScope?: string[] } = {},
-): Attempt {
-  const baseline = canonicalBaselineHash(ctx.paths);
-  const workspace = AttemptWorkspace.create(ctx.projectRoot, {
-    taskId: task.id,
-    writeScope: task.write_scope,
-    canonicalWriteScope: opts.canonicalWriteScope,
-    baselineCommit: ctx.git.status(ctx.projectRoot).isRepo ? ctx.git.headCommit(ctx.projectRoot) : null,
-    baselineCanonicalHash: baseline,
-  });
-  const remap = (p: string) => {
-    const rel = path.relative(ctx.projectRoot, p);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) return p;
-    return path.join(workspace.root, rel);
-  };
-  const remapped: AgentTask = {
-    ...task,
-    canonical_files: task.canonical_files.map(remap),
-    code_files: task.code_files.map(remap),
-    workspace: { id: workspace.id, root: workspace.root },
-    canonical_baseline: baseline,
-  };
-  return { task: remapped, workspace };
-}
-
-/**
- * A read-only dispatch (reviewer/researcher/planner returning a payload):
- * no workspace, empty write scope, and the controlled checkout is verified
- * untouched afterwards — a "read-only" agent that wrote anything is a hard
- * violation, not a warning.
- */
-async function dispatchReadOnly(ctx: WorkflowContext, task: AgentTask): Promise<{ result: AgentResult; violation: string[] }> {
-  const before = snapshotTree(ctx.projectRoot);
-  const result = await dispatch(ctx, { ...task, write_scope: [], workspace: null, canonical_baseline: canonicalBaselineHash(ctx.paths) });
-  const delta = diffTrees(before, snapshotTree(ctx.projectRoot));
-  return { result, violation: delta.changed };
 }
 
 async function executePhase(
@@ -881,9 +832,12 @@ async function executePhase(
       return blocked(ctx, `Phase ${phase.id}: evidence seal commit failed.`, []);
     }
 
-    // The tree must be clean for everything RIJO touched when the phase ends.
+    // The tree must be clean when the phase ends: nothing RIJO touched — and
+    // no canonical .rijo file at all — may remain uncommitted.
     const endStatus = ctx.git.status(ctx.projectRoot);
-    const rijoDirty = endStatus.dirtyFiles.filter((f) => toCommit.includes(f) || allowedEvidencePaths.includes(f));
+    const rijoDirty = endStatus.dirtyFiles.filter(
+      (f) => f.startsWith('.rijo/') || toCommit.includes(f) || allowedEvidencePaths.includes(f),
+    );
     if (rijoDirty.length > 0) {
       return blocked(ctx, `Phase ${phase.id}: tree not clean after commits.`, rijoDirty);
     }

@@ -1,4 +1,7 @@
+import * as path from 'node:path';
 import { RijoPaths } from '../core/paths.js';
+import { AttemptWorkspace, snapshotTree, diffTrees } from '../core/workspace.js';
+import { canonicalBaselineHash } from '../core/manifest.js';
 import { loadConfig } from '../core/config.js';
 import { ProgressBus, consoleSink, newRunId, type ProgressSink } from '../core/progress.js';
 import { acquireLock, releaseLock } from '../core/locks.js';
@@ -114,6 +117,62 @@ export async function dispatch(ctx: WorkflowContext, task: AgentTaskDraft): Prom
 export async function dispatchBatch(ctx: WorkflowContext, tasks: AgentTaskDraft[], max?: number): Promise<AgentResult[]> {
   const withTier = tasks.map((t) => AgentTaskSchema.parse({ ...t, tier: t.tier ?? tierFor(ctx.config, t.role) }));
   return runBatch(ctx.runner, withTier, max ?? ctx.config.limits.max_parallel_agents);
+}
+
+/** Attempt bundle: the dispatched task plus its isolated workspace. */
+export interface Attempt {
+  task: AgentTask;
+  workspace: AttemptWorkspace;
+}
+
+/**
+ * Prepare an isolated attempt: create the workspace, remap the brief's file
+ * references into it and stamp the canonical baseline. The agent only ever
+ * sees (and writes) the workspace copy.
+ */
+export function prepareAttempt(
+  ctx: WorkflowContext,
+  task: AgentTaskDraft,
+  opts: { canonicalWriteScope?: string[] } = {},
+): Attempt {
+  const full = AgentTaskSchema.parse(task);
+  const baseline = canonicalBaselineHash(ctx.paths);
+  const workspace = AttemptWorkspace.create(ctx.projectRoot, {
+    taskId: full.id,
+    writeScope: full.write_scope,
+    canonicalWriteScope: opts.canonicalWriteScope,
+    baselineCommit: ctx.git.status(ctx.projectRoot).isRepo ? ctx.git.headCommit(ctx.projectRoot) : null,
+    baselineCanonicalHash: baseline,
+  });
+  const remap = (p: string) => {
+    const rel = path.relative(ctx.projectRoot, p);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) return p;
+    return path.join(workspace.root, rel);
+  };
+  const remapped: AgentTask = {
+    ...full,
+    canonical_files: full.canonical_files.map(remap),
+    code_files: full.code_files.map(remap),
+    workspace: { id: workspace.id, root: workspace.root },
+    canonical_baseline: baseline,
+  };
+  return { task: remapped, workspace };
+}
+
+/**
+ * A read-only dispatch (reviewer/researcher/planner returning a payload):
+ * no workspace, empty write scope, and the controlled checkout is verified
+ * untouched afterwards — a "read-only" agent that wrote anything is a hard
+ * violation, not a warning.
+ */
+export async function dispatchReadOnly(
+  ctx: WorkflowContext,
+  task: AgentTaskDraft,
+): Promise<{ result: AgentResult; violation: string[] }> {
+  const before = snapshotTree(ctx.projectRoot);
+  const result = await dispatch(ctx, { ...task, write_scope: [], workspace: null, canonical_baseline: canonicalBaselineHash(ctx.paths) });
+  const delta = diffTrees(before, snapshotTree(ctx.projectRoot));
+  return { result, violation: delta.changed };
 }
 
 export function blocked(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {

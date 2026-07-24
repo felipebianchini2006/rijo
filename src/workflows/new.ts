@@ -205,6 +205,8 @@ export async function newWorkflow(
       ensureDir(paths.importsDir);
       ensureDir(paths.archiveDir);
       ensureDir(paths.researchDir);
+      // volatile internals never enter version control
+      writeFileAtomic(path.join(paths.root, '.gitignore'), ['runtime/', 'events.jsonl', 'archive/', ''].join('\n'));
       saveConfig(paths, defaultConfig());
       writeManifest(paths, newManifest(now));
     }
@@ -424,6 +426,27 @@ export async function newWorkflow(
     // ---- adapters
     const adapterReport = generateAdapters(projectRoot);
     bus.emit('new.adapters', { message: `adapters gerados: ${adapterReport.generated.join(', ') || 'nenhum'}` });
+
+    // ---- baseline commit: the canonical context and generated adapters are
+    // committed so the milestone starts from a clean, known tree. Only paths
+    // RIJO itself created are staged — user files (including the plan) are
+    // never swept in.
+    if (config.git.commit && ctx.git.status(projectRoot).isRepo) {
+      const rijoRel = path.relative(projectRoot, paths.root).split(path.sep).join('/');
+      const adapterPaths = adapterReport.generated
+        .map((g) => g.split(' ')[0]!)
+        .filter((g) => exists(path.resolve(projectRoot, g)));
+      const baselineCommit = ctx.git.commitPaths(
+        projectRoot,
+        `rijo(${milestone.id}): milestone initialized`,
+        [rijoRel, ...adapterPaths],
+      );
+      if (!baselineCommit) {
+        return blocked(ctx, `Milestone ${milestone.id}: baseline commit failed while git commits are enabled.`, [
+          'The canonical artifacts are on disk but the initialization commit did not complete.',
+        ]);
+      }
+    }
 
     bus.emit(
       'new.done',
