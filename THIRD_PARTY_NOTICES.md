@@ -10,7 +10,7 @@ and the licenses of the reference projects.
 
 | Project | License | Concepts studied |
 |---|---|---|
-| BMAD-METHOD (BMad Code, LLC) | MIT with trademark notice | review triage taxonomy, fail-loud rendering, status-in-frontmatter resume |
+| BMAD-METHOD (BMad Code, LLC) | MIT with trademark notice | review triage taxonomy, fail-loud rendering, status-in-frontmatter resume, role-scoped expert/specialist review lenses attached to an agent task (RIJO's own catalog, names, checklists and prose — see `docs/expert-profiles.md`) |
 | Spec Kit (GitHub, Inc.) | MIT | artifact-as-state checkboxes, deterministic sidecar scripts, constitution file |
 | GSD / gsd-core (Open GSD) | MIT | disk-writing fresh-context subagents, plan waves, statusline, milestone lifecycle |
 | OpenSpec (OpenSpec Contributors) | MIT | stateless instruction-emitting CLI, filesystem-derived state, marker-block idempotency, zod validation patterns |

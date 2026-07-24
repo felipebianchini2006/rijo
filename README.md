@@ -145,6 +145,25 @@ const outcome = await runWorkflow(process.cwd(), { target: 'all' }, { runner: my
 Sem runtime vinculado, os workflows param com diagnóstico preciso — nunca
 simulam trabalho de agente.
 
+## Supervisão resiliente
+
+Cada tarefa despachada a um agente é supervisionada: liveness vem só de
+fatos de runtime (heartbeat/processo/conexão, nunca do texto do modelo),
+todo espera é limitada por deadline, e um host travado é cancelado por uma
+escada `requestCancel → forceTerminate → fencing` antes de ser substituído
+com identidade e workspace novos. Um orçamento esgotado termina em
+`BLOCKED` — nunca em loop infinito. Veja `docs/agent-supervisor.md`,
+`docs/agent-liveness.md`, `docs/host-cancellation.md`, `docs/recovery.md` e
+`docs/failure-injection.md`.
+
+## Expert profiles
+
+Um brief de agente pode receber uma lente técnica compacta e determinística
+— um **expert profile** — escolhida pelo roteador a partir de um catálogo
+de 10 perfis 100% originais do RIJO (nome, missão, checklist e
+anti-patterns próprios; nenhuma persona ou nome de terceiros). Veja
+`docs/expert-profiles.md`.
+
 ## Exemplos
 
 - `examples/greenfield/` — plano completo que gera M001 com duas fases.

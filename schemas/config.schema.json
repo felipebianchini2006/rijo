@@ -4,34 +4,391 @@
   "title": "RIJO project config (.rijo/config.yml)",
   "type": "object",
   "properties": {
-    "schema_version": { "type": "integer", "default": 1 },
+    "schema_version": {
+      "type": "integer",
+      "default": 2
+    },
     "models": {
       "type": "object",
       "properties": {
-        "lead": { "type": "string", "default": "strongest" },
-        "reviewer": { "type": "string", "default": "strongest-independent" },
-        "planner": { "type": "string", "default": "balanced-reasoning" },
-        "worker": { "type": "string", "default": "economical-coding" },
-        "researcher": { "type": "string", "default": "economical-research" },
-        "qa": { "type": "string", "default": "economical-browser" }
+        "lead": {
+          "type": "string",
+          "default": "strongest"
+        },
+        "reviewer": {
+          "type": "string",
+          "default": "strongest-independent"
+        },
+        "planner": {
+          "type": "string",
+          "default": "balanced-reasoning"
+        },
+        "worker": {
+          "type": "string",
+          "default": "economical-coding"
+        },
+        "researcher": {
+          "type": "string",
+          "default": "economical-research"
+        },
+        "qa": {
+          "type": "string",
+          "default": "economical-browser"
+        }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "description": "Concrete model mapping per provider tier. `model` is a real, host-valid model name/alias, never an abstract tier string.",
+      "properties": {
+        "claude": {
+          "type": "object",
+          "description": "tier name -> Claude model + reasoning effort",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "effort": {
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ],
+                "default": "medium"
+              }
+            },
+            "required": [
+              "model"
+            ]
+          }
+        },
+        "codex": {
+          "type": "object",
+          "description": "tier name -> Codex model + reasoning effort",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "reasoning_effort": {
+                "enum": [
+                  "minimal",
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh"
+                ],
+                "default": "medium"
+              }
+            },
+            "required": [
+              "model"
+            ]
+          }
+        }
       }
     },
     "limits": {
       "type": "object",
       "properties": {
-        "plan_revisions": { "type": "integer", "default": 2 },
-        "review_loops": { "type": "integer", "default": 2 },
-        "qa_fix_loops": { "type": "integer", "default": 2 },
-        "fix_attempts": { "type": "integer", "default": 2 },
-        "max_parallel_agents": { "type": "integer", "default": 4 }
+        "plan_revisions": {
+          "type": "integer",
+          "default": 2
+        },
+        "review_loops": {
+          "type": "integer",
+          "default": 2
+        },
+        "qa_fix_loops": {
+          "type": "integer",
+          "default": 2
+        },
+        "fix_attempts": {
+          "type": "integer",
+          "default": 2
+        },
+        "max_parallel_agents": {
+          "type": "integer",
+          "default": 4
+        }
       }
     },
-    "context_budget_bytes": { "type": "integer", "default": 24576 },
+    "context_budget_bytes": {
+      "type": "integer",
+      "default": 24576
+    },
     "git": {
       "type": "object",
       "properties": {
-        "tag_milestones": { "type": "boolean", "default": true },
-        "commit": { "type": "boolean", "default": true }
+        "tag_milestones": {
+          "type": "boolean",
+          "default": true
+        },
+        "commit": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "qa": {
+      "type": "object",
+      "description": "QA gate configuration for `rijo check --production`. `start_command` is a structured argv, never a shell string.",
+      "properties": {
+        "start_command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "base_url": {
+          "type": "string",
+          "default": "http://127.0.0.1:3000"
+        },
+        "health_url": {
+          "type": "string",
+          "default": ""
+        },
+        "startup_timeout_ms": {
+          "type": "integer",
+          "default": 60000
+        },
+        "shutdown_timeout_ms": {
+          "type": "integer",
+          "default": 10000
+        },
+        "browsers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "chromium"
+          ]
+        },
+        "viewports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "width": {
+                "type": "integer"
+              },
+              "height": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "width",
+              "height"
+            ]
+          },
+          "default": [
+            {
+              "name": "desktop",
+              "width": 1440,
+              "height": 900
+            },
+            {
+              "name": "mobile",
+              "width": 390,
+              "height": 844
+            }
+          ]
+        },
+        "waivers": {
+          "type": "array",
+          "description": "journey ids explicitly waived, each with an auditable reason",
+          "items": {
+            "type": "object",
+            "properties": {
+              "journey_id": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "journey_id",
+              "reason"
+            ]
+          },
+          "default": []
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "description": "Execution policy. `sandbox: 'required'` blocks repository-code execution without an OS sandbox; `'approved-unsandboxed'` is the explicit, auditable opt-out.",
+      "properties": {
+        "sandbox": {
+          "enum": [
+            "required",
+            "approved-unsandboxed"
+          ],
+          "default": "required"
+        },
+        "network_default": {
+          "enum": [
+            "none",
+            "restricted",
+            "enabled"
+          ],
+          "default": "none"
+        },
+        "env_allowlist": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "command_timeout_ms": {
+          "type": "integer",
+          "default": 600000
+        }
+      }
+    },
+    "research": {
+      "type": "object",
+      "description": "Research policy: volatile decisions fail closed unless explicitly waived.",
+      "properties": {
+        "fail_closed": {
+          "type": "boolean",
+          "default": true
+        },
+        "waivers": {
+          "type": "array",
+          "description": "auditable waivers: topic key -> reason",
+          "items": {
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "key",
+              "reason"
+            ]
+          },
+          "default": []
+        },
+        "max_sources": {
+          "type": "integer",
+          "default": 500
+        }
+      }
+    },
+    "supervisor": {
+      "type": "object",
+      "description": "Supervisor policy: no agent attempt may block a workflow indefinitely. Liveness comes only from the host controller, never from model output. See docs/agent-supervisor.md and docs/agent-liveness.md.",
+      "properties": {
+        "heartbeat_interval_ms": {
+          "type": "integer",
+          "default": 15000
+        },
+        "heartbeat_grace_ms": {
+          "type": "integer",
+          "default": 45000
+        },
+        "no_progress_timeout_ms": {
+          "type": "object",
+          "description": "per-role soft deadline (no progress observed)",
+          "properties": {
+            "lead": {
+              "type": "integer",
+              "default": 300000
+            },
+            "planner": {
+              "type": "integer",
+              "default": 300000
+            },
+            "worker": {
+              "type": "integer",
+              "default": 300000
+            },
+            "reviewer": {
+              "type": "integer",
+              "default": 240000
+            },
+            "researcher": {
+              "type": "integer",
+              "default": 180000
+            },
+            "qa": {
+              "type": "integer",
+              "default": 300000
+            }
+          }
+        },
+        "hard_timeout_ms": {
+          "type": "object",
+          "description": "per-role unconditional cancel deadline",
+          "properties": {
+            "lead": {
+              "type": "integer",
+              "default": 900000
+            },
+            "planner": {
+              "type": "integer",
+              "default": 900000
+            },
+            "worker": {
+              "type": "integer",
+              "default": 1200000
+            },
+            "reviewer": {
+              "type": "integer",
+              "default": 900000
+            },
+            "researcher": {
+              "type": "integer",
+              "default": 600000
+            },
+            "qa": {
+              "type": "integer",
+              "default": 1200000
+            }
+          }
+        },
+        "cancel_grace_ms": {
+          "type": "integer",
+          "default": 15000
+        },
+        "hard_kill_grace_ms": {
+          "type": "integer",
+          "default": 5000
+        },
+        "max_replacements_per_task": {
+          "type": "integer",
+          "default": 2
+        },
+        "max_total_task_elapsed_ms": {
+          "type": "integer",
+          "default": 2400000
+        },
+        "replacement_backoff_ms": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "default": [
+            1000,
+            5000
+          ]
+        }
       }
     }
   }

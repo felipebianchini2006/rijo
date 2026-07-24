@@ -108,3 +108,18 @@ Report classes: `not_run` / `blocked` / `passed` / `failed`.
    locks and processes on Linux/Windows.
 5. `docs/readiness.md` documents the earlier alpha.1 audit; the adm-zip pin
    noted there was superseded by the ^0.6.0 upgrade (audit clean).
+
+## Addendum — Prompt 02 (resilient supervisor + expert profiles), 2026-07-24
+
+| Item | Evidence |
+|---|---|
+| Full suite (Node 24.18) | 43 files, **333 passed, 3 skipped** (skips = live-gated) |
+| Full suite (Node 22.23, mise) | 43 files, 333 passed, 3 skipped; build OK |
+| Supervisor fake-clock fault matrix | tests/supervisor.test.ts — 20 scenarios (no-response host, heartbeat stop, hard deadline with live heartbeat, slow-but-healthy not replaced, ack/no-ack cancel, force terminate, fencing without force, late/duplicate/old-lease results, fresh replacement identity+workspace, EXHAUSTED→BLOCKED, dispose without orphan timers, independent task continues, crash-window recovery) |
+| Real-process fault injection | tests/supervisor-process.test.ts — frozen child, SIGTERM-ignoring child (SIGKILL proven), late responder discarded, dead pipe replaced; all spawned pids verified dead |
+| Bridge resilience | tests/bridge-resilience.test.ts (13) — HOST_TIMEOUT, HOST_DISCONNECTED on EOF, duplicate idempotency, attempt-echo fencing, abort→cancelTask, queue deadline, zero unhandled rejections; child-kill and stdin-close mid-workflow in tests/bridge-child.test.ts |
+| Lease lock | tests/locks.test.ts (14) — expiry/wedged-heartbeat reconciliation, reclaimed orphan attempts, renewal under withLock, no manual-deletion path |
+| Expert profiles | tests/experts.test.ts (31) — deterministic router, ≤3 profiles, researcher=1, reviewer independence, single-source Claude+Codex adapters with concrete models |
+| **LIVE Part-M E2E (real Claude Code CLI)** | **PASSED** on this host (`RIJO_LIVE_E2E=1`): two real `claude -p` processes deliberately terminated at the hard deadline; record shows CANCELLING → REPLACING (generation 2, fresh workspace) → EXHAUSTED, bounded <60s; both real pids dead (no orphans); killed attempts applied nothing; receipts in task-events.jsonl without secrets |
+| Codex live supervision | **blocked** — same account usage limit as Prompt 01 (until 2026-07-28 14:04); the ProcessController path is host-agnostic and proven with real processes + the Claude host |
+| Status surface | `rijo --status --json` v2 (additive) with supervisor block; human panel shows attempt/generation/heartbeat/progress/replacements/state |
