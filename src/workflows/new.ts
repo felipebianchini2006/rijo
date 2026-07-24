@@ -11,20 +11,26 @@ import {
 import { serializeFrontmatter } from '../core/frontmatter.js';
 import { milestonePaths } from '../core/paths.js';
 import { defaultConfig, saveConfig } from '../core/config.js';
-import { newManifest, readManifest, touchManifest, writeManifest } from '../core/manifest.js';
-import { initialState, readState, writeState } from '../core/state.js';
+import { computeHashes, newManifest, readManifest, touchManifest, writeManifest, type HashOverlay } from '../core/manifest.js';
+import { initialState, readState, renderState } from '../core/state.js';
 import {
   activeMilestone,
+  applySealDispositions,
   carryRequirement,
   createMilestone,
   nextMilestoneId,
-  sealMilestone,
+  renderCloseout,
+  renderMilestonesIndex,
+  slugify,
   updateMilestonesIndex,
+  validateSeal,
   type CarryoverItem,
+  type MilestoneRef,
 } from '../core/milestones.js';
-import { writeRequirements, writeRoadmap, readRequirements, readRoadmap } from '../core/roadmap.js';
+import { MilestoneTransaction } from '../core/txn.js';
+import { renderRequirements, renderRoadmap, readRequirements, readRoadmap } from '../core/roadmap.js';
 import { validateTraceability } from '../core/traceability.js';
-import { RequirementSchema, RoadmapPhaseSchema } from '../core/schemas/index.js';
+import { ManifestSchema, RequirementSchema, RoadmapPhaseSchema } from '../core/schemas/index.js';
 import { ResearchStore } from '../research/cache.js';
 import { renderBrief } from '../agents/prompts.js';
 import { AgentTaskSchema, type AgentTaskDraft } from '../agents/protocol.js';
@@ -277,35 +283,12 @@ export async function newWorkflow(
       return failed(ctx, 'Traceability validation failed for the generated roadmap.', traceIssues.map((i) => `${i.code}: ${i.message} — ${i.fix}`));
     }
 
-    // ---- COMMIT POINT: validation passed. Seal the previous milestone (if any)
-    // then create the new one. createMilestone yields the same deterministic ID.
-    if (opts.next && activePrev) {
-      const allDone = carryoverItems.length === 0;
-      sealMilestone(
-        paths,
-        activePrev,
-        {
-          status: allDone ? 'COMPLETE' : 'PARTIAL',
-          baselineCommit: ctx.git.headCommit(projectRoot),
-          baselineBranch: gitStatus.branch,
-          deliveredVersion: null,
-          carryover: carryoverItems,
-          evidence: [],
-          residualRisks: [],
-          productionState: 'see qa/production-readiness.md if present',
-        },
-        now,
-      );
-      if (config.git.tag_milestones && gitStatus.isRepo) {
-        ctx.git.tag(projectRoot, `rijo/${activePrev.id}`, `RIJO milestone ${activePrev.id} sealed`);
-      }
-      bus.emit('milestone.sealed', { message: `milestone ${activePrev.id} selado (${allDone ? 'COMPLETE' : 'PARTIAL'})` }, { milestone: activePrev.id });
-    }
-    const milestone = createMilestone(paths, extraction.project_name, now);
-    if (milestone.id !== newId) {
-      return failed(ctx, 'Milestone ID drift during transaction.', [`expected ${newId}, got ${milestone.id}`]);
-    }
-    const mp = milestonePaths(milestone.dir);
+    // Deterministic identity of the milestone being created; nothing durable
+    // outside the runtime dir changes until the transaction commit point.
+    const newSlug = slugify(extraction.project_name);
+    const newDir = paths.milestoneDir(newId, newSlug);
+    const mp = milestonePaths(newDir);
+    const milestone: MilestoneRef = { id: newId, slug: newSlug, dir: newDir, paths: mp };
 
     // ---- research (parallel on first milestone, delta afterwards)
     bus.emit('new.research', { stage: 'RESEARCH', message: 'pesquisa técnica (delta quando possível)' });
@@ -377,39 +360,30 @@ export async function newWorkflow(
       }
     }
 
-    // ---- persist canonical artifacts
+    // ---- build EVERY canonical artifact of the transition in memory
     bus.emit('new.persist', { stage: 'ROADMAP', message: 'gravando contexto canônico e roadmap' });
-    writeGlobalArtifacts(ctx, extraction, brown, decisions);
-    writeFileAtomic(
-      mp.scope,
-      serializeFrontmatter(
-        { milestone: milestone.id, source_plan: path.basename(planPath), created_at: now().toISOString() },
-        [
-          `# Scope — ${milestone.id}`,
-          '',
-          extraction.project_summary,
-          '',
-          '## Out of scope',
-          ...(extraction.out_of_scope.length ? extraction.out_of_scope.map((o) => `- ${o}`) : ['- none declared']),
-          '',
-          '## Completion criteria',
-          ...(extraction.acceptance.length ? extraction.acceptance.map((a) => `- ${a}`) : ['- all requirements verified']),
-          '',
-        ].join('\n'),
-      ),
+    const scopeContent = serializeFrontmatter(
+      { milestone: milestone.id, source_plan: path.basename(planPath), created_at: now().toISOString() },
+      [
+        `# Scope — ${milestone.id}`,
+        '',
+        extraction.project_summary,
+        '',
+        '## Out of scope',
+        ...(extraction.out_of_scope.length ? extraction.out_of_scope.map((o) => `- ${o}`) : ['- none declared']),
+        '',
+        '## Completion criteria',
+        ...(extraction.acceptance.length ? extraction.acceptance.map((a) => `- ${a}`) : ['- all requirements verified']),
+        '',
+      ].join('\n'),
     );
-    writeRequirements(mp.requirements, { milestone: milestone.id, requirements });
-    writeRoadmap(mp.roadmap, { milestone: milestone.id, phases });
-    writeFileAtomic(
-      mp.research,
-      serializeFrontmatter(
-        { milestone: milestone.id, updated_at: now().toISOString() },
-        [`# Research — ${milestone.id}`, '', ...(researchSummaries.length ? researchSummaries : ['- no research topics required']), ''].join('\n'),
-      ),
+    const requirementsContent = renderRequirements({ milestone: milestone.id, requirements });
+    const roadmapContent = renderRoadmap({ milestone: milestone.id, phases });
+    const researchContent = serializeFrontmatter(
+      { milestone: milestone.id, updated_at: now().toISOString() },
+      [`# Research — ${milestone.id}`, '', ...(researchSummaries.length ? researchSummaries : ['- no research topics required']), ''].join('\n'),
     );
-
-    writeState(
-      paths,
+    const stateContent = renderState(
       {
         ...initialState(now),
         milestone: milestone.id,
@@ -420,8 +394,98 @@ export async function newWorkflow(
       },
       `Milestone ${milestone.id} created from ${path.basename(planPath)}. ${requirements.length} requirements across ${phases.length} phases.`,
     );
-    touchManifest(paths, () => {}, now);
-    updateMilestonesIndex(paths, now);
+    const globals = buildGlobalArtifacts(ctx, extraction, brown, decisions);
+
+    const relRoot = (p: string) => path.relative(projectRoot, p).split(path.sep).join('/');
+    const relRijo = (p: string) => path.relative(paths.root, p).split(path.sep).join('/');
+
+    if (opts.next && activePrev) {
+      // ---- CRASH-SAFE TRANSACTION: seal the previous milestone and activate
+      // the next one through a single atomic commit point. Nothing outside
+      // .rijo/runtime changes before commitPoint(); after it, apply is
+      // deterministic and idempotent (startup reconciliation rolls forward).
+      const allDone = carryoverItems.length === 0;
+      const sealInput = {
+        status: (allDone ? 'COMPLETE' : 'PARTIAL') as 'COMPLETE' | 'PARTIAL',
+        baselineCommit: ctx.git.headCommit(projectRoot),
+        baselineBranch: gitStatus.branch,
+        deliveredVersion: null,
+        carryover: carryoverItems,
+        evidence: [],
+        residualRisks: [],
+        productionState: 'see qa/production-readiness.md if present',
+      };
+      const prevReqDoc = exists(activePrev.paths.requirements) ? readRequirements(activePrev.paths.requirements) : null;
+      try {
+        validateSeal(activePrev, sealInput, prevReqDoc);
+      } catch (err) {
+        return failed(ctx, `Milestone ${activePrev.id} cannot be sealed.`, [(err as Error).message]);
+      }
+      const sealedReqDoc = prevReqDoc ? applySealDispositions(prevReqDoc, carryoverItems) : null;
+      const closeoutContent = renderCloseout(activePrev, sealInput, sealedReqDoc, now);
+
+      const manifest = readManifest(paths)!;
+      const prevEntry = manifest.milestones.find((m) => m.id === activePrev.id);
+      if (prevEntry) prevEntry.status = sealInput.status;
+      manifest.milestones.push({ id: newId, slug: newSlug, status: 'ACTIVE' });
+      manifest.active_milestone = newId;
+      manifest.updated_at = now().toISOString();
+      const indexContent = renderMilestonesIndex(paths, manifest, now, new Map([[activePrev.id, closeoutContent]]));
+
+      const overlay: HashOverlay = new Map<string, string>([
+        [relRijo(activePrev.paths.closeout), closeoutContent],
+        [relRijo(mp.scope), scopeContent],
+        [relRijo(mp.requirements), requirementsContent],
+        [relRijo(mp.roadmap), roadmapContent],
+        [relRijo(mp.research), researchContent],
+        ['STATE.md', stateContent],
+        ['MILESTONES.md', indexContent],
+        ['manifest.json', JSON.stringify(manifest)],
+      ]);
+      if (sealedReqDoc) overlay.set(relRijo(activePrev.paths.requirements), renderRequirements(sealedReqDoc));
+      for (const g of globals) overlay.set(relRijo(g.path), g.content);
+      manifest.hashes = computeHashes(paths, overlay);
+      const manifestContent = JSON.stringify(ManifestSchema.parse(manifest), null, 2) + '\n';
+
+      const tx = MilestoneTransaction.begin(paths, { kind: 'milestone-next', prev: activePrev.id, next: newId }, deps.txnHooks ?? {}, now);
+      tx.stageDir(relRoot(mp.phasesDir));
+      tx.stageDir(relRoot(path.join(mp.qaDir, 'journeys')));
+      tx.stageDir(relRoot(path.join(mp.qaDir, 'screenshots')));
+      tx.stageDir(relRoot(path.join(mp.qaDir, 'traces')));
+      tx.stage(relRoot(activePrev.paths.closeout), closeoutContent);
+      if (sealedReqDoc) tx.stage(relRoot(activePrev.paths.requirements), renderRequirements(sealedReqDoc));
+      tx.stage(relRoot(mp.scope), scopeContent);
+      tx.stage(relRoot(mp.requirements), requirementsContent);
+      tx.stage(relRoot(mp.roadmap), roadmapContent);
+      tx.stage(relRoot(mp.research), researchContent);
+      for (const g of globals) tx.stage(relRoot(g.path), g.content);
+      tx.stage(relRoot(paths.state), stateContent);
+      tx.stage(relRoot(paths.milestonesIndex), indexContent);
+      tx.stage(relRoot(paths.manifest), manifestContent);
+      tx.commitPoint();
+      tx.apply();
+      tx.finish();
+
+      if (config.git.tag_milestones && gitStatus.isRepo) {
+        ctx.git.tag(projectRoot, `rijo/${activePrev.id}`, `RIJO milestone ${activePrev.id} sealed`);
+      }
+      bus.emit('milestone.sealed', { message: `milestone ${activePrev.id} selado (${allDone ? 'COMPLETE' : 'PARTIAL'})` }, { milestone: activePrev.id });
+    } else {
+      // ---- first milestone: direct creation (there is no previous state a
+      // crash could corrupt; a partial init is recreated by re-running new).
+      const created = createMilestone(paths, extraction.project_name, now);
+      if (created.id !== newId) {
+        return failed(ctx, 'Milestone ID drift during creation.', [`expected ${newId}, got ${created.id}`]);
+      }
+      for (const g of globals) writeFileAtomic(g.path, g.content);
+      writeFileAtomic(mp.scope, scopeContent);
+      writeFileAtomic(mp.requirements, requirementsContent);
+      writeFileAtomic(mp.roadmap, roadmapContent);
+      writeFileAtomic(mp.research, researchContent);
+      writeFileAtomic(paths.state, stateContent);
+      touchManifest(paths, () => {}, now);
+      updateMilestonesIndex(paths, now);
+    }
 
     // ---- adapters
     const adapterReport = generateAdapters(projectRoot);
@@ -499,27 +563,33 @@ function detectBrownfield(ctx: { projectRoot: string }, hasRijo: boolean): Brown
   return { isBrownfield, stackNotes, baselineCommands };
 }
 
-function writeGlobalArtifacts(
+/**
+ * Compute the final contents of the global canonical artifacts touched by a
+ * milestone creation (pure: nothing is written here). PROJECT/RULES only when
+ * missing; STACK is regenerated; DECISIONS is append-only.
+ */
+function buildGlobalArtifacts(
   ctx: { paths: import('../core/paths.js').RijoPaths; now: () => Date },
   extraction: PlanExtraction,
   brown: BrownfieldInfo,
   decisions: string[],
-): void {
+): Array<{ path: string; content: string }> {
   const { paths, now } = ctx;
   const ts = now().toISOString();
+  const out: Array<{ path: string; content: string }> = [];
   if (!exists(paths.project)) {
-    writeFileAtomic(
-      paths.project,
-      serializeFrontmatter(
+    out.push({
+      path: paths.project,
+      content: serializeFrontmatter(
         { name: extraction.project_name, updated_at: ts },
         [`# ${extraction.project_name}`, '', extraction.project_summary, ''].join('\n'),
       ),
-    );
+    });
   }
   if (!exists(paths.rules)) {
-    writeFileAtomic(
-      paths.rules,
-      serializeFrontmatter(
+    out.push({
+      path: paths.rules,
+      content: serializeFrontmatter(
         { updated_at: ts },
         [
           '# Rules',
@@ -531,11 +601,11 @@ function writeGlobalArtifacts(
           '',
         ].join('\n'),
       ),
-    );
+    });
   }
-  writeFileAtomic(
-    paths.stack,
-    serializeFrontmatter(
+  out.push({
+    path: paths.stack,
+    content: serializeFrontmatter(
       { updated_at: ts, validated_at: ts },
       [
         '# Stack',
@@ -547,14 +617,15 @@ function writeGlobalArtifacts(
         '',
       ].join('\n'),
     ),
-  );
+  });
   const decisionsHeader = exists(paths.decisions) ? readText(paths.decisions) : '# Decisions (append-only)\n';
   const newEntries = decisions.map((d) => `- ${ts} — ${d}`).join('\n');
   if (decisions.length) {
-    writeFileAtomic(paths.decisions, `${decisionsHeader.trimEnd()}\n${newEntries}\n`);
+    out.push({ path: paths.decisions, content: `${decisionsHeader.trimEnd()}\n${newEntries}\n` });
   } else if (!exists(paths.decisions)) {
-    writeFileAtomic(paths.decisions, decisionsHeader);
+    out.push({ path: paths.decisions, content: decisionsHeader });
   }
+  return out;
 }
 
 function summarizePreviousMilestones(ctx: { paths: import('../core/paths.js').RijoPaths }): string {

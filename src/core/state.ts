@@ -17,11 +17,7 @@ export function readState(paths: RijoPaths): StateFrontmatter | null {
   return parsed.success ? parsed.data : null;
 }
 
-export function writeState(
-  paths: RijoPaths,
-  state: StateFrontmatter,
-  narrative: string,
-): void {
+export function renderState(state: StateFrontmatter, narrative: string): string {
   const body = [
     '# STATE',
     '',
@@ -31,7 +27,15 @@ export function writeState(
     state.blocked ? `- BLOCKED: ${state.blocked_reason ?? 'unspecified'}` : '- No blockers.',
     '',
   ].join('\n');
-  writeFileAtomic(paths.state, serializeFrontmatter(StateFrontmatterSchema.parse(state), body));
+  return serializeFrontmatter(StateFrontmatterSchema.parse(state), body);
+}
+
+export function writeState(
+  paths: RijoPaths,
+  state: StateFrontmatter,
+  narrative: string,
+): void {
+  writeFileAtomic(paths.state, renderState(state, narrative));
 }
 
 export function initialState(now: () => Date = () => new Date()): StateFrontmatter {

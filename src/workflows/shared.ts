@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import { RijoPaths } from '../core/paths.js';
 import { AttemptWorkspace, snapshotTree, diffTrees } from '../core/workspace.js';
 import { canonicalBaselineHash } from '../core/manifest.js';
+import { reconcileTransactions, type TxnHooks } from '../core/txn.js';
 import { loadConfig } from '../core/config.js';
 import { ProgressBus, consoleSink, newRunId, type ProgressSink } from '../core/progress.js';
 import { acquireLock, releaseLock } from '../core/locks.js';
@@ -36,6 +37,8 @@ export interface WorkflowDeps {
   git?: GitOps;
   sink?: ProgressSink;
   now?: () => Date;
+  /** test seam: fault injection inside milestone transactions. */
+  txnHooks?: TxnHooks;
 }
 
 export function createContext(projectRoot: string, deps: WorkflowDeps = {}): WorkflowContext {
@@ -91,6 +94,16 @@ export function guardSchema(ctx: WorkflowContext): WorkflowOutcome | null {
 export async function withLock<T>(ctx: WorkflowContext, body: () => Promise<T>): Promise<T> {
   acquireLock(ctx.paths.lock, ctx.bus.runId, ctx.now);
   try {
+    // Startup reconciliation: an interrupted milestone transaction is rolled
+    // back (no commit marker) or deterministically rolled forward (marker
+    // present) BEFORE any workflow observes the tree.
+    const rec = reconcileTransactions(ctx.paths);
+    for (const id of rec.rolledBack) {
+      ctx.bus.emit('txn.rolled_back', { message: `transação incompleta descartada: ${id}` }, { txn: id });
+    }
+    for (const id of rec.rolledForward) {
+      ctx.bus.emit('txn.rolled_forward', { message: `transação confirmada reaplicada: ${id}` }, { txn: id });
+    }
     return await body();
   } finally {
     releaseLock(ctx.paths.lock, ctx.bus.runId);

@@ -16,36 +16,54 @@ const MILESTONE_TRACKED = ['SCOPE.md', 'REQUIREMENTS.md', 'ROADMAP.md', 'RESEARC
 const PHASE_TRACKED = ['SPEC.md', 'PLAN.md', 'VERIFICATION.md', 'REVIEW.md'];
 
 /**
+ * Overlay of not-yet-written contents keyed by path relative to `.rijo/`.
+ * Lets a transaction compute the FINAL hash map before anything durable
+ * changes (crash-safe staging).
+ */
+export type HashOverlay = Map<string, string>;
+
+/**
  * Hash the ENTIRE relevant canonical context: global files, the active
  * milestone's requirements/roadmap/specs/plans/verifications, decisions,
  * configuration and research sources. Any change outside the core is drift.
+ * With an overlay, staged contents take precedence over the disk.
  */
-export function computeHashes(paths: RijoPaths): Record<string, string> {
+export function computeHashes(paths: RijoPaths, overlay?: HashOverlay): Record<string, string> {
   const hashes: Record<string, string> = {};
-  for (const rel of TRACKED) {
+  const hashOf = (rel: string): string | null => {
+    if (overlay?.has(rel)) return sha256(overlay.get(rel)!);
     const p = path.join(paths.root, rel);
-    if (exists(p)) hashes[rel] = sha256File(p);
+    return exists(p) ? sha256File(p) : null;
+  };
+  for (const rel of TRACKED) {
+    const h = hashOf(rel);
+    if (h) hashes[rel] = h;
   }
-  if (exists(paths.researchSources)) hashes['research/sources.json'] = sha256File(paths.researchSources);
+  {
+    const h = hashOf('research/sources.json');
+    if (h) hashes['research/sources.json'] = h;
+  }
 
-  const raw = readJsonIfExists<{ active_milestone?: string | null; milestones?: Array<{ id: string; slug: string }> }>(
-    paths.manifest,
-  );
-  const active = raw?.active_milestone ? raw.milestones?.find((m) => m.id === raw.active_milestone) : null;
+  const rawManifest = overlay?.has('manifest.json')
+    ? (JSON.parse(overlay.get('manifest.json')!) as { active_milestone?: string | null; milestones?: Array<{ id: string; slug: string }> })
+    : readJsonIfExists<{ active_milestone?: string | null; milestones?: Array<{ id: string; slug: string }> }>(paths.manifest);
+  const active = rawManifest?.active_milestone
+    ? rawManifest.milestones?.find((m) => m.id === rawManifest.active_milestone)
+    : null;
   if (active) {
     const mdir = paths.milestoneDir(active.id, active.slug);
     const mrel = path.relative(paths.root, mdir).split(path.sep).join('/');
     for (const f of MILESTONE_TRACKED) {
-      const p = path.join(mdir, f);
-      if (exists(p)) hashes[`${mrel}/${f}`] = sha256File(p);
+      const h = hashOf(`${mrel}/${f}`);
+      if (h) hashes[`${mrel}/${f}`] = h;
     }
     const phasesDir = path.join(mdir, 'phases');
     if (exists(phasesDir)) {
       for (const entry of fs.readdirSync(phasesDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
         if (!entry.isDirectory()) continue;
         for (const f of PHASE_TRACKED) {
-          const p = path.join(phasesDir, entry.name, f);
-          if (exists(p)) hashes[`${mrel}/phases/${entry.name}/${f}`] = sha256File(p);
+          const h = hashOf(`${mrel}/phases/${entry.name}/${f}`);
+          if (h) hashes[`${mrel}/phases/${entry.name}/${f}`] = h;
         }
       }
     }

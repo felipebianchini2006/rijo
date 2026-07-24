@@ -24,7 +24,7 @@ export function readRequirements(p: string): RequirementsDoc {
   return RequirementsDocSchema.parse(data);
 }
 
-export function writeRequirements(p: string, doc: RequirementsDoc): void {
+export function renderRequirements(doc: RequirementsDoc): string {
   const body = [
     `# Requirements — ${doc.milestone}`,
     '',
@@ -36,7 +36,11 @@ export function writeRequirements(p: string, doc: RequirementsDoc): void {
     ),
     '',
   ].join('\n');
-  writeFileAtomic(p, serializeFrontmatter(RequirementsDocSchema.parse(doc), body));
+  return serializeFrontmatter(RequirementsDocSchema.parse(doc), body);
+}
+
+export function writeRequirements(p: string, doc: RequirementsDoc): void {
+  writeFileAtomic(p, renderRequirements(doc));
 }
 
 const RoadmapDocSchema = z.object({
@@ -50,7 +54,7 @@ export function readRoadmap(p: string): RoadmapDoc {
   return RoadmapDocSchema.parse(data);
 }
 
-export function writeRoadmap(p: string, doc: RoadmapDoc): void {
+export function renderRoadmap(doc: RoadmapDoc): string {
   const body = [
     `# Roadmap — ${doc.milestone}`,
     '',
@@ -67,7 +71,11 @@ export function writeRoadmap(p: string, doc: RoadmapDoc): void {
         .join('\n');
     }),
   ].join('\n');
-  writeFileAtomic(p, serializeFrontmatter(RoadmapDocSchema.parse(doc), body));
+  return serializeFrontmatter(RoadmapDocSchema.parse(doc), body);
+}
+
+export function writeRoadmap(p: string, doc: RoadmapDoc): void {
+  writeFileAtomic(p, renderRoadmap(doc));
 }
 
 /** Phase ready set: PENDING phases whose dependencies are all DONE. */

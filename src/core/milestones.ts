@@ -98,25 +98,14 @@ export interface CloseoutInput {
 }
 
 /**
- * Seal a milestone: classify incomplete requirements, write CLOSEOUT.md,
- * update requirement statuses. Historic artifacts are never rewritten —
- * only statuses and the closeout are added. The active_milestone pointer is
- * NOT changed here; the caller swaps it in the same transaction that creates
- * the next milestone.
+ * Validate that a milestone CAN be sealed with the given closeout input.
+ * Throws with a precise diagnostic; mutates nothing.
  */
-export function sealMilestone(
-  paths: RijoPaths,
-  ref: MilestoneRef,
-  input: CloseoutInput,
-  now: () => Date = () => new Date(),
-): void {
+export function validateSeal(ref: MilestoneRef, input: CloseoutInput, reqDoc: { requirements: Requirement[] } | null): void {
   if (exists(ref.paths.closeout)) {
     throw new Error(`Milestone ${ref.id} already has a CLOSEOUT.md; historic milestones are immutable`);
   }
-  const reqDoc = exists(ref.paths.requirements) ? readRequirements(ref.paths.requirements) : null;
-  const done = reqDoc?.requirements.filter((r) => r.status === 'DONE') ?? [];
   const undone = reqDoc?.requirements.filter((r) => r.status !== 'DONE') ?? [];
-
   if (input.status === 'COMPLETE' && undone.length > 0) {
     throw new Error(
       `Milestone ${ref.id} cannot close as COMPLETE: unverified requirements remain (${undone
@@ -133,24 +122,33 @@ export function sealMilestone(
         .join(', ')}`,
     );
   }
+}
 
-  // update statuses on the sealed milestone's requirement doc
-  if (reqDoc) {
-    for (const item of input.carryover) {
-      const req = reqDoc.requirements.find((r) => r.id === item.requirement.id);
-      if (!req) continue;
-      req.status =
-        item.disposition === 'carried'
-          ? 'CARRIED'
-          : item.disposition === 'debt'
-            ? 'DEBT'
-            : item.disposition === 'cancelled'
-              ? 'CANCELLED'
-              : 'BLOCKED';
-    }
-    writeRequirements(ref.paths.requirements, reqDoc);
+/** Apply carryover dispositions to the sealed milestone's requirement doc (pure). */
+export function applySealDispositions<T extends { requirements: Requirement[] }>(reqDoc: T, carryover: CarryoverItem[]): T {
+  for (const item of carryover) {
+    const req = reqDoc.requirements.find((r) => r.id === item.requirement.id);
+    if (!req) continue;
+    req.status =
+      item.disposition === 'carried'
+        ? 'CARRIED'
+        : item.disposition === 'debt'
+          ? 'DEBT'
+          : item.disposition === 'cancelled'
+            ? 'CANCELLED'
+            : 'BLOCKED';
   }
+  return reqDoc;
+}
 
+/** Render the CLOSEOUT.md content (pure). */
+export function renderCloseout(
+  ref: MilestoneRef,
+  input: CloseoutInput,
+  reqDoc: { requirements: Requirement[] } | null,
+  now: () => Date = () => new Date(),
+): string {
+  const done = reqDoc?.requirements.filter((r) => r.status === 'DONE') ?? [];
   const fm = {
     milestone: ref.id,
     status: input.status,
@@ -183,7 +181,29 @@ export function sealMilestone(
     ...(input.residualRisks.length ? input.residualRisks.map((r) => `- ${r}`) : ['- none identified']),
     '',
   ].join('\n');
-  writeFileAtomic(ref.paths.closeout, serializeFrontmatter(fm, body));
+  return serializeFrontmatter(fm, body);
+}
+
+/**
+ * Seal a milestone: classify incomplete requirements, write CLOSEOUT.md,
+ * update requirement statuses. Historic artifacts are never rewritten —
+ * only statuses and the closeout are added. The active_milestone pointer is
+ * NOT changed here; the caller swaps it in the same transaction that creates
+ * the next milestone. (Direct-write variant; `rijo new --next` stages these
+ * same contents through the crash-safe MilestoneTransaction instead.)
+ */
+export function sealMilestone(
+  paths: RijoPaths,
+  ref: MilestoneRef,
+  input: CloseoutInput,
+  now: () => Date = () => new Date(),
+): void {
+  const reqDoc = exists(ref.paths.requirements) ? readRequirements(ref.paths.requirements) : null;
+  validateSeal(ref, input, reqDoc);
+  const doneDoc = reqDoc ? applySealDispositions(reqDoc, input.carryover) : null;
+  const closeout = renderCloseout(ref, input, doneDoc, now);
+  if (doneDoc) writeRequirements(ref.paths.requirements, doneDoc);
+  writeFileAtomic(ref.paths.closeout, closeout);
 
   touchManifest(
     paths,
@@ -211,17 +231,20 @@ export function carryRequirement(req: Requirement, newMilestoneId: string, seq: 
   };
 }
 
-/** Regenerate the MILESTONES.md chronological index from the manifest. */
-export function updateMilestonesIndex(paths: RijoPaths, now: () => Date = () => new Date()): void {
-  const manifest = readManifest(paths);
-  if (!manifest) return;
+/** Render the MILESTONES.md chronological index for a manifest (pure). */
+export function renderMilestonesIndex(
+  paths: RijoPaths,
+  manifest: Manifest,
+  now: () => Date = () => new Date(),
+  closeoutOverride?: Map<string, string>,
+): string {
   const rows = manifest.milestones.map((m) => {
     const dir = paths.milestoneDir(m.id, m.slug);
-    const closeout = readTextIfExists(path.join(dir, 'CLOSEOUT.md'));
+    const closeout = closeoutOverride?.get(m.id) ?? readTextIfExists(path.join(dir, 'CLOSEOUT.md'));
     const baseline = closeout?.match(/baseline_commit: (\S+)/)?.[1] ?? '—';
     return `| ${m.id} | ${m.slug} | ${m.status} | ${baseline === 'null' ? '—' : baseline} |`;
   });
-  const body = [
+  return [
     '---',
     `active_milestone: ${manifest.active_milestone ?? 'null'}`,
     `updated_at: ${now().toISOString()}`,
@@ -234,7 +257,13 @@ export function updateMilestonesIndex(paths: RijoPaths, now: () => Date = () => 
     ...rows,
     '',
   ].join('\n');
-  writeFileAtomic(paths.milestonesIndex, body);
+}
+
+/** Regenerate the MILESTONES.md chronological index from the manifest. */
+export function updateMilestonesIndex(paths: RijoPaths, now: () => Date = () => new Date()): void {
+  const manifest = readManifest(paths);
+  if (!manifest) return;
+  writeFileAtomic(paths.milestonesIndex, renderMilestonesIndex(paths, manifest, now));
   // MILESTONES.md is itself hash-tracked; refresh manifest hashes without structural change
   touchManifest(paths, () => {}, now);
 }
