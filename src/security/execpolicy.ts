@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -99,7 +100,10 @@ function classify(executable: string, args: string[]): { trust: CommandTrust; ne
  * never pass, not even when someone lists them in env_allowlist.
  */
 export function buildEnv(cwd: string, config: ExecutionConfig): Record<string, string> {
-  const scratchHome = path.join(cwd, '.rijo-sandbox-home');
+  // scratch HOME/TMPDIR live OUTSIDE the workspace tree (system tmp) so the
+  // sandbox leaves no residue in the checkout — a clean tree stays clean.
+  const digest = createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 12);
+  const scratchHome = path.join(os.tmpdir(), 'rijo-sbx', digest);
   fs.mkdirSync(path.join(scratchHome, 'tmp'), { recursive: true });
   const nodeDir = path.dirname(process.execPath);
   const env: Record<string, string> = {
@@ -142,9 +146,12 @@ export function seatbeltProfile(cwd: string, network: NetworkPolicy): string {
   ];
   if (network !== 'enabled') {
     lines.push('(deny network*)');
-    // local loopback stays possible under "restricted" (e.g. talking to a dev server)
+    // "restricted": loopback only — enough to run and talk to a local dev
+    // server under test, nothing beyond the machine.
     if (network === 'restricted') {
-      lines.push('(allow network* (remote ip "localhost:*"))');
+      lines.push('(allow network-outbound (remote ip "localhost:*"))');
+      lines.push('(allow network-bind (local ip "localhost:*"))');
+      lines.push('(allow network-inbound (local ip "localhost:*"))');
     }
   }
   return lines.join('\n');

@@ -19,9 +19,10 @@ export interface GitOps {
   checkoutInto(cwd: string, commit: string, destDir: string): boolean;
 }
 
-function git(cwd: string, args: string[]): { code: number; out: string } {
+function git(cwd: string, args: string[]): { code: number; out: string; raw: string } {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
-  return { code: r.status ?? 1, out: `${r.stdout ?? ''}`.trim() };
+  const raw = `${r.stdout ?? ''}`;
+  return { code: r.status ?? 1, out: raw.trim(), raw };
 }
 
 export class SystemGit implements GitOps {
@@ -30,10 +31,16 @@ export class SystemGit implements GitOps {
     if (inside.code !== 0 || inside.out !== 'true') return { isRepo: false, branch: null, dirtyFiles: [] };
     const branch = git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
     const porcelain = git(cwd, ['status', '--porcelain', '-uall']);
+    // parse per line from the RAW output: a whole-output trim would eat the
+    // leading space of a " M file" entry on the first line and corrupt the path
+    const dirtyFiles = porcelain.raw
+      .split('\n')
+      .filter((l) => l.length > 3)
+      .map((l) => l.slice(3).replace(/^"|"$/g, ''));
     return {
       isRepo: true,
       branch: branch.code === 0 ? branch.out : null,
-      dirtyFiles: porcelain.out ? porcelain.out.split('\n').map((l) => l.slice(3).replace(/^"|"$/g, '')) : [],
+      dirtyFiles,
     };
   }
 

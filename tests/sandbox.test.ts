@@ -79,9 +79,10 @@ describe('environment reconstruction', () => {
       // secrets do not pass even when explicitly allowlisted
       expect(env['RIJO_TEST_SECRET_TOKEN']).toBeUndefined();
       expect(env['AWS_SECRET_ACCESS_KEY']).toBeUndefined();
-      // HOME/TMPDIR are redirected inside the workspace scratch
-      expect(env['HOME']).toContain(root);
-      expect(env['TMPDIR']).toContain(root);
+      // HOME/TMPDIR are redirected into an out-of-tree scratch (never the real home)
+      expect(env['HOME']).not.toBe(process.env['HOME']);
+      expect(env['HOME']).toContain('rijo-sbx');
+      expect(env['TMPDIR']).toContain('rijo-sbx');
       // PATH is rebuilt, not inherited
       expect(env['PATH']).toContain(path.join(root, 'node_modules', '.bin'));
     } finally {

@@ -1,20 +1,24 @@
 import * as path from 'node:path';
 import { exists, readText, writeFileAtomic } from '../core/fsx.js';
-import { serializeFrontmatter } from '../core/frontmatter.js';
-import { activeMilestone } from '../core/milestones.js';
+import { serializeFrontmatter, parseFrontmatter } from '../core/frontmatter.js';
+import { activeMilestone, type MilestoneRef } from '../core/milestones.js';
 import { readRequirements } from '../core/roadmap.js';
+import { snapshotFiles, diffSnapshots } from '../core/scope.js';
 import type { CommandEvidence } from '../core/commands.js';
-import { deriveJourneys, JourneyResultSchema, type Journey, type JourneyResult } from '../qa/journeys.js';
+import { deriveJourneys, loadJourneyActions, JourneyResultSchema, type Journey, type JourneyAction, type JourneyResult } from '../qa/journeys.js';
 import { generatePlaywrightSpecs } from '../qa/playwright.js';
 import { decideReadiness } from '../qa/readiness.js';
+import { runProductionGate, type GateReport } from '../qa/gate.js';
 import type { AgentTaskDraft } from '../agents/protocol.js';
 import {
   createContext,
   withLock,
+  blocked,
   completed,
   failed,
   dispatch,
   dispatchBatch,
+  prepareAttempt,
   guardSchema,
   type WorkflowContext,
   type WorkflowDeps,
@@ -55,6 +59,11 @@ export async function checkWorkflow(
       message: `avaliando commit ${commit?.slice(0, 8) ?? 'sem VCS'} (${environment})`,
     });
 
+    // ---- PRODUCTION GATE: executable verification of the exact commit.
+    if (opts.production) {
+      return productionCheck(ctx, milestone, opts);
+    }
+
     // ---- 2-3: deterministic checks (only those that exist in the project)
     let checks = runDeterministicChecks(ctx);
     const hasBuild = detectHasBuild(ctx);
@@ -65,10 +74,24 @@ export async function checkWorkflow(
     const reqDoc = readRequirements(milestone.paths.requirements);
     const journeys = deriveJourneys(reqDoc.requirements);
     writeJourneysDoc(milestone.paths.qaDir, journeys, now);
-    // Playwright specs: deterministic codegen with acceptance scenarios as steps.
+    // Playwright specs: deterministic codegen from structured actions only —
+    // a journey without an actions file gets NO spec (never a placeholder).
     const acceptanceById = Object.fromEntries(reqDoc.requirements.map((r) => [r.id, r.acceptance]));
-    const specs = generatePlaywrightSpecs(journeys, path.join(milestone.paths.qaDir, 'journeys'), 'http://localhost:3000', acceptanceById);
-    bus.emit('check.playwright', { message: `${specs.length} specs Playwright gerados em qa/journeys/` });
+    const actionsByJourney: Record<string, JourneyAction[]> = {};
+    for (const j of journeys) {
+      const a = loadJourneyActions(milestone.paths.qaDir, j.id);
+      if (a) actionsByJourney[j.id] = a.actions;
+    }
+    const specs = generatePlaywrightSpecs(
+      journeys,
+      path.join(milestone.paths.qaDir, 'journeys'),
+      config.qa.base_url,
+      acceptanceById,
+      actionsByJourney,
+    );
+    bus.emit('check.playwright', {
+      message: `${specs.length}/${journeys.length} specs Playwright gerados (jornadas sem ações estruturadas não geram spec)`,
+    });
 
     // ---- 7-9: browser journeys (isolated agents), honest about capability
     const missingCapabilities: string[] = [];
@@ -220,6 +243,199 @@ export async function checkWorkflow(
       details,
     };
   });
+}
+
+/**
+ * `check --production`: the gate is EXECUTABLE verification of the exact
+ * commit — clean checkout, reproducible install, real server, real Playwright
+ * on every configured browser/viewport, evidence on failure. After --fix the
+ * WHOLE matrix re-runs on the new commit; any change during the gate
+ * invalidates the round. READY demands: known HEAD, clean tree, every
+ * deterministic check green, every journey passed (or explicitly waived in
+ * versioned config), every active requirement DONE and journey-covered.
+ */
+async function productionCheck(
+  ctx: WorkflowContext,
+  milestone: MilestoneRef,
+  opts: CheckOptions,
+): Promise<WorkflowOutcome> {
+  const { paths, bus, config, now, projectRoot } = ctx;
+  const reqDoc = readRequirements(milestone.paths.requirements);
+  const journeys = deriveJourneys(reqDoc.requirements);
+  const acceptanceById = Object.fromEntries(reqDoc.requirements.map((r) => [r.id, r.acceptance]));
+  const gateDeps = {
+    projectRoot,
+    git: ctx.git,
+    shell: ctx.shell,
+    config,
+    qaDir: milestone.paths.qaDir,
+    now,
+    emit: (type: string, message: string) => void bus.emit(type, { message }),
+  };
+
+  const fixesApplied: string[] = [];
+  let gate: GateReport = await runProductionGate(gateDeps, journeys, acceptanceById);
+
+  // ---- bounded --fix loop: repair in an isolated workspace, commit, and
+  // re-run the ENTIRE matrix (build, lint, typecheck, unit, E2E, all journeys)
+  // against the NEW exact commit.
+  let round = 0;
+  while (opts.fix && gate.status === 'failed' && round < config.limits.qa_fix_loops) {
+    round++;
+    bus.emit('check.fix', { stage: 'REPAIR', message: `rodada ${round}: corrigindo por causa raiz e reexecutando a matriz inteira` });
+    const fixTask: AgentTaskDraft = {
+      id: `check-fix-${round}`,
+      role: 'worker',
+      objective:
+        'Group the failing checks and journey findings by root cause and fix them with limited scope. Do not fix symptoms individually when one cause explains several failures. Work only inside your isolated workspace.',
+      canonical_files: [paths.rules].filter(exists),
+      code_files: [],
+      write_scope: ['**'],
+      acceptance_criteria: ['Failing journeys and checks pass on the full gate re-run'],
+      verification_commands: [],
+      return_format: 'JSON payload: {done: boolean, notes: string}',
+      notes: gate.reasons.join('\n'),
+    };
+    const attempt = prepareAttempt(ctx, fixTask);
+    let appliedPaths: string[] = [];
+    try {
+      const res = await dispatch(ctx, attempt.task);
+      if (!res.ok) {
+        bus.emit('check.fix_failed', { message: `reparo falhou: ${res.summary}` });
+        break;
+      }
+      const beforeApply = snapshotFiles(projectRoot);
+      attempt.workspace.applyVerifiedPatch();
+      appliedPaths = diffSnapshots(beforeApply, snapshotFiles(projectRoot)).changed;
+    } catch (err) {
+      bus.emit('check.fix_failed', { message: `reparo descartado: ${(err as Error).message}` });
+      break;
+    } finally {
+      attempt.workspace.discard();
+    }
+    if (appliedPaths.length === 0) break;
+    const fixCommit = ctx.git.commitPaths(projectRoot, `rijo(check-fix): round ${round}`, appliedPaths);
+    if (!fixCommit) {
+      return blocked(ctx, 'check --fix: repair commit failed; the gate cannot certify an uncommitted tree.', appliedPaths);
+    }
+    fixesApplied.push(`round ${round}: commit ${fixCommit}`);
+    gate = await runProductionGate(gateDeps, journeys, acceptanceById);
+  }
+
+  // ---- readiness decision
+  const reasons: string[] = [];
+  if (gate.status === 'blocked') {
+    reasons.push(...gate.reasons);
+  } else {
+    const waived = new Map(config.qa.waivers.map((w) => [w.journey_id, w.reason]));
+    for (const c of gate.commands.filter((c) => c.exit_code !== 0)) {
+      reasons.push(`Check failed: ${c.command} (exit ${c.exit_code})`);
+    }
+    for (const j of gate.journeys) {
+      if (j.passed === true) continue;
+      const waiver = waived.get(j.id);
+      if (waiver) {
+        reasons.push(`WAIVED journey ${j.id} (${waiver}) — auditable, versioned in config`);
+        continue;
+      }
+      reasons.push(`Journey ${j.id} ${j.passed === null ? 'not executed' : 'failed'}: ${j.failures.join('; ') || 'see evidence'}`);
+    }
+    // requirement gate: every active requirement DONE and journey-covered
+    const active = reqDoc.requirements.filter((r) => r.status !== 'CANCELLED' && r.status !== 'CARRIED');
+    for (const r of active) {
+      if (!journeys.some((j) => j.requirement_ids.includes(r.id))) reasons.push(`Requirement not covered by any journey: ${r.id}`);
+      if (r.status !== 'DONE' && r.status !== 'DEBT') reasons.push(`Requirement ${r.id} is ${r.status}, not DONE.`);
+    }
+  }
+  const hardFailures = reasons.filter((r) => !r.startsWith('WAIVED'));
+  const status = gate.status === 'blocked' ? 'BLOCKED' : hardFailures.length === 0 ? 'READY' : 'NOT_READY';
+
+  // ---- report: tested_commit, evidence paths, tool versions, commands
+  const writeReadiness = (evidenceCommit: string | null) =>
+    writeFileAtomic(
+      milestone.paths.readiness,
+      serializeFrontmatter(
+        {
+          status,
+          tested_commit: gate.tested_commit || null,
+          evidence_commit: evidenceCommit,
+          environment: 'production-candidate',
+          checked_at: now().toISOString(),
+          tool_versions: gate.tool_versions,
+          commands: gate.commands.map((c) => ({ command: c.command, exit_code: c.exit_code, sandbox: c.sandbox ?? null })),
+          journeys: gate.journeys.map((j) => ({ id: j.id, requirements: j.requirement_ids, passed: j.passed, spec: j.spec ? path.basename(j.spec) : null })),
+          evidence_dir: gate.evidence_dir,
+          server_log: gate.server_log,
+          fixes_applied: fixesApplied,
+          waivers: config.qa.waivers,
+        },
+        [
+          `# Production readiness — ${milestone.id}`,
+          '',
+          `Status: **${status}**`,
+          `Tested commit: \`${gate.tested_commit || 'n/a'}\` · Date: ${now().toISOString()}`,
+          '',
+          '## Gates',
+          ...(reasons.length ? reasons.map((r) => `- ${r}`) : ['- All gates passed']),
+          '',
+          '## Commands (exact commit, isolated checkout)',
+          ...gate.commands.map((c) => `- \`${c.command}\` → exit ${c.exit_code} [${c.sandbox ?? 'n/a'}]`),
+          '',
+          '## Journeys (requirement → journey → spec → result)',
+          ...gate.journeys.map(
+            (j) =>
+              `- ${j.id} [${j.requirement_ids.join(', ')}] → ${j.spec ? path.basename(j.spec) : 'no spec'} → ${j.passed === true ? 'PASSED' : j.passed === false ? 'FAILED' : 'NOT EXECUTED'}${j.failures.length ? ` — ${j.failures.join('; ')}` : ''}`,
+          ),
+          '',
+          '## Evidence',
+          `- results/traces: ${gate.evidence_dir ?? 'n/a'}`,
+          `- server log: ${gate.server_log ?? 'n/a'}`,
+          '',
+          '## Tool versions',
+          ...Object.entries(gate.tool_versions).map(([k, v]) => `- ${k}: ${v}`),
+          '',
+        ].join('\n'),
+      ),
+    );
+  writeReadiness(null);
+
+  // evidence commit: the readiness report points at the tested commit; the
+  // report itself lands in a separate, verified evidence-only commit.
+  const relReadiness = path.relative(projectRoot, milestone.paths.readiness).split(path.sep).join('/');
+  const relQaDir = path.relative(projectRoot, milestone.paths.qaDir).split(path.sep).join('/');
+  let evidenceCommit: string | null = null;
+  if (ctx.git.status(projectRoot).isRepo && config.git.commit) {
+    // evidence commit: readiness report + the gate's captured evidence
+    // (server log, traces, screenshots) — nothing else. A BLOCKED round is
+    // evidence too: it is committed so it can never dirty the next round.
+    const label = gate.tested_commit ? `for ${gate.tested_commit.slice(0, 12)}` : `(gate ${status})`;
+    evidenceCommit = ctx.git.commitPaths(projectRoot, `rijo(check): readiness evidence ${label}`, [relReadiness, relQaDir]);
+    if (evidenceCommit && gate.tested_commit) {
+      const range = ctx.git.diffNames(projectRoot, gate.tested_commit, evidenceCommit);
+      const illegal = range.filter((f) => f !== relReadiness && !f.startsWith(relQaDir));
+      if (illegal.length > 0) {
+        return blocked(ctx, 'Readiness evidence commit touched non-evidence paths.', illegal);
+      }
+      writeReadiness(evidenceCommit);
+      ctx.git.commitPaths(projectRoot, `rijo(check): readiness evidence sealed`, [relReadiness]);
+    }
+  }
+
+  bus.emit('check.done', {
+    status: status === 'READY' ? 'completed' : 'blocked',
+    stage: 'REPORT',
+    message: `prontidão (production gate): ${status}`,
+  });
+  const details = [
+    `Report: ${path.relative(projectRoot, milestone.paths.readiness)}`,
+    `tested_commit: ${gate.tested_commit || 'n/a'}`,
+    ...(evidenceCommit ? [`evidence_commit: ${evidenceCommit}`] : []),
+    ...reasons.slice(0, 10),
+  ];
+  if (status === 'READY') {
+    return completed(ctx, `Production readiness: READY (commit ${gate.tested_commit.slice(0, 8)}).`, details);
+  }
+  return { ok: false, status: 'blocked' as const, message: `Production readiness: ${status}.`, details };
 }
 
 function detectHasBuild(ctx: WorkflowContext): boolean {
