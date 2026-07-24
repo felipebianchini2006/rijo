@@ -17,7 +17,7 @@ import {
   failed,
   dispatch,
   dispatchReadOnly,
-  prepareAttempt,
+  replaceableAttempt,
   guardSchema,
   type WorkflowContext,
   type WorkflowDeps,
@@ -218,23 +218,23 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       return_format: 'JSON payload: {converted: boolean, components_created[], notes}',
       notes: '',
     };
-    const attempt = prepareAttempt(ctx, convertTask);
+    const attemptH = replaceableAttempt(ctx, convertTask, {}, { stage: 'UI_SMOKE' });
     let deltaFiles: string[] = [];
     try {
-      const res = await dispatch(ctx, attempt.task, { stage: 'UI_SMOKE' });
+      const res = await dispatch(ctx, attemptH.attempt.task, { stage: 'UI_SMOKE' }, { prepareReplacement: attemptH.prepareReplacement });
       const conv = z.object({ converted: z.boolean(), components_created: z.array(z.string()).default([]), notes: z.string().default('') }).safeParse(res.payload);
       if (!res.ok || !conv.success || !conv.data.converted) {
         return blocked(ctx, 'UI conversion failed.', [res.summary]);
       }
       // real delta validated against the DERIVED scope (agent report ignored)
-      const delta = attempt.workspace.validate();
+      const delta = attemptH.attempt.workspace.validate();
       deltaFiles = delta.changed;
       if (deltaFiles.length === 0) {
         return blocked(ctx, 'UI conversion produced no changes.', []);
       }
 
       // ---- deterministic mock scan on the REAL changed files (payload is never proof)
-      const mockFindings = scanForMocks(attempt.workspace.root, delta.added.concat(delta.modified));
+      const mockFindings = scanForMocks(attemptH.attempt.workspace.root, delta.added.concat(delta.modified));
       if (mockFindings.length > 0) {
         return blocked(
           ctx,
@@ -252,7 +252,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         ]);
       }
       for (const sc of verifyScripts) {
-        const ev = ctx.shell.run(`npm run ${sc}`, { cwd: attempt.workspace.root });
+        const ev = ctx.shell.run(`npm run ${sc}`, { cwd: attemptH.attempt.workspace.root });
         bus.emit('ui.verify', { message: `${sc} → exit ${ev.exit_code}` });
         if (ev.blocked || ev.exit_code !== 0) {
           return blocked(ctx, `UI import failed ${sc} in the isolated workspace.`, [ev.summary.slice(0, 600)]);
@@ -275,7 +275,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
           objective:
             'Validate the converted UI in a real browser: every mapped route renders; loading, empty, error and success states behave; desktop/tablet/mobile viewports; keyboard and focus; console and network clean.',
           canonical_files: [mappingPath],
-          code_files: deltaFiles.map((f) => path.join(attempt.workspace.root, f)),
+          code_files: deltaFiles.map((f) => path.join(attemptH.attempt.workspace.root, f)),
           write_scope: [],
           acceptance_criteria: [
             'Every mapped route renders without console errors',
@@ -286,7 +286,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
           return_format: 'JSON payload: {passed: boolean, routes_checked[], states_checked[], notes}',
           notes: `Routes to validate: ${mapping.data.routes.map((r) => r.to).join(', ') || 'from MAPPING.md'}`,
         };
-        const vres = await dispatch(ctx, { ...validateTask, workspace: { id: attempt.workspace.id, root: attempt.workspace.root } }, { stage: 'UI_SMOKE' });
+        const vres = await dispatch(ctx, { ...validateTask, workspace: { id: attemptH.attempt.workspace.id, root: attemptH.attempt.workspace.root } }, { stage: 'UI_SMOKE' });
         const vparsed = z
           .object({ passed: z.boolean(), routes_checked: z.array(z.string()).default([]), states_checked: z.array(z.string()).default([]), notes: z.string().default('') })
           .safeParse(vres.payload);
@@ -297,14 +297,14 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       }
 
       // ---- ALL gates passed: only now the patch reaches the checkout
-      attempt.workspace.applyVerifiedPatch();
+      attemptH.attempt.workspace.applyVerifiedPatch();
     } catch (err) {
       if (err instanceof Error && ['WorkspaceScopeError', 'CanonicalWriteError', 'SymlinkEscapeError', 'PatchConflictError'].includes(err.name)) {
         return blocked(ctx, `UI conversion discarded — ${err.message}`, []);
       }
       throw err;
     } finally {
-      attempt.workspace.discard();
+      attemptH.attempt.workspace.discard();
     }
     const conv = { data: { components_created: deltaFiles, routes_mapped: mapping.data.routes, api_contracts: mapping.data.mappings.filter((m) => m.kind === 'api').map((m) => m.to), notes: '' } };
 

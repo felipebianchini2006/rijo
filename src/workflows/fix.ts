@@ -12,7 +12,7 @@ import {
   failed,
   dispatchReadOnly,
   dispatch,
-  prepareAttempt,
+  replaceableAttempt,
   guardSchema,
   type WorkflowDeps,
   type WorkflowOutcome,
@@ -145,10 +145,10 @@ export async function fixWorkflow(
       // Each repair attempt runs in its OWN isolated workspace; the patch is
       // verified INSIDE the workspace and only applied to the checkout after
       // every gate passes. A failed attempt is discarded whole.
-      const attemptWs = prepareAttempt(ctx, repairTask);
+      const attemptWs = replaceableAttempt(ctx, repairTask, {}, { stage: 'REPAIR' });
       let applied = false;
       try {
-        const res = await dispatch(ctx, attemptWs.task, { stage: 'REPAIR' });
+        const res = await dispatch(ctx, attemptWs.attempt.task, { stage: 'REPAIR' }, { prepareReplacement: attemptWs.prepareReplacement });
         const parsed = RepairSchema.safeParse(res.payload);
         if (!res.ok || !parsed.success || !parsed.data.fixed) {
           appendLog(`repair attempt ${attempt} failed: ${res.summary}`);
@@ -160,7 +160,7 @@ export async function fixWorkflow(
           appendLog(`repair attempt ${attempt}: rejected — no post-fix verification command (NO_VERIFICATION_EVIDENCE)`);
           continue;
         }
-        const evidences = parsed.data.verification_commands.map((c) => ctx.shell.run(c, { cwd: attemptWs.workspace.root }));
+        const evidences = parsed.data.verification_commands.map((c) => ctx.shell.run(c, { cwd: attemptWs.attempt.workspace.root }));
         const policyBlocked = evidences.filter((e) => e.blocked);
         if (policyBlocked.length > 0) {
           appendLog(`repair attempt ${attempt}: verification command blocked by policy (${policyBlocked.map((e) => e.command).join(', ')})`);
@@ -171,7 +171,7 @@ export async function fixWorkflow(
           appendLog(`repair attempt ${attempt}: verification failed (${failures.map((f) => f.command).join(', ')})`);
           continue;
         }
-        attemptWs.workspace.applyVerifiedPatch();
+        attemptWs.attempt.workspace.applyVerifiedPatch();
         applied = true;
         repair = parsed.data;
         appendLog(`repair attempt ${attempt}: verified in isolated workspace (${parsed.data.verification_commands.length} commands exit 0)`);
@@ -180,7 +180,7 @@ export async function fixWorkflow(
         appendLog(`repair attempt ${attempt}: discarded — ${(err as Error).message}`);
         continue;
       } finally {
-        attemptWs.workspace.discard();
+        attemptWs.attempt.workspace.discard();
         void applied;
       }
     }

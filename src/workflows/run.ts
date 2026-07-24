@@ -1,16 +1,16 @@
 import * as path from 'node:path';
 import { z } from 'zod';
 import { exists, readText, readTextIfExists, writeFileAtomic, ensureDir } from '../core/fsx.js';
-import { parseFrontmatter, serializeFrontmatter } from '../core/frontmatter.js';
+import { serializeFrontmatter } from '../core/frontmatter.js';
 import { phasePaths, type PhasePaths } from '../core/paths.js';
-import { readState, writeState, initialState } from '../core/state.js';
+import { readState } from '../core/state.js';
 import { touchManifest, canonicalBaselineHash } from '../core/manifest.js';
 import { activeMilestone, type MilestoneRef } from '../core/milestones.js';
-import { readRequirements, readRoadmap, writeRequirements, writeRoadmap, nextPhase, type RoadmapDoc } from '../core/roadmap.js';
+import { readRequirements, readRoadmap, writeRoadmap, nextPhase, type RoadmapDoc } from '../core/roadmap.js';
 import { readPlan, writePlan, lintPlan, setTaskStatus, parallelGroups } from '../core/plan.js';
 import { validateStateIntegrity } from '../core/traceability.js';
 import { checkContextBudget } from '../core/contextBudget.js';
-import { snapshotFiles, diffSnapshots, pathInScope, type FileSnapshot } from '../core/scope.js';
+import { snapshotFiles, diffSnapshots, type FileSnapshot } from '../core/scope.js';
 import {
   AttemptWorkspace,
   snapshotTree,
@@ -33,14 +33,15 @@ import {
   dispatch,
   dispatchBatch,
   guardSchema,
-  prepareAttempt,
+  replaceableAttempt,
   dispatchReadOnly,
-  type Attempt,
+  type ReplaceableAttempt,
   type WorkflowContext,
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
 import { inferSecurityTag, inferHighRisk } from './routing.js';
+import { stageFinalization } from './finalize.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -190,23 +191,6 @@ async function executePhase(
     writeRoadmap(milestone.paths.roadmap, doc);
   };
 
-  const checkpoint = (stageName: import('../core/schemas/index.js').Stage, narrative: string, extra: Partial<import('../core/schemas/index.js').StateFrontmatter> = {}) => {
-    const prev = readState(paths) ?? initialState(now);
-    writeState(
-      paths,
-      {
-        ...prev,
-        milestone: milestone.id,
-        phase: phase.id,
-        stage: stageName,
-        updated_at: now().toISOString(),
-        ...extra,
-      },
-      narrative,
-    );
-    touchManifest(paths, () => {}, now);
-  };
-
   /** Append-only transition event FIRST, then the plan projection, then manifest hashes. */
   const transition = (taskId: string, to: TaskStatus, reason = '') => {
     bus.emit('task.transition', { message: `tarefa ${taskId} → ${to}${reason ? ` (${reason})` : ''}` }, { task: taskId, to, reason });
@@ -247,18 +231,18 @@ async function executePhase(
     };
     // The spec is a canonical artifact: this is an explicitly core-authorized
     // canonical write, isolated in a workspace and applied only after validation.
-    const attempt = prepareAttempt(ctx, specTask, { canonicalWriteScope: [specRel] });
-    const res = await dispatch(ctx, attempt.task, { stage: 'SPEC_READY' });
+    const spec = replaceableAttempt(ctx, specTask, { canonicalWriteScope: [specRel] }, { stage: 'SPEC_READY' });
+    const res = await dispatch(ctx, spec.attempt.task, { stage: 'SPEC_READY' }, { prepareReplacement: spec.prepareReplacement });
     try {
-      if (!res.ok || !exists(path.join(attempt.workspace.root, specRel))) {
+      if (!res.ok || !exists(path.join(spec.attempt.workspace.root, specRel))) {
         return blocked(ctx, `Phase ${phase.id}: spec generation failed.`, [res.summary]);
       }
-      attempt.workspace.applyVerifiedPatch();
+      spec.attempt.workspace.applyVerifiedPatch();
       touchManifest(paths, () => {}, now);
     } catch (err) {
       return blocked(ctx, `Phase ${phase.id}: spec generation violated workspace boundaries.`, [String((err as Error).message)]);
     } finally {
-      attempt.workspace.discard();
+      spec.attempt.workspace.discard();
     }
   } else {
     stage('SPEC_READY', 'especificação existente validada');
@@ -391,7 +375,16 @@ async function executePhase(
     // THEN the workspaces are created — every attempt in the group captures
     // the same, final canonical baseline.
     for (const t of pending) transition(t.id, 'RUNNING');
-    const attempts: Attempt[] = [];
+    const routingFor = (t: { write_scope?: string[]; code_files?: string[] }) => {
+      const scopePaths = [...(t.write_scope ?? []), ...(t.code_files ?? [])];
+      return {
+        stage: 'EXECUTE' as const,
+        requirementTags: inferSecurityTag(scopePaths),
+        paths: scopePaths,
+        highRisk: inferHighRisk(scopePaths),
+      };
+    };
+    const attempts: ReplaceableAttempt[] = [];
     for (const t of pending) {
       const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
@@ -407,7 +400,7 @@ async function executePhase(
         workspace: null,
         canonical_baseline: null,
       };
-      attempts.push(prepareAttempt(ctx, workerTask));
+      attempts.push(replaceableAttempt(ctx, workerTask, {}, routingFor(workerTask)));
     }
 
     const taskIdx = plan.tasks.findIndex((t) => t.id === pending[0]!.id) + 1;
@@ -415,22 +408,20 @@ async function executePhase(
     bus.emit('run.task_start', {
       stage: 'EXECUTE',
       task: { id: pending[0]!.id, index: taskIdx, total: totalTasks, name: pending[0]!.name },
-      agent: { role: 'worker', id: attempts[0]!.task.id },
+      agent: { role: 'worker', id: attempts[0]!.attempt.task.id },
       message: pending.map((t) => t.name).join(' | '),
     });
 
-    const discardAll = () => attempts.forEach((a) => a.workspace.discard());
+    const discardAll = () => attempts.forEach((a) => a.attempt.workspace.discard());
     let results: AgentResult[];
     try {
-      results = await dispatchBatch(ctx, attempts.map((a) => a.task), undefined, (task) => {
-        const scopePaths = [...(task.write_scope ?? []), ...(task.code_files ?? [])];
-        return {
-          stage: 'EXECUTE',
-          requirementTags: inferSecurityTag(scopePaths),
-          paths: scopePaths,
-          highRisk: inferHighRisk(scopePaths),
-        };
-      });
+      results = await dispatchBatch(
+        ctx,
+        attempts.map((a) => a.attempt.task),
+        undefined,
+        (task) => routingFor(task),
+        (_task, i) => attempts[i]!.prepareReplacement,
+      );
     } catch (err) {
       discardAll();
       pending.forEach((t) => transition(t.id, 'FAILED', 'dispatch error'));
@@ -452,12 +443,12 @@ async function executePhase(
     // Canonical baseline must still be current: an attempt briefed against an
     // older canonical context can never be applied.
     const baselineNow = canonicalBaselineHash(paths);
-    const stale = attempts.filter((a) => a.task.canonical_baseline !== baselineNow);
+    const stale = attempts.filter((a) => a.attempt.task.canonical_baseline !== baselineNow);
     if (stale.length > 0) {
       discardAll();
       pending.forEach((t) => transition(t.id, 'FAILED', 'canonical baseline drift'));
       return blocked(ctx, `Phase ${phase.id}: canonical context changed while attempts ran (CANONICAL_DRIFT).`, [
-        `Stale attempts: ${stale.map((a) => a.task.id).join(', ')}. Re-run to retry against the current baseline.`,
+        `Stale attempts: ${stale.map((a) => a.attempt.task.id).join(', ')}. Re-run to retry against the current baseline.`,
       ]);
     }
 
@@ -466,7 +457,7 @@ async function executePhase(
     // validated against that task's own scope — never the group union, and the
     // agent's files_written report is irrelevant.
     try {
-      for (const a of attempts) a.workspace.validate();
+      for (const a of attempts) a.attempt.workspace.validate();
     } catch (err) {
       discardAll();
       pending.forEach((t) => transition(t.id, 'FAILED', 'boundary violation'));
@@ -486,7 +477,7 @@ async function executePhase(
       const a = attempts[i]!;
       const t = pending[i]!;
       try {
-        a.workspace.applyVerifiedPatch();
+        a.attempt.workspace.applyVerifiedPatch();
       } catch (err) {
         discardAll();
         transition(t.id, 'FAILED', 'patch conflict');
@@ -497,7 +488,7 @@ async function executePhase(
         }
         throw err;
       }
-      a.workspace.discard();
+      a.attempt.workspace.discard();
       transition(t.id, 'IMPLEMENTED');
       bus.emit('run.task_done', {
         completedUnits: readPlan(pp.plan).tasks.filter((x) => x.status !== 'PENDING' && x.status !== 'RUNNING').length,
@@ -663,8 +654,8 @@ async function executePhase(
         workspace: null,
         canonical_baseline: null,
       };
-      const smokeAttempt = prepareAttempt(ctx, smokeTask, { canonicalWriteScope: [screenshotScope] });
-      const smokeRes = await dispatch(ctx, smokeAttempt.task, { stage: 'UI_SMOKE' });
+      const smokeHandle = replaceableAttempt(ctx, smokeTask, { canonicalWriteScope: [screenshotScope] }, { stage: 'UI_SMOKE' });
+      const smokeRes = await dispatch(ctx, smokeHandle.attempt.task, { stage: 'UI_SMOKE' }, { prepareReplacement: smokeHandle.prepareReplacement });
       const smoke = UiSmokePayloadSchema.safeParse(smokeRes.payload);
       try {
         if (!smokeRes.ok || !smoke.success || !smoke.data.passed) {
@@ -673,190 +664,35 @@ async function executePhase(
             ...(smoke.success ? [...smoke.data.console_errors, ...smoke.data.network_errors] : []),
           ]);
         }
-        smokeAttempt.workspace.applyVerifiedPatch();
+        smokeHandle.attempt.workspace.applyVerifiedPatch();
       } catch (err) {
         return blocked(ctx, `Phase ${phase.id}: UI smoke violated workspace boundaries.`, [String((err as Error).message)]);
       } finally {
-        smokeAttempt.workspace.discard();
+        smokeHandle.attempt.workspace.discard();
       }
       uiSmokeNote = `passed${smoke.data.screenshot ? ` (screenshot: ${smoke.data.screenshot})` : ''}`;
     }
   }
 
-  // ---- PERSIST: finalize ALL phase artifacts BEFORE the commit, WITHOUT any
-  // self-referencing hash. The C1 code commit contains code + tests + final
-  // phase state; the hash cross-references land in a separate evidence commit
-  // (C2) that may only touch allowed metadata paths.
+  // ---- PERSIST + FINALIZE: transactional, resumable phase finalization (P0.7).
+  // Verification and review have passed. A durable FINALIZING marker now guards
+  // the requirement/roadmap/checkpoint DONE flips and the two-commit-plus-seal
+  // sequence (C1 = code + phase state without self-reference; C2 = evidence
+  // pointing at C1; seal), so a crash between any two steps is always observable
+  // as a clean pre-finalization state (retryable) or a fully DONE-and-committed
+  // phase — never a DONE phase without its commits. See workflows/finalize.ts;
+  // an interrupted finalization is resumed under the lock by reconcileFinalization.
   stage('PERSIST', 'persistindo resumo, evidências e estado');
-  for (const t of readPlan(pp.plan).tasks) {
-    if (t.status === 'VERIFIED') transition(t.id, 'DONE');
-  }
-  const finalPlan = readPlan(pp.plan);
-  writeFileAtomic(
-    pp.verification,
-    serializeFrontmatter(
-      {
-        phase: phase.id,
-        verified_at: now().toISOString(),
-        commands: evidences.map((e) => ({ command: e.command, exit_code: e.exit_code, duration_ms: e.duration_ms })),
-        ui_smoke: uiSmokeNote,
-        tested_commit: null,
-        evidence_commit: null,
-        vcs: ctx.git.status(ctx.projectRoot).isRepo && config.git.commit ? 'git' : 'disabled',
-      },
-      [
-        `# Verification — phase ${phase.id}`,
-        '',
-        ...evidences.map((e) => `- \`${e.command}\` → exit ${e.exit_code}`),
-        '',
-        `UI smoke: ${uiSmokeNote}`,
-        '',
-      ].join('\n'),
-    ),
-  );
-  writeFileAtomic(
-    pp.summary,
-    serializeFrontmatter(
-      { phase: phase.id, completed_at: now().toISOString() },
-      [
-        `# Summary — phase ${phase.id} (${phase.name})`,
-        '',
-        ...finalPlan.tasks.map((t) => `- ${t.done ? '✔' : '✘'} ${t.id} ${t.name}`),
-        '',
-      ].join('\n'),
-    ),
-  );
-  // Requirement completion: DONE only when task, test, review and evidence are
-  // all linked. We only reach here after the review approved; the requirement
-  // records the tests and the verification evidence explicitly.
-  const reqDocFinal = readRequirements(milestone.paths.requirements);
-  const hadEvidence = evidences.length > 0;
-  for (const r of reqDocFinal.requirements) {
-    if (r.phase !== phase.id) continue;
-    const coveringTasks = finalPlan.tasks.filter((t) => t.requirement_ids.includes(r.id) && t.status === 'DONE');
-    if (coveringTasks.length === 0) {
-      // Not implemented by any completed task — never silently mark DONE.
-      r.status = 'BLOCKED';
-      continue;
-    }
-    const tests = coveringTasks.flatMap((t) => t.tests);
-    r.status = 'DONE';
-    r.tests = tests;
-    if (tests.length === 0 && !r.no_test_justification) {
-      const waived = coveringTasks.every((t) => t.no_execution_justification);
-      r.no_test_justification = waived
-        ? `Non-executable work (waiver): ${coveringTasks.map((t) => t.no_execution_justification).join('; ')}`
-        : 'Verified by phase verification commands (no dedicated test declared in plan).';
-    }
-    r.evidence = `VERIFICATION.md + REVIEW.md of phase ${phase.id} (${evidences.length} commands${hadEvidence ? ', all exit 0' : ', waived'}; review approved)`;
-  }
-  writeRequirements(milestone.paths.requirements, reqDocFinal);
-  markPhase('DONE', null);
-  checkpoint('DONE', `Phase ${phase.id} (${phase.name}) verified.`, {
-    task: null,
-    last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
-    next_step: 'rijo run (next phase) or rijo check',
+  return stageFinalization(ctx, {
+    milestone,
+    phase,
+    pp,
+    plan,
+    evidences,
+    uiSmokeNote,
+    phaseBaseline,
+    dirtyAtStart,
   });
-
-  // ---- COMMIT: two-commit model without self-reference.
-  //   C1 (code commit): source changed within task scopes + all phase state,
-  //      with no commit hash recorded anywhere inside it.
-  //   verification already ran against exactly this tree.
-  //   C2 (evidence commit): ONLY the allowed metadata paths, updated to point
-  //      at C1. The C1..C2 range is verified to contain nothing else.
-  let commitHash: string | null = null;
-  const gitStatus = ctx.git.status(ctx.projectRoot);
-  if (config.git.commit && gitStatus.isRepo) {
-    stage('COMMIT', 'commit dos arquivos autorizados da fase verificada');
-    const sourceDelta = diffSnapshots(phaseBaseline, snapshotFiles(ctx.projectRoot));
-    const authorizedSource = sourceDelta.changed.filter((p) => plan.tasks.some((t) => pathInScope(p, t.write_scope)));
-
-    // Pre-existing user edits on the same paths are an explicit conflict —
-    // never silently appropriated into a RIJO commit.
-    const appropriated = authorizedSource.filter((p) => dirtyAtStart.has(p));
-    if (appropriated.length > 0) {
-      return blocked(ctx, `Phase ${phase.id}: files had pre-existing local changes before this phase ran.`, [
-        `Conflicting paths: ${appropriated.join(', ')}`,
-        'Commit or revert your local changes, then re-run the phase.',
-      ]);
-    }
-
-    const rel = (p: string) => path.relative(ctx.projectRoot, p).split(path.sep).join('/');
-    const rijoArtifacts = [
-      pp.spec, pp.plan, pp.summary, pp.review, pp.verification,
-      milestone.paths.requirements, milestone.paths.roadmap,
-      paths.state, paths.manifest, paths.milestonesIndex, paths.stack, paths.decisions,
-    ]
-      .filter(exists)
-      .map(rel);
-    const toCommit = [...new Set([...authorizedSource, ...rijoArtifacts])];
-    commitHash = ctx.git.commitPaths(ctx.projectRoot, `rijo(${milestone.id}-F${phase.id}): ${phase.name} verified`, toCommit);
-    if (!commitHash) {
-      return blocked(ctx, `Phase ${phase.id}: code commit (C1) failed while git commits are enabled.`, [
-        'The verified artifacts are on disk but the phase commit did not complete.',
-      ]);
-    }
-
-    // C2: evidence pointing at C1 — only allowed metadata paths may change.
-    const { data, body } = parseFrontmatter(readText(pp.verification));
-    writeFileAtomic(
-      pp.verification,
-      serializeFrontmatter({ ...(data as Record<string, unknown>), tested_commit: commitHash, evidence_commit: null }, body),
-    );
-    markPhase('DONE', commitHash);
-    checkpoint('DONE', `Phase ${phase.id} (${phase.name}) verified and committed.`, {
-      task: null,
-      last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
-      last_commit: commitHash,
-      next_step: 'rijo run (next phase) or rijo check',
-    });
-    const allowedEvidencePaths = [pp.verification, milestone.paths.roadmap, paths.state, paths.manifest, paths.milestonesIndex]
-      .filter(exists)
-      .map(rel);
-    const evidenceCommit = ctx.git.commitPaths(ctx.projectRoot, `rijo(${milestone.id}-F${phase.id}): evidence for ${commitHash.slice(0, 12)}`, allowedEvidencePaths);
-    if (!evidenceCommit) {
-      return blocked(ctx, `Phase ${phase.id}: evidence commit (C2) failed.`, [
-        `Code commit ${commitHash} exists but its evidence metadata is uncommitted.`,
-      ]);
-    }
-    // Deterministic check: C1..C2 contains ONLY allowed evidence metadata.
-    const rangeFiles = ctx.git.diffNames(ctx.projectRoot, commitHash, evidenceCommit);
-    const illegal = rangeFiles.filter((f) => !allowedEvidencePaths.includes(f));
-    if (illegal.length > 0) {
-      return blocked(ctx, `Phase ${phase.id}: evidence commit touched non-evidence paths.`, illegal);
-    }
-    // Record the evidence commit inside its own file for auditability (this
-    // makes the working file differ from C2 by exactly one known field; it is
-    // folded into the NEXT phase's C1, never left dangling as unknown state).
-    const after = parseFrontmatter(readText(pp.verification));
-    writeFileAtomic(
-      pp.verification,
-      serializeFrontmatter({ ...(after.data as Record<string, unknown>), evidence_commit: evidenceCommit }, after.body),
-    );
-    touchManifest(paths, () => {}, now);
-    const finalCommit = ctx.git.commitPaths(ctx.projectRoot, `rijo(${milestone.id}-F${phase.id}): evidence sealed`, [rel(pp.verification), rel(paths.manifest)]);
-    if (!finalCommit) {
-      return blocked(ctx, `Phase ${phase.id}: evidence seal commit failed.`, []);
-    }
-
-    // The tree must be clean when the phase ends: nothing RIJO touched — and
-    // no canonical .rijo file at all — may remain uncommitted.
-    const endStatus = ctx.git.status(ctx.projectRoot);
-    const rijoDirty = endStatus.dirtyFiles.filter(
-      (f) => f.startsWith('.rijo/') || toCommit.includes(f) || allowedEvidencePaths.includes(f),
-    );
-    if (rijoDirty.length > 0) {
-      return blocked(ctx, `Phase ${phase.id}: tree not clean after commits.`, rijoDirty);
-    }
-  }
-
-  bus.emit('run.phase_done', {
-    status: 'running',
-    stage: 'DONE',
-    lastCheckpoint: commitHash ?? `phase-${phase.id}`,
-    message: `fase ${phase.id} concluída${commitHash ? ` (commit ${commitHash.slice(0, 8)})` : ''}`,
-  });
-  return completed(ctx, `Phase ${phase.id} (${phase.name}) done${commitHash ? `, commit ${commitHash}` : ''}.`);
 }
 
 /**
@@ -885,13 +721,13 @@ async function runRepairAttempt(
     workspace: null,
     canonical_baseline: null,
   };
-  const attempt = prepareAttempt(ctx, repairTask);
+  const handle = replaceableAttempt(ctx, repairTask, {}, { stage: 'EXECUTE' });
   try {
-    const res = await dispatch(ctx, attempt.task, { stage: 'EXECUTE' });
+    const res = await dispatch(ctx, handle.attempt.task, { stage: 'EXECUTE' }, { prepareReplacement: handle.prepareReplacement });
     if (!res.ok) {
       return blocked(ctx, `Phase ${phaseId}: repair worker failed.`, [res.summary]);
     }
-    attempt.workspace.applyVerifiedPatch();
+    handle.attempt.workspace.applyVerifiedPatch();
     return null;
   } catch (err) {
     if (
@@ -904,7 +740,7 @@ async function runRepairAttempt(
     }
     throw err;
   } finally {
-    attempt.workspace.discard();
+    handle.attempt.workspace.discard();
   }
 }
 

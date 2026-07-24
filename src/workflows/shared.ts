@@ -4,6 +4,8 @@ import { AttemptWorkspace, snapshotTree, diffTrees, discardOrphanWorkspaces } fr
 import { reconcileSupervisedTasks } from '../supervisor/recover.js';
 import { canonicalBaselineHash } from '../core/manifest.js';
 import { reconcileTransactions, type TxnHooks } from '../core/txn.js';
+import type { FinalizeHooks } from '../core/finalize.js';
+import { reconcileFinalization } from './finalize.js';
 import { loadConfig } from '../core/config.js';
 import { ProgressBus, consoleSink, newRunId, type ProgressSink } from '../core/progress.js';
 import { acquireLock, RECOMMENDED_RENEW_MS } from '../core/locks.js';
@@ -36,6 +38,8 @@ export interface WorkflowContext {
   shell: ShellRunner;
   git: GitOps;
   now: () => Date;
+  /** Test seam: fault injection at each durable phase-finalization step. */
+  finalizeHooks: FinalizeHooks;
 }
 
 export interface WorkflowDeps {
@@ -52,6 +56,8 @@ export interface WorkflowDeps {
   now?: () => Date;
   /** test seam: fault injection inside milestone transactions. */
   txnHooks?: TxnHooks;
+  /** test seam: fault injection at each durable phase-finalization step. */
+  finalizeHooks?: FinalizeHooks;
 }
 
 export function createContext(projectRoot: string, deps: WorkflowDeps = {}): WorkflowContext {
@@ -85,6 +91,7 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     shell: deps.shell ?? new SystemShellRunner(config.execution),
     git: deps.git ?? new SystemGit(),
     now,
+    finalizeHooks: deps.finalizeHooks ?? {},
   };
 }
 
@@ -189,6 +196,12 @@ export async function withLock<T>(
       ctx.bus.emit('workspace.orphan_discarded', { message: `workspace órfão descartado: ${ws}` }, { workspace: ws });
     }
 
+    // (d) resume an interrupted phase finalization: complete the commit/seal
+    // sequence and flip the phase to a durable DONE, or a strict no-op when no
+    // finalize marker exists. This runs before the body so the next execution
+    // never observes a phase that is DONE-on-disk yet uncommitted.
+    await reconcileFinalization(ctx);
+
     return await body();
   } finally {
     clearInterval(renewTimer);
@@ -215,10 +228,15 @@ export async function dispatch(
   ctx: WorkflowContext,
   task: AgentTaskDraft,
   routing: DispatchRouting = {},
+  options: { prepareReplacement?: SupervisedDispatch['prepareReplacement'] } = {},
 ): Promise<AgentResult> {
   const routed = prepareDispatchedTask(ctx.config, task, routing);
   const full: AgentTask = AgentTaskSchema.parse(routed);
-  return ctx.executor.run({ task: full, role: full.role });
+  return ctx.executor.run({
+    task: full,
+    role: full.role,
+    ...(options.prepareReplacement ? { prepareReplacement: options.prepareReplacement } : {}),
+  });
 }
 
 /**
@@ -231,11 +249,13 @@ export async function dispatchBatch(
   tasks: AgentTaskDraft[],
   max?: number,
   routing?: (task: AgentTaskDraft, index: number) => DispatchRouting,
+  replacement?: (task: AgentTaskDraft, index: number) => SupervisedDispatch['prepareReplacement'],
 ): Promise<AgentResult[]> {
   const reqs: SupervisedDispatch[] = tasks.map((t, i) => {
     const routed = prepareDispatchedTask(ctx.config, t, routing ? routing(t, i) : {});
     const full: AgentTask = AgentTaskSchema.parse(routed);
-    return { task: full, role: full.role };
+    const prep = replacement?.(t, i);
+    return { task: full, role: full.role, ...(prep ? { prepareReplacement: prep } : {}) };
   });
   return ctx.executor.runBatch(reqs, max ?? ctx.config.limits.max_parallel_agents);
 }
@@ -278,6 +298,52 @@ export function prepareAttempt(
     canonical_baseline: baseline,
   };
   return { task: remapped, workspace };
+}
+
+/**
+ * An attempt handle whose workspace is REBUILT for every replacement
+ * generation: the supervisor calls `prepareReplacement` after fencing a failed
+ * generation, and the handle swaps `attempt` to a brand-new routed task in a
+ * brand-new isolated workspace. The caller always validates/applies
+ * `handle.attempt` — the winning generation — never a fenced one.
+ */
+export interface ReplaceableAttempt {
+  /** The attempt of the LATEST generation (the one applied on success). */
+  attempt: Attempt;
+  /** Factory handed to the executor: fresh routed task + fresh workspace per replacement. */
+  prepareReplacement: NonNullable<SupervisedDispatch['prepareReplacement']>;
+}
+
+export function replaceableAttempt(
+  ctx: WorkflowContext,
+  draft: AgentTaskDraft,
+  opts: { canonicalWriteScope?: string[] } = {},
+  routing: DispatchRouting = {},
+): ReplaceableAttempt {
+  const handle: ReplaceableAttempt = {
+    attempt: prepareAttempt(ctx, draft, opts),
+    prepareReplacement: (_generation, _previousFailure) => {
+      // A fenced generation's workspace is never reused. Re-route the ORIGINAL
+      // draft (same deterministic profile routing as the first dispatch) and
+      // isolate it in a brand-new workspace against the current baseline.
+      const routed = prepareDispatchedTask(ctx.config, draft, routing);
+      const fresh = prepareAttempt(ctx, routed, opts);
+      handle.attempt = fresh;
+      return {
+        task: fresh.task,
+        dispose: () => {
+          // Called only when THIS generation is abandoned (replaced again,
+          // exhausted or externally stopped) — never after success.
+          try {
+            fresh.workspace.discard();
+          } catch {
+            /* already discarded */
+          }
+        },
+      };
+    },
+  };
+  return handle;
 }
 
 /**
