@@ -308,14 +308,34 @@ export async function newWorkflow(
         acceptance_criteria: ['Every volatile claim has source title, url, check date and version'],
         verification_commands: [],
         return_format:
-          'JSON payload: {summary: string, sources: [{claim, source, url, checked_at, version, confidence}]}',
+          'JSON payload: {summary: string, sources: [{claim, source, url, checked_at, version, confidence, tier: official|advisory|secondary}]}. tier=official for official docs/registries, advisory for primary security advisories.',
         notes: '',
       }));
       const results = await dispatchBatch(ctx, tasks);
+      const waivers = new Map(config.research.waivers.map((w) => [w.key, w.reason]));
       for (let i = 0; i < results.length; i++) {
         const r = results[i]!;
         const topic = toResearch[i]!;
-        if (!r.ok) continue;
+        const waiver = waivers.get(topic.key);
+        const failClosed = (reason: string): WorkflowOutcome | null => {
+          if (!topic.volatile || !config.research.fail_closed) {
+            decisions.push(`Research "${topic.topic}": ${reason}; recorded as an open gap (non-volatile or fail-closed disabled).`);
+            return null;
+          }
+          if (waiver) {
+            decisions.push(`Research waiver for "${topic.topic}" (${reason}). Auditable justification: ${waiver}`);
+            return null;
+          }
+          return blocked(ctx, `Volatile research "${topic.topic}" failed closed: ${reason}.`, [
+            'A volatile decision (stack, version, security, compatibility) requires an official source or primary advisory.',
+            `Add sources, or record an auditable waiver in .rijo/config.yml (research.waivers: [{key: "${topic.key}", reason: "…"}]).`,
+          ]);
+        };
+        if (!r.ok) {
+          const out = failClosed('researcher failed to produce a result');
+          if (out) return out;
+          continue;
+        }
         const payload = z
           .object({
             summary: z.string(),
@@ -328,13 +348,15 @@ export async function newWorkflow(
                   checked_at: z.string().default(now().toISOString()),
                   version: z.string().nullable().default(null),
                   confidence: z.enum(['high', 'medium', 'low']).default('medium'),
+                  tier: z.enum(['official', 'advisory', 'secondary']).default('secondary'),
                 }),
               )
               .default([]),
           })
           .safeParse(r.payload);
         if (!payload.success) {
-          decisions.push(`Research for "${topic.topic}" returned an unparseable result; proceeding with a conservative assumption (revalidate before production).`);
+          const out = failClosed('researcher returned an unparseable result');
+          if (out) return out;
           continue;
         }
         for (const s of payload.data.sources) {
@@ -347,16 +369,22 @@ export async function newWorkflow(
           volatile: topic.volatile,
           sources: payload.data.sources.map((s) => s.url),
         });
-        // Wire the volatile-source rule into the main path: a volatile decision
-        // with no verifiable source is recorded as an auditable assumption
-        // rather than silently trusted.
+        // Fail-closed rule on the main path: a volatile decision without a
+        // fresh official/advisory source blocks (or requires an auditable
+        // waiver) — lack of research is never converted into an assumption.
         if (topic.volatile) {
           const verdict = store.validateVolatileDecision(topic.topic, payload.data.sources.map((s) => s.url));
           if (!verdict.valid) {
-            decisions.push(`Volatile research "${topic.topic}" lacks a verifiable source (${verdict.reason}); proceeding with a conservative assumption (revalidate before production).`);
+            const out = failClosed(verdict.reason ?? 'no valid source');
+            if (out) return out;
           }
         }
         researchSummaries.push(`- ${topic.topic}: ${payload.data.summary}`);
+      }
+      // long-project hygiene: keep sources.json bounded, archive the oldest
+      const compacted = store.compactSources(config.research.max_sources);
+      if (compacted.archived > 0) {
+        bus.emit('research.compacted', { message: `${compacted.archived} fontes arquivadas em ${path.basename(compacted.archiveFile!)}` });
       }
     }
 

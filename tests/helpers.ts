@@ -155,6 +155,7 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
                 checked_at: '2026-07-23T00:00:00.000Z',
                 version: '24.x',
                 confidence: 'high',
+                tier: 'official',
               },
             ],
           },

@@ -51,16 +51,23 @@ export class ResearchStore {
 
   /**
    * Returns a valid cache entry, or null when research is needed.
-   * Non-volatile facts never expire; volatile ones expire after the TTL.
+   * Non-volatile facts never expire; volatile ones expire after the TTL — an
+   * expired entry NEVER looks current (use lookupWithMeta for its remains).
    */
   lookup(key: string): CacheEntry | null {
+    const meta = this.lookupWithMeta(key);
+    return meta && !meta.expired ? meta.entry : null;
+  }
+
+  /** The raw entry plus an explicit expiry flag (an expired fact is history, not truth). */
+  lookupWithMeta(key: string): { entry: CacheEntry; expired: boolean } | null {
     const entry = this.readCache().find((e) => e.key === key);
     if (!entry) return null;
     if (entry.volatile) {
       const ageDays = (this.now().getTime() - Date.parse(entry.checked_at)) / 86400000;
-      if (ageDays > VOLATILE_TTL_DAYS) return null;
+      if (ageDays > VOLATILE_TTL_DAYS) return { entry, expired: true };
     }
-    return entry;
+    return { entry, expired: false };
   }
 
   store(entry: Omit<CacheEntry, 'checked_at'>): CacheEntry {
@@ -73,17 +80,44 @@ export class ResearchStore {
 
   /**
    * A volatile decision (version pick, security posture, compatibility claim)
-   * must cite at least one source with url and checked_at.
+   * must cite at least one registered, FRESH source from an official page or a
+   * primary advisory. Anything less fails closed — never a silent assumption.
    */
   validateVolatileDecision(claim: string, sourceUrls: string[]): { valid: boolean; reason?: string } {
     if (sourceUrls.length === 0) {
       return { valid: false, reason: `Volatile decision "${claim}" has no verifiable source` };
     }
-    const known = new Set(this.readSources().map((s) => s.url));
+    const known = new Map(this.readSources().map((s) => [s.url, s]));
     const missing = sourceUrls.filter((u) => !known.has(u));
     if (missing.length > 0) {
       return { valid: false, reason: `Sources not registered in sources.json: ${missing.join(', ')}` };
     }
+    const cited = sourceUrls.map((u) => known.get(u)!);
+    const fresh = cited.filter((s) => (this.now().getTime() - Date.parse(s.checked_at)) / 86400000 <= VOLATILE_TTL_DAYS);
+    if (fresh.length === 0) {
+      return { valid: false, reason: `All cited sources for "${claim}" are stale (older than ${VOLATILE_TTL_DAYS} days)` };
+    }
+    if (!fresh.some((s) => s.tier === 'official' || s.tier === 'advisory')) {
+      return { valid: false, reason: `Volatile decision "${claim}" cites no official documentation or primary advisory` };
+    }
     return { valid: true };
+  }
+
+  /**
+   * Long-project hygiene: when sources.json exceeds maxSources, the oldest
+   * entries are moved to a timestamped archive file. The active file keeps the
+   * newest facts; archives are never consulted as current truth.
+   */
+  compactSources(maxSources: number): { archived: number; archiveFile: string | null } {
+    const sources = this.readSources();
+    if (sources.length <= maxSources) return { archived: 0, archiveFile: null };
+    const sorted = [...sources].sort((a, b) => Date.parse(a.checked_at) - Date.parse(b.checked_at));
+    const toArchive = sorted.slice(0, sources.length - maxSources);
+    const keep = sorted.slice(sources.length - maxSources);
+    const stamp = this.now().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+    const archiveFile = this.paths.researchSources.replace(/sources\.json$/, `sources-archive-${stamp}.json`);
+    writeJsonAtomic(archiveFile, SourcesFileSchema.parse({ sources: toArchive }));
+    writeJsonAtomic(this.paths.researchSources, SourcesFileSchema.parse({ sources: keep }));
+    return { archived: toArchive.length, archiveFile };
   }
 }

@@ -341,6 +341,8 @@ export const SourceSchema = z.object({
   checked_at: z.string(),
   version: z.string().nullable().default(null),
   confidence: z.enum(['high', 'medium', 'low']),
+  /** provenance tier: volatile decisions require official docs or a primary advisory. */
+  tier: z.enum(['official', 'advisory', 'secondary']).default('secondary'),
   used_by: z.array(z.string()).default([]),
 });
 export type ResearchSource = z.infer<typeof SourceSchema>;
