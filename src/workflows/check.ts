@@ -248,7 +248,9 @@ function runDeterministicChecks(ctx: WorkflowContext): CommandEvidence[] {
       const hasPlaywright = Boolean(pkg.devDependencies?.['@playwright/test'] || pkg.dependencies?.['@playwright/test']);
       const hasConfig = ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs'].some((f) => exists(path.join(ctx.projectRoot, f)));
       if (hasPlaywright && hasConfig && ctx.runner.capabilities.browser) {
-        commands.push('npx playwright test');
+        // locally installed binary (node_modules/.bin is on the reconstructed
+        // PATH) — never npx, which could download an arbitrary package.
+        commands.push('playwright test');
       }
       commands.push('npm audit --omit=dev --audit-level=high');
     } catch {

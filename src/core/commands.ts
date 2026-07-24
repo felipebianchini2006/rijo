@@ -1,6 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import * as path from 'node:path';
 import { redact } from '../security/redact.js';
+import { planCommand } from '../security/execpolicy.js';
+import { ExecutionConfigSchema, type ExecutionConfig } from './schemas/index.js';
 
 export type CommandCategory =
   | 'test'
@@ -20,10 +22,23 @@ export interface CommandEvidence {
   /** true when the command policy refused to run it (never a repairable failure). */
   blocked: boolean;
   category: CommandCategory;
+  /** which sandbox actually ran the command (evidence-log requirement). */
+  sandbox?: string;
+  /** trust classification applied by the execution policy. */
+  trust?: string;
+  /** effective network policy applied. */
+  network?: string;
+}
+
+export interface ShellRunOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  /** dependency installation requires this explicit flag (gate-managed). */
+  allowInstall?: boolean;
 }
 
 export interface ShellRunner {
-  run(command: string, opts?: { cwd?: string; timeoutMs?: number }): CommandEvidence;
+  run(command: string, opts?: ShellRunOptions): CommandEvidence;
 }
 
 const SUMMARY_LIMIT = 2000;
@@ -36,7 +51,10 @@ const EXIT_BLOCKED = 126;
  * so an agent cannot smuggle `git push`/`git remote` through a test command.
  */
 const ALLOWED_EXECUTABLES = new Set([
-  'npm', 'pnpm', 'yarn', 'npx', 'bun', 'node', 'deno',
+  // npx/dlx are deliberately ABSENT: they download and execute arbitrary
+  // registry packages. Locally installed binaries resolve via the
+  // reconstructed PATH (node_modules/.bin) instead.
+  'npm', 'pnpm', 'yarn', 'bun', 'node', 'deno',
   'tsc', 'vitest', 'jest', 'mocha', 'ava', 'playwright',
   'eslint', 'prettier', 'biome',
   'python', 'python3', 'pytest', 'ruff', 'mypy',
@@ -49,7 +67,6 @@ const DENIED_SUBCOMMANDS: Record<string, Set<string>> = {
   pnpm: new Set(['publish', 'login', 'add-user']),
   yarn: new Set(['publish', 'login']),
   bun: new Set(['publish', 'login']),
-  npx: new Set([]),
   cargo: new Set(['publish', 'login', 'owner', 'yank']),
   go: new Set([]),
 };
@@ -118,25 +135,42 @@ export function evaluateCommand(raw: string): CommandDecision {
 }
 
 /**
- * Real command runner. Never uses a shell: the command is parsed, validated
- * against the policy, and executed as executable + args with shell:false.
- * Rejected commands return a blocked evidence record (exit 126) instead of
- * running — callers treat that as BLOCKED, not a repairable failure.
+ * Real command runner. Never uses a shell: the command line is parsed,
+ * validated by the string policy AND the capability policy (trust, network,
+ * env reconstruction, cwd containment, OS sandbox), then executed as
+ * executable + args with shell:false. Repository code runs inside the native
+ * sandbox; when none is available and the policy requires one, the command is
+ * BLOCKED (exit 126) — there is no unsafe fallback.
  */
 export class SystemShellRunner implements ShellRunner {
-  run(command: string, opts: { cwd?: string; timeoutMs?: number } = {}): CommandEvidence {
-    const decision = evaluateCommand(command);
-    if (!decision.ok) {
-      return { command, exit_code: EXIT_BLOCKED, summary: `blocked by command policy: ${decision.reason}`, duration_ms: 0, blocked: true, category: decision.category };
+  constructor(private readonly execConfig: ExecutionConfig = ExecutionConfigSchema.parse({})) {}
+
+  run(command: string, opts: ShellRunOptions = {}): CommandEvidence {
+    const plan = planCommand(command, {
+      cwd: opts.cwd ?? process.cwd(),
+      config: this.execConfig,
+      allowInstall: opts.allowInstall,
+    });
+    if (!plan.ok) {
+      const decision = evaluateCommand(command);
+      return {
+        command,
+        exit_code: EXIT_BLOCKED,
+        summary: `blocked by execution policy: ${plan.reason}`,
+        duration_ms: 0,
+        blocked: true,
+        category: decision.ok ? decision.category : 'custom',
+        sandbox: 'blocked',
+      };
     }
     const started = Date.now();
-    const result = spawnSync(decision.executable, decision.args, {
+    const result = spawnSync(plan.spawn.executable, plan.spawn.args, {
       shell: false,
-      cwd: opts.cwd,
-      timeout: opts.timeoutMs ?? 10 * 60 * 1000,
+      cwd: plan.command.cwd,
+      timeout: opts.timeoutMs ?? plan.command.timeoutMs,
       encoding: 'utf8',
       maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, npm_config_yes: 'true' },
+      env: plan.env,
     });
     const out = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
     const tail = out.length > SUMMARY_LIMIT ? `…${out.slice(-SUMMARY_LIMIT)}` : out;
@@ -146,7 +180,10 @@ export class SystemShellRunner implements ShellRunner {
       summary: redact(tail),
       duration_ms: Date.now() - started,
       blocked: false,
-      category: decision.category,
+      category: plan.command.category,
+      sandbox: plan.sandbox,
+      trust: plan.command.trust,
+      network: plan.command.network,
     };
   }
 }

@@ -38,13 +38,14 @@ export interface WorkflowDeps {
 export function createContext(projectRoot: string, deps: WorkflowDeps = {}): WorkflowContext {
   const paths = new RijoPaths(projectRoot);
   const now = deps.now ?? (() => new Date());
+  const config = loadConfig(paths);
   return {
     projectRoot,
     paths,
-    config: loadConfig(paths),
+    config,
     bus: new ProgressBus(paths, newRunId(now), deps.sink ?? consoleSink, now),
     runner: deps.runner ?? new UnboundAgentRunner(),
-    shell: deps.shell ?? new SystemShellRunner(),
+    shell: deps.shell ?? new SystemShellRunner(config.execution),
     git: deps.git ?? new SystemGit(),
     now,
   };

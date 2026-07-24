@@ -28,9 +28,14 @@ describe('command policy', () => {
     }
   });
   it('allows normal verification commands', () => {
-    for (const cmd of ['npm run build', 'npm test', 'npx vitest run', 'npm run typecheck', 'npx playwright test']) {
+    for (const cmd of ['npm run build', 'npm test', 'vitest run', 'npm run typecheck', 'playwright test']) {
       expect(evaluateCommand(cmd).ok, cmd).toBe(true);
     }
+  });
+
+  it('blocks npx entirely (arbitrary package download/execution)', () => {
+    expect(evaluateCommand('npx cowsay hello').ok).toBe(false);
+    expect(evaluateCommand('npx playwright test').ok).toBe(false);
   });
   it('rejects path-qualified executables (traversal)', () => {
     expect(evaluateCommand('../evil.sh').ok).toBe(false);
