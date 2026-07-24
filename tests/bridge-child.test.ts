@@ -214,7 +214,10 @@ describe('host↔core JSON-RPC bridge (real child process)', () => {
 
   beforeAll(() => {
     // Build the CLI so dist/cli/index.js is current; idempotent and CI-safe.
-    execFileSync('npm', ['run', 'build'], { cwd: repoRoot, stdio: 'pipe' });
+    // tsc is invoked through the current Node binary — spawning "npm" fails on
+    // Windows (.cmd shim, ENOENT without a shell).
+    const tsc = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
+    execFileSync(process.execPath, [tsc, '-p', path.join(repoRoot, 'tsconfig.json')], { cwd: repoRoot, stdio: 'pipe' });
     expect(fs.existsSync(cliEntry)).toBe(true);
   }, 120_000);
 

@@ -50,6 +50,17 @@ export class SystemGit implements GitOps {
   }
 
   /**
+   * Commits need an author identity; environments without a configured
+   * user.email (fresh CI runners, containers) get a per-invocation RIJO
+   * fallback via `-c` — an existing user identity is never overridden.
+   */
+  private identityArgs(cwd: string): string[] {
+    const email = git(cwd, ['config', 'user.email']);
+    if (email.code === 0 && email.out) return [];
+    return ['-c', 'user.name=RIJO', '-c', 'user.email=rijo@localhost'];
+  }
+
+  /**
    * Stage the exact paths given (and nothing else) and commit them. Pre-existing
    * unrelated changes in the working tree are left untouched, so an automatic
    * commit can never sweep in the user's own edits.
@@ -59,12 +70,12 @@ export class SystemGit implements GitOps {
     // stage each path explicitly; -A/. are deliberately never used
     if (git(cwd, ['add', '--', ...paths]).code !== 0) return null;
     // commit only the staged index for these paths
-    if (git(cwd, ['commit', '-m', message, '--', ...paths]).code !== 0) return null;
+    if (git(cwd, [...this.identityArgs(cwd), 'commit', '-m', message, '--', ...paths]).code !== 0) return null;
     return this.headCommit(cwd);
   }
 
   tag(cwd: string, name: string, message: string): boolean {
-    return git(cwd, ['tag', '-a', name, '-m', message]).code === 0;
+    return git(cwd, [...this.identityArgs(cwd), 'tag', '-a', name, '-m', message]).code === 0;
   }
 
   init(cwd: string): boolean {

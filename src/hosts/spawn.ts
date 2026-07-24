@@ -50,6 +50,8 @@ export const nodeSpawner: Spawner = (req) =>
     let settled = false;
 
     const child = spawn(req.command, req.args, {
+      // Windows CLIs (claude/codex) install as .cmd shims: shell required there
+      shell: process.platform === 'win32',
       cwd: req.cwd,
       env: req.env ?? process.env,
       stdio: ['pipe', 'pipe', 'pipe'],

@@ -63,8 +63,11 @@ function browserInstalled(browser: string): boolean {
   return fs.readdirSync(cache).some((d) => d.startsWith(`${browser}-`) || d.startsWith(`${browser}_headless_shell-`));
 }
 
+/** Windows needs a shell to resolve/execute .cmd shims (npm, playwright). */
+const WIN_SHELL = process.platform === 'win32';
+
 function toolVersion(bin: string, args: string[], cwd?: string): string {
-  const r = spawnSync(bin, args, { encoding: 'utf8', cwd, shell: false });
+  const r = spawnSync(bin, args, { encoding: 'utf8', cwd, shell: WIN_SHELL });
   return r.status === 0 ? (r.stdout ?? '').trim() : 'unavailable';
 }
 
@@ -220,7 +223,7 @@ export async function runProductionGate(
       encoding: 'utf8',
       timeout: config.execution.command_timeout_ms,
       maxBuffer: 32 * 1024 * 1024,
-      shell: false,
+      shell: WIN_SHELL,
     });
     commands.push({
       command: 'playwright test (gate, RIJO-generated specs)',

@@ -202,8 +202,13 @@ export function planCommand(raw: string, opts: PlanCommandOptions): CommandPlan 
     return { ok: false, reason: `cwd does not exist: ${resolvedCwd}`, disposition: 'BLOCKED' };
   }
 
-  const { trust, network } = classify(executable, args);
-  const effectiveNetwork: NetworkPolicy = isInstall ? 'enabled' : trust === 'known-script' ? network : opts.config.network_default;
+  const classified = classify(executable, args);
+  // A gate-approved install ALWAYS runs with --ignore-scripts (appended
+  // below), so no repository code executes — only the package manager itself.
+  // That makes it known-script: it needs the network, not an OS sandbox, and
+  // works identically on hosts without one (Linux/Windows runners).
+  const trust: CommandTrust = isInstall ? 'known-script' : classified.trust;
+  const effectiveNetwork: NetworkPolicy = isInstall ? 'enabled' : trust === 'known-script' ? classified.network : opts.config.network_default;
 
   let finalArgs = args;
   if (isInstall) {

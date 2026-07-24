@@ -28,7 +28,8 @@ export interface TxnHooks {
 }
 
 function fsyncFile(p: string): void {
-  const fd = fs.openSync(p, 'r');
+  // 'r+': Windows refuses fsync on a read-only descriptor (EPERM)
+  const fd = fs.openSync(p, 'r+');
   try {
     fs.fsyncSync(fd);
   } finally {

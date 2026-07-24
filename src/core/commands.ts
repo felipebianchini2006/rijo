@@ -164,8 +164,12 @@ export class SystemShellRunner implements ShellRunner {
       };
     }
     const started = Date.now();
+    // Windows: npm/tsc/etc. are .cmd shims that Node refuses to spawn without
+    // a shell (EINVAL) and cannot resolve otherwise (ENOENT). The raw command
+    // already passed the metacharacter gate, so the shell adds resolution,
+    // not expressiveness. Every other platform stays shell-free.
     const result = spawnSync(plan.spawn.executable, plan.spawn.args, {
-      shell: false,
+      shell: process.platform === 'win32',
       cwd: plan.command.cwd,
       timeout: opts.timeoutMs ?? plan.command.timeoutMs,
       encoding: 'utf8',
