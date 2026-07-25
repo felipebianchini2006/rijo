@@ -535,6 +535,14 @@ export class Supervisor {
 
         const req = await this.raceDeadline(this.controller.requestCancel(handle, reason), this.config.cancel_grace_ms);
         let acknowledged = req.outcome === 'value' && req.value.acknowledged;
+        // Durable audit of the graceful step: the receipt detail records HOW the
+        // group died (e.g. a SIGTERM-ignoring child forced an in-step escalation
+        // to a group SIGKILL) — evidence that would otherwise only live in memory.
+        this.store.emit(st.record.logical_task_id, 'cancel_receipt', {
+          acknowledged,
+          detail: req.outcome === 'value' ? req.value.detail ?? null : `no receipt within ${this.config.cancel_grace_ms}ms`,
+          reason,
+        });
 
         if (!acknowledged && this.controller.forceTerminate) {
           const term = await this.raceDeadline(

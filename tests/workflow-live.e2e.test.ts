@@ -119,7 +119,10 @@ describe('LIVE full-workflow E2E (Claude)', () => {
       // Shim + its state directory (counter + recorded pids) live outside the fixture.
       const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-wf-b-shim-'));
       const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-wf-b-state-'));
-      writeClaudeShim(shimDir);
+      // The host env is a strict allowlist now (security hardening): custom
+      // variables never reach a spawned host process. The shim therefore gets
+      // its configuration BAKED IN as literals instead of via environment.
+      writeClaudeShim(shimDir, realClaude, stateDir);
 
       try {
         // Single turnkey `new --run` (like Scenario A) with the `claude` shim
@@ -133,8 +136,6 @@ describe('LIVE full-workflow E2E (Claude)', () => {
         const runEnv: NodeJS.ProcessEnv = {
           ...process.env,
           PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
-          RIJO_REAL_CLAUDE: realClaude,
-          RIJO_SHIM_STATE: stateDir,
         };
         const run = runRijo(fixture, ['new', '@PLANO.md', '--host', 'claude', '--run'], {
           env: runEnv,
@@ -150,11 +151,20 @@ describe('LIVE full-workflow E2E (Claude)', () => {
           expect(() => process.kill(pid, 0), `pid ${pid} from the stalled gen-1 tree must be dead`).toThrow();
         }
 
-        // ---- Receipts prove the chain: cancellation ladder → force terminate →
-        // replacement → a generation-2 SUCCEEDED.
+        // ---- Receipts prove the chain: cancellation with a PROVEN dead group →
+        // replacement → a generation-2 SUCCEEDED. Since the group-proof cancel,
+        // a SIGTERM-ignoring child is SIGKILLed inside the graceful step itself
+        // (audited in the cancel_receipt detail); the separate force_terminated
+        // rung only fires when that in-step escalation could not confirm death.
         const events = fs.readFileSync(taskEventsPath(fixture), 'utf8');
         expect(events, 'no CANCELLING transition recorded').toContain('CANCELLING');
-        expect(events, 'no force-terminate receipt recorded').toContain('force_terminated');
+        const inStepGroupKill =
+          events.includes('"cancel_receipt"') && events.includes('SIGKILL cleared the whole group');
+        const separateForceRung = events.includes('force_terminated');
+        expect(
+          inStepGroupKill || separateForceRung,
+          'no hard-kill evidence: neither a group-clearing cancel_receipt nor a force_terminated event was recorded',
+        ).toBe(true);
         expect(events, 'no REPLACING transition recorded').toContain('REPLACING');
         assertNoSecrets(events);
 
@@ -207,15 +217,17 @@ function readShimPids(stateDir: string): number[] {
  * SIGTERM and hangs — never printing a fabricated result. See the file header
  * for why this is a legitimate, non-fabricating stall injector.
  */
-function writeClaudeShim(shimDir: string): void {
+function writeClaudeShim(shimDir: string, realClaude: string, stateDir: string): void {
   const shim = `#!/usr/bin/env node
 'use strict';
 const fs = require('fs');
 const path = require('path');
 const { spawnSync, spawn } = require('child_process');
 
-const REAL = process.env.RIJO_REAL_CLAUDE;
-const STATE = process.env.RIJO_SHIM_STATE;
+// Baked-in configuration: the supervised host process receives a minimal
+// allowlisted environment, so the shim cannot rely on custom env vars.
+const REAL = ${JSON.stringify(realClaude)};
+const STATE = ${JSON.stringify(stateDir)};
 const argv = process.argv.slice(2);
 const joined = argv.join('\\n');
 
