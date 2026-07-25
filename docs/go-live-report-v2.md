@@ -146,3 +146,17 @@ scenarioB-rerun.log  — Scenario B isolated re-run from the clean clone: PASS
 ci-run.json          — CI 30135389766 (5/5 success) snapshot
 sbom.cdx.json        — CycloneDX 1.5 SBOM
 ```
+
+## Addendum — Codex live cleared (2026-07-25)
+
+The account quota reset. On the certified security commit (`6730be6`, no other
+change), both Codex live gates were executed fresh:
+
+| Gate | Result |
+|---|---|
+| Driver E2E (`RIJO_LIVE_E2E=1`, real `codex exec`, gpt-5.6) | **PASSED** — parsed AgentResult in 35.1s |
+| Full turnkey workflow (`RIJO_LIVE_CODEX_E2E=1`): tarball → clean fixture → `rijo new @PLANO.md --host codex --run` | **PASSED** in 384s — a real phase finalized end-to-end (not a quota skip) |
+
+With the same flow now proven live on BOTH hosts, the sole open criterion is
+closed and the verdict lifts from `READY_CLAUDE_ONLY` to **`READY`**. Codex is
+no longer experimental. Nothing was published to npm.
