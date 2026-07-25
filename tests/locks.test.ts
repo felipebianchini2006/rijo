@@ -263,20 +263,42 @@ describe('withLock', () => {
     const renewMs = 40;
     const lockPath = ctx.paths.lock;
 
-    let sawUnexpired = false;
+    let heldByThisRun = false;
+    let renewedBeyondInitial = false;
+    let unexpiredAfterRenewal = false;
     await withLock(
       ctx,
       async () => {
+        const initialExpiry = Date.parse(
+          (JSON.parse(fs.readFileSync(lockPath, 'utf8')) as LockInfo).expires_at,
+        );
         // Wait well past the raw TTL — only the background renewal can keep the lease alive.
         await sleep(ttlMs * 4);
-        const onDisk = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as LockInfo;
-        sawUnexpired = Date.parse(onDisk.expires_at) > Date.now();
+        // A single instantaneous read is timing-fragile on a loaded CI runner
+        // (the renew interval can be delayed past the raw TTL at any one
+        // instant). What the lease contract guarantees is that renewal KEEPS
+        // extending expires_at while the body runs — so poll briefly for an
+        // extension beyond the initial expiry AND an unexpired lease.
+        const deadline = Date.now() + 2_000;
+        while (Date.now() < deadline) {
+          const onDisk = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as LockInfo;
+          heldByThisRun = onDisk.run_id === ctx.bus.runId;
+          const expiry = Date.parse(onDisk.expires_at);
+          if (expiry > initialExpiry) renewedBeyondInitial = true;
+          if (renewedBeyondInitial && expiry > Date.now()) {
+            unexpiredAfterRenewal = true;
+            break;
+          }
+          await sleep(20);
+        }
         return null;
       },
       { ttlMs, renewMs },
     );
 
-    expect(sawUnexpired).toBe(true);
+    expect(heldByThisRun).toBe(true);
+    expect(renewedBeyondInitial).toBe(true);
+    expect(unexpiredAfterRenewal).toBe(true);
     // released cleanly at the end
     expect(fs.existsSync(lockPath)).toBe(false);
   });
