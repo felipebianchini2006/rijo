@@ -1,0 +1,32 @@
+
+ RUN  v3.2.7 /private/tmp/claude-501/-Users-felipebianchini-Developer-rijo--claude-worktrees-rijo-alpha-release-candidate-77c9eb/3d1e0b8f-3030-4622-aac2-a238d35e82fa/scratchpad/golive-v2/clone
+
+
+> rijo@0.1.0-alpha.1 prepack
+> npm run build
+
+
+> rijo@0.1.0-alpha.1 build
+> tsc -p tsconfig.json
+
+ ✓ tests/workflow-live.e2e.test.ts (2 tests | 1 skipped) 299898ms
+   ✓ LIVE full-workflow E2E (Claude) > Scenario B — a real stalled generation is whole-tree killed and a fresh generation completes  298389ms
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 1 skipped (2)
+   Start at  21:17:21
+   Duration  300.15s (transform 35ms, setup 0ms, collect 85ms, tests 299.90s, environment 0ms, prepare 30ms)
+

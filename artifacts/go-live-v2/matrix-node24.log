@@ -1,0 +1,24 @@
+=== npm ci ===
+npm warn allow-scripts Run `npm approve-scripts --allow-scripts-pending` to review, or `npm approve-scripts <pkg>` to allow.
+exit:0
+=== typecheck ===
+
+exit:0
+=== test (node24) ===
+      Tests  418 passed | 7 skipped (425)
+   Start at  20:59:06
+   Duration  51.97s (transform 781ms, setup 0ms, collect 3.09s, tests 359.08s, environment 4ms, prepare 1.36s)
+
+exit:0
+=== build ===
+
+exit:0
+=== pack ===
+rijo-0.1.0-alpha.1.tgz
+exit:0
+9d77172d990817bf03002bb8efe41389ff9117af8c216c84ccbec0fca5b096c9  rijo-0.1.0-alpha.1.tgz
+=== audit ===
+found 0 vulnerabilities
+exit:0
+=== sbom ===
+exit:0

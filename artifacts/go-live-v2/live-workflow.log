@@ -1,0 +1,26 @@
+=== LIVE full-workflow E2E (clean clone, real Claude) ===
+    142|         });
+    143|         expect(run.status, `rijo new --run did not exit 0 after replac…
+       |                                                                                                 ^
+    144| 
+    145|         // ---- The stalled generation-1 process tree (shim + child + …
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)
+   Start at  21:00:22
+   Duration  929.03s (transform 22ms, setup 0ms, collect 58ms, tests 928.88s, environment 0ms, prepare 25ms)
+
+exit:0
+=== LIVE Codex workflow E2E (gated) ===
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+
+ Test Files  1 passed (1)
+      Tests  1 skipped (1)
+   Start at  21:15:51
+   Duration  34.53s (transform 31ms, setup 0ms, collect 59ms, tests 34.32s, environment 0ms, prepare 36ms)
+
+exit:0

@@ -1,0 +1,6 @@
+Certification round: 2026-07-24 (v2 — correction cycle P0.1..P0.10)
+Certified commit: 0a7ef0b (HEAD, branch dev/rijo-alpha-release-candidate-77c9eb)
+Clean-clone matrix + live E2E executed at: 029a1ea (delta to 0a7ef0b: tests/locks.test.ts only — test hardening, no product change; revalidated by CI 30135389766 at 0a7ef0b)
+Host: macOS 26.5.2 arm64 | Node 24.18.0 + 22.23.1 | npm 11.16.0 | git 2.55.0
+Claude Code CLI: 2.1.218 (Claude Code)
+Codex CLI: codex-cli 0.146.0-alpha.3.1 (quota-blocked until 2026-07-28 14:04)

@@ -1,0 +1,15 @@
+=== npm ci (n22) ===
+found 0 vulnerabilities
+exit:0
+=== typecheck (n22) ===
+> tsc -p tsconfig.json --noEmit
+exit:0
+=== test (n22) ===
+      Tests  418 passed | 7 skipped (425)
+   Start at  21:00:34
+   Duration  51.45s (transform 1.15s, setup 0ms, collect 3.54s, tests 352.91s, environment 4ms, prepare 1.39s)
+
+exit:0
+=== build (n22) ===
+> tsc -p tsconfig.json
+exit:0
