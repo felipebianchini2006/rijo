@@ -12,7 +12,14 @@ export interface ProcessLaunch {
   command: string;
   args: string[];
   cwd: string;
+  /**
+   * The COMPLETE environment for the child, reconstructed from an allowlist
+   * (see security/hostEnv.ts). Callers must always set it: an absent env means
+   * "minimal environment", never "inherit the operator's whole shell".
+   */
   env?: NodeJS.ProcessEnv;
+  /** NAMES ONLY of the ambient variables withheld from `env`. Never values. */
+  envWithheld?: readonly string[];
   input?: string;
 }
 

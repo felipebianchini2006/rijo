@@ -20,6 +20,12 @@ export interface HostAttemptHandle {
   thread_id?: string | null;
   turn_id?: string | null;
   process_id?: number | null;
+  /**
+   * NAMES ONLY of the ambient environment variables withheld from this attempt's
+   * host process (see security/hostEnv.ts). Recorded so the filtering is
+   * auditable; values are never captured, so this is safe to log.
+   */
+  env_withheld?: readonly string[];
   /** resolves with the attempt's result (or rejects on hard host failure) */
   result: Promise<AgentResult>;
 }

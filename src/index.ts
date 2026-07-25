@@ -19,5 +19,13 @@ export { silentSink, consoleSink, readStatus, renderStatusLine } from './core/pr
 export { generateAdapters } from './adapters/index.js';
 export { AttemptWorkspace, snapshotTree, diffTrees } from './core/workspace.js';
 export { planCommand, buildEnv, nativeSandboxAvailable } from './security/execpolicy.js';
+export { isSensitivePath, SENSITIVE_PATH_PATTERNS } from './security/sensitive.js';
+export {
+  buildHostEnv,
+  HOST_ENV_BASE_ALLOWLIST,
+  CLAUDE_HOST_ENV_ALLOWLIST,
+  CODEX_HOST_ENV_ALLOWLIST,
+  type HostEnvResult,
+} from './security/hostEnv.js';
 export * from './hosts/index.js';
 export * as schemas from './core/schemas/index.js';

@@ -5,6 +5,7 @@ import { resolveCodexTier } from '../agents/roles.js';
 import { nodeSpawner, type Spawner } from './spawn.js';
 import { validateCodexModel } from './models.js';
 import { buildHostPrompt, extractAgentResult, diagnosticTail, failResult } from './parse.js';
+import { buildHostEnv, CODEX_HOST_ENV_ALLOWLIST } from '../security/hostEnv.js';
 import type { ProcessLaunch, RawExit } from './processTypes.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -76,7 +77,10 @@ export function buildCodexLaunch(task: AgentTask, config: RijoConfig, opts: Code
     `model_reasoning_effort="${tier.reasoning_effort}"`,
     '--skip-git-repo-check',
   ];
-  return { command: opts.bin ?? 'codex', args, cwd };
+  // Reconstructed environment: the CLI gets HOME (its credentials live in
+  // ~/.codex) and its OWN auth variables, never the operator's whole shell.
+  const { env, withheld } = buildHostEnv(CODEX_HOST_ENV_ALLOWLIST);
+  return { command: opts.bin ?? 'codex', args, cwd, env, envWithheld: withheld };
 }
 
 /**

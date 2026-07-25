@@ -5,6 +5,7 @@ import { resolveClaudeTier } from '../agents/roles.js';
 import { nodeSpawner, type Spawner } from './spawn.js';
 import { validateClaudeModel } from './models.js';
 import { buildHostPrompt, extractAgentResult, diagnosticTail, failResult } from './parse.js';
+import { buildHostEnv, CLAUDE_HOST_ENV_ALLOWLIST } from '../security/hostEnv.js';
 import type { ProcessLaunch, RawExit } from './processTypes.js';
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -183,7 +184,10 @@ export function buildClaudeLaunch(task: AgentTask, config: RijoConfig, opts: Cla
   // an explicit override still wins.
   if (opts.allowedTools && opts.allowedTools.length) args.push('--allowedTools', opts.allowedTools.join(','));
 
-  return { command: opts.bin ?? 'claude', args, cwd };
+  // Reconstructed environment: the CLI gets HOME (its credentials live in
+  // ~/.claude) and its OWN auth variables, never the operator's whole shell.
+  const { env, withheld } = buildHostEnv(CLAUDE_HOST_ENV_ALLOWLIST);
+  return { command: opts.bin ?? 'claude', args, cwd, env, envWithheld: withheld };
 }
 
 /**

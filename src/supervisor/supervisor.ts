@@ -352,6 +352,16 @@ export class Supervisor {
             host_process_id: handle.process_id ?? null,
             last_heartbeat_at: this.toIso(),
           });
+          // Audit trail for the host environment reconstruction: NAMES ONLY of
+          // the ambient variables the controller refused to export. Values are
+          // never captured by the controller, so this event cannot leak one.
+          if (handle.env_withheld && handle.env_withheld.length > 0) {
+            this.store.emit(logicalId, 'host_env_filtered', {
+              attempt_id: identity.attempt_id,
+              withheld_count: handle.env_withheld.length,
+              withheld_names: [...handle.env_withheld],
+            });
+          }
           st.lastProgressAt = this.clock.now();
 
           const outcome = await this.runAttempt(st, handle, role);
