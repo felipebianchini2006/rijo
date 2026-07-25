@@ -15,6 +15,7 @@ import {
   AttemptWorkspace,
   snapshotTree,
   diffTrees,
+  findEscapingSymlinks,
   WorkspaceScopeError,
   CanonicalWriteError,
   SymlinkEscapeError,
@@ -102,6 +103,20 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
     const errors = integrity.filter((i) => i.severity === 'error');
     if (errors.length > 0) {
       return blocked(ctx, 'State integrity check failed.', errors.map((e) => `${e.code}: ${e.message} — ${e.fix}`));
+    }
+    // Per-attempt isolation is only real if the project can be copied without
+    // carrying a door out of it: a symlink whose target escapes the checkout
+    // would let an attempt read and write the host filesystem. Workspace
+    // creation refuses such a project anyway — reporting it here turns the
+    // refusal into a BLOCKED outcome with guidance instead of an exception.
+    const escaping = findEscapingSymlinks(ctx.projectRoot);
+    if (escaping.length > 0) {
+      return blocked(
+        ctx,
+        `The checkout contains symlinks whose target is absolute or leaves the project root: ${escaping.join(', ')}. ` +
+          `An attempt workspace cannot isolate them.`,
+        ['Remove the links or repoint them at a relative path inside the project, then re-run.'],
+      );
     }
     const milestone = activeMilestone(paths);
     if (!milestone) return failed(ctx, 'No active milestone in manifest.');

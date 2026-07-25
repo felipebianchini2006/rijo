@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
@@ -168,6 +169,33 @@ describe('per-attempt isolation (workflow level)', () => {
     const second = await runWorkflow(root, {}, d);
     expect(second.ok, second.message).toBe(true);
     expect(fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8')).toBe('// clean attempt 2\n');
+  });
+
+  it('a checkout with a symlink escaping the project root blocks before any attempt runs', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-outside-'));
+    try {
+      fs.writeFileSync(path.join(outside, 'victim.txt'), 'host secret\n');
+      const d = deps(root);
+      await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+      // the operator (or a previous attempt) leaves a door out of the checkout
+      fs.symlinkSync(path.join(outside, 'victim.txt'), path.join(root, 'leak.txt'));
+      let dispatched = false;
+      d.runner.on(
+        (t) => t.id === 'exec-01-T01',
+        (t) => {
+          dispatched = true;
+          return ok(t, { files_written: [], payload: { done: true, notes: '' } });
+        },
+      );
+      const outcome = await runWorkflow(root, {}, d);
+      expect(outcome.status).toBe('blocked');
+      expect(outcome.message).toMatch(/symlinks whose target is absolute or leaves the project root/);
+      expect(outcome.message).toContain('leak.txt');
+      expect(dispatched).toBe(false);
+      expect(fs.readFileSync(path.join(outside, 'victim.txt'), 'utf8')).toBe('host secret\n');
+    } finally {
+      cleanup(outside);
+    }
   });
 
   it('a read-only reviewer that writes to the checkout blocks the phase', async () => {

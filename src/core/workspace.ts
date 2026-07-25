@@ -1,7 +1,9 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ensureDir, exists, sha256 } from './fsx.js';
 import { pathInScope } from './scope.js';
+import { isSensitivePath } from '../security/sensitive.js';
 
 /**
  * Real per-attempt isolation. A worker NEVER writes to the controlled checkout:
@@ -31,7 +33,29 @@ function shouldSkip(rel: string): boolean {
   const parts = rel.split('/');
   if (parts.some((p) => SKIP_DIRS.has(p))) return true;
   if (parts[0] === '.rijo' && parts.length > 1 && RIJO_VOLATILE.has(parts[1]!)) return true;
+  // Credentials never enter a workspace: excluded from the snapshot, therefore
+  // from the copy, from the delta and from any patch applied back.
+  if (isSensitivePath(rel)) return true;
   return false;
+}
+
+/** True when `candidate` is `root` itself or lives under it (pure path math, never follows links). */
+function containedIn(root: string, candidate: string): boolean {
+  const rel = path.relative(root, candidate);
+  if (rel === '') return true;
+  return !path.isAbsolute(rel) && !rel.split(path.sep).includes('..');
+}
+
+/**
+ * A symlink escapes `root` when its target is absolute or climbs out of the
+ * tree. Absolute targets count as escapes even when they happen to point back
+ * inside the same checkout: the copy that lands in another tree (the workspace,
+ * or the checkout on apply) would still dereference to the ORIGINAL location,
+ * which is exactly the isolation hole this guards.
+ */
+function linkEscapes(root: string, linkAbs: string, target: string): boolean {
+  if (path.isAbsolute(target)) return true;
+  return !containedIn(root, path.resolve(path.dirname(linkAbs), target));
 }
 
 /**
@@ -72,6 +96,26 @@ export function snapshotTree(root: string): TreeSnapshot {
   };
   walk(root);
   return snap;
+}
+
+/**
+ * Every symlink in the project tree whose target escapes `projectRoot`.
+ * Copying such a link into a workspace would defeat the isolation: reading
+ * through it leaves the sandbox and writing through it reaches the host
+ * filesystem. Workspace creation refuses to start while one exists
+ * (fail-closed) instead of silently omitting it, because an omitted path
+ * changes what the agent sees without anyone being told.
+ * `node_modules` is not part of this set — it is machine-generated, is cloned
+ * separately and has its own (omit-and-report) policy.
+ */
+export function findEscapingSymlinks(projectRoot: string, snapshot?: TreeSnapshot): string[] {
+  const snap = snapshot ?? snapshotTree(projectRoot);
+  const escaping: string[] = [];
+  for (const [rel, entry] of snap) {
+    if (entry.symlinkTarget === null) continue;
+    if (linkEscapes(projectRoot, path.join(projectRoot, rel), entry.symlinkTarget)) escaping.push(rel);
+  }
+  return escaping.sort();
 }
 
 export interface WorkspaceDelta {
@@ -143,12 +187,24 @@ export class CanonicalWriteError extends Error {
   }
 }
 
+/**
+ * A symlink would carry writes out of the isolated tree. Raised in two phases:
+ * `pre-create` (the project already contains an escaping link, so no workspace
+ * is built at all) and `apply` (the attempt produced one, so nothing is
+ * applied).
+ */
 export class SymlinkEscapeError extends Error {
   constructor(
     public readonly taskId: string,
     public readonly offending: string[],
+    public readonly phase: 'pre-create' | 'apply' = 'apply',
   ) {
-    super(`Attempt ${taskId} introduced symlinks pointing outside the workspace: ${offending.join(', ')}`);
+    super(
+      phase === 'pre-create'
+        ? `No workspace was created for ${taskId}: the project contains symlinks whose target is absolute or ` +
+            `escapes the project root, and copying them would break the attempt's isolation: ${offending.join(', ')}`
+        : `Attempt ${taskId} introduced symlinks pointing outside the workspace: ${offending.join(', ')}`,
+    );
     this.name = 'SymlinkEscapeError';
   }
 }
@@ -192,28 +248,33 @@ export class AttemptWorkspace {
     public readonly canonicalWriteScope: string[],
     public readonly baselineCommit: string | null,
     public readonly baselineCanonicalHash: string,
+    /**
+     * Dependency links dropped while cloning node_modules because they pointed
+     * outside the workspace (globally linked packages, a shared store, a parent
+     * repo). Kept as evidence: an attempt that cannot resolve a dependency has
+     * an auditable reason instead of a silent omission.
+     */
+    public readonly droppedDependencyLinks: string[],
     private readonly baseline: TreeSnapshot,
   ) {}
 
   /**
    * Create an isolated copy of the project for one attempt. Symlinks are
-   * preserved verbatim; node_modules is linked read-through (never copied,
-   * never diffed) so repository tooling still resolves inside the workspace.
+   * preserved verbatim and never dereferenced; a project that already contains
+   * a symlink escaping its root is refused outright (fail-closed) before a
+   * single byte is copied. `node_modules` is CLONED, never linked: a writable
+   * link to the checkout's dependency tree would let an attempt rewrite the
+   * real project's dependencies. It stays out of the delta either way.
    */
   static create(projectRoot: string, opts: AttemptWorkspaceOptions): AttemptWorkspace {
     const id = `ws-${opts.taskId}-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
     const root = path.join(projectRoot, '.rijo', 'runtime', 'workspaces', id);
     const baseline = snapshotTree(projectRoot);
+    const escaping = findEscapingSymlinks(projectRoot, baseline);
+    if (escaping.length > 0) throw new SymlinkEscapeError(opts.taskId, escaping, 'pre-create');
     ensureDir(root);
     copyTree(projectRoot, root, baseline);
-    const nm = path.join(projectRoot, 'node_modules');
-    if (exists(nm)) {
-      try {
-        fs.symlinkSync(nm, path.join(root, 'node_modules'), 'junction');
-      } catch {
-        /* link failed: tooling inside the workspace just won't resolve deps */
-      }
-    }
+    const droppedDependencyLinks = isolateNodeModules(projectRoot, root);
     return new AttemptWorkspace(
       id,
       root,
@@ -223,6 +284,7 @@ export class AttemptWorkspace {
       (opts.canonicalWriteScope ?? []).map((s) => s.replace(/\\/g, '/')),
       opts.baselineCommit ?? null,
       opts.baselineCanonicalHash ?? '',
+      droppedDependencyLinks,
       baseline,
     );
   }
@@ -250,12 +312,22 @@ export class AttemptWorkspace {
     const offending = nonCanonical.filter((p) => !pathInScope(p, this.writeScope));
     if (offending.length > 0) throw new WorkspaceScopeError(this.taskId, offending);
 
+    // Re-checked against the CURRENT link on disk, not the snapshot: this
+    // covers a link the agent created pointing outside, a pre-existing link
+    // whose target it repointed, and any link it swapped between the snapshot
+    // and this call. An absolute target is an escape even when it currently
+    // resolves inside the workspace — applied verbatim to the checkout it would
+    // still point back at the discarded workspace.
     const escapes: string[] = [];
     for (const rel of delta.symlinks) {
-      const target = fs.readlinkSync(path.join(this.root, rel));
-      const resolved = path.resolve(path.dirname(path.join(this.root, rel)), target);
-      const inside = !path.relative(this.root, resolved).startsWith('..') && !path.isAbsolute(path.relative(this.root, resolved));
-      if (!inside) escapes.push(rel);
+      const linkAbs = path.join(this.root, rel);
+      let target: string;
+      try {
+        target = fs.readlinkSync(linkAbs);
+      } catch {
+        continue; // no longer a symlink: covered by the hash/target diff above
+      }
+      if (linkEscapes(this.root, linkAbs, target)) escapes.push(rel);
     }
     if (escapes.length > 0) throw new SymlinkEscapeError(this.taskId, escapes);
     return delta;
@@ -291,6 +363,10 @@ export class AttemptWorkspace {
         fs.rmSync(dst, { force: true });
         fs.symlinkSync(entry.symlinkTarget, dst);
       } else {
+        // Never write THROUGH a link occupying the destination: copyFileSync
+        // follows it and would clobber whatever it points at, possibly outside
+        // the checkout. Replace the link with the real file instead.
+        if (isSymlink(dst)) fs.rmSync(dst, { force: true });
         fs.copyFileSync(src, dst);
       }
     }
@@ -330,16 +406,105 @@ export function discardOrphanWorkspaces(runtimeDir: string): string[] {
   return discarded;
 }
 
+function isSymlink(p: string): boolean {
+  try {
+    return fs.lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 function copyTree(from: string, to: string, snapshot: TreeSnapshot): void {
   for (const [rel, entry] of snapshot) {
     const src = path.join(from, rel);
     const dst = path.join(to, rel);
     ensureDir(path.dirname(dst));
     try {
+      // Links are recreated verbatim from the snapshot target — the source is
+      // never dereferenced, so no content from outside the tree is ever pulled
+      // in (and escaping links were already refused before the copy started).
       if (entry.symlinkTarget !== null) fs.symlinkSync(entry.symlinkTarget, dst);
       else fs.copyFileSync(src, dst);
     } catch {
       /* source vanished mid-copy; the baseline snapshot remains authoritative */
+    }
+  }
+}
+
+/**
+ * Give the attempt its OWN dependency tree. The workspace used to receive a
+ * writable link to the checkout's `node_modules`, so an attempt could rewrite
+ * or delete the real project's dependencies through it. The directory is
+ * cloned instead:
+ *  - macOS: `cp -Rc` (APFS clonefile) — copy-on-write, near-instant, and the
+ *    first write to a cloned file allocates its own blocks;
+ *  - elsewhere: a real recursive copy that keeps symlinks verbatim.
+ * Hardlinks are never an option: a shared inode means every write inside the
+ * workspace lands in the checkout's dependency tree.
+ * Returns the links dropped for pointing outside the workspace.
+ */
+function isolateNodeModules(projectRoot: string, root: string): string[] {
+  const nm = path.join(projectRoot, 'node_modules');
+  if (!exists(nm)) return []; // no dependencies installed: nothing to isolate
+  // A `node_modules` that is itself a link is cloned by CONTENT — recreating
+  // the link would hand the attempt the very write-through path being closed.
+  let src = nm;
+  try {
+    if (isSymlink(nm)) src = fs.realpathSync(nm);
+  } catch {
+    return [];
+  }
+  const dst = path.join(root, 'node_modules');
+  if (!cloneDirectory(src, dst)) return []; // tooling just won't resolve deps
+  const dropped: string[] = [];
+  pruneEscapingLinks(dst, root, dropped);
+  return dropped.sort();
+}
+
+/** Deep copy that never dereferences symlinks. False when the copy could not be made. */
+function cloneDirectory(src: string, dst: string): boolean {
+  if (process.platform === 'darwin') {
+    const cloned = spawnSync('cp', ['-Rc', src, dst], { stdio: 'ignore' });
+    if (cloned.status === 0) return true;
+    fs.rmSync(dst, { recursive: true, force: true }); // partial clone, start over
+  }
+  try {
+    fs.cpSync(src, dst, { recursive: true, verbatimSymlinks: true, force: true });
+    return true;
+  } catch {
+    fs.rmSync(dst, { recursive: true, force: true });
+    return false;
+  }
+}
+
+/**
+ * Drop every link under `dir` whose target leaves `root`. A cloned
+ * `node_modules` can carry links to a global store, a linked package or a
+ * parent repository; following them would put the attempt back on the host
+ * filesystem. Links that stay inside the workspace — `.bin` shims and
+ * npm-workspace package links — are kept so tooling still resolves.
+ */
+function pruneEscapingLinks(dir: string, root: string, dropped: string[]): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isSymbolicLink()) {
+      let target: string;
+      try {
+        target = fs.readlinkSync(full);
+      } catch {
+        continue;
+      }
+      if (!linkEscapes(root, full, target)) continue;
+      fs.rmSync(full, { force: true });
+      dropped.push(path.relative(root, full).split(path.sep).join('/'));
+    } else if (e.isDirectory()) {
+      pruneEscapingLinks(full, root, dropped);
     }
   }
 }
