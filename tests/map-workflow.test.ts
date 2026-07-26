@@ -386,7 +386,7 @@ describe('rijo new brownfield map integration', () => {
   it('auto-maps under the existing new lock and gives the planner real paths and symbols', async () => {
     const d = deps(root);
     const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() });
-    expect(outcome.ok).toBe(true);
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
     expect(fs.existsSync(new RijoPaths(root).codebaseMapState)).toBe(true);
     const extract = d.runner.executed.find((t) => t.id === 'new-extract')!;
     expect(extract.notes).toContain('src/auth/service.ts');
@@ -396,7 +396,8 @@ describe('rijo new brownfield map integration', () => {
 
   it('new --next refreshes a stale brownfield map before classifying the next milestone', async () => {
     const first = deps(root);
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, { ...first, git: new SystemGit() })).ok).toBe(true);
+    const firstOutcome = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...first, git: new SystemGit() });
+    expect(firstOutcome.ok, JSON.stringify(firstOutcome)).toBe(true);
     fs.appendFileSync(
       path.join(root, 'src', 'auth', 'service.ts'),
       '\nexport function rotateSession() { return true; }\n',
@@ -422,7 +423,8 @@ describe('rijo new brownfield map integration', () => {
 
   it('marks only verified phase source paths stale for the next incremental map', async () => {
     const d = deps(root);
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() })).ok).toBe(true);
+    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() });
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
     const run = await runWorkflow(root, {}, { ...d, git: new SystemGit() });
     expect(run.ok).toBe(true);
     expect(d.runner.executed.find((task) => task.id === 'spec-01')?.notes).toContain('CODEBASE MAP CONTEXT');
