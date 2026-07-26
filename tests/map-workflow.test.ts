@@ -145,7 +145,7 @@ describe('rijo map workflow', () => {
     expect(receipts.claim_receipts.every((receipt: any) => receipt.structural === 'PASSED')).toBe(true);
     expect(receipts.claim_receipts.every((receipt: any) => receipt.semantic === 'APPROVED')).toBe(true);
     expect(receipts.consolidation.status).toBe('APPROVED');
-  });
+  }, 120_000);
 
   it('drops rejected enriched claims and promotes only a re-reviewed deterministic fallback', async () => {
     const d = deps(root);

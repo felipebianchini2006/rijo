@@ -77,7 +77,9 @@ describe('attempt workspaces are Git-isolated from the controlled checkout', () 
       encoding: 'utf8',
     });
     expect(topLevel.status).toBe(0);
-    expect(fs.realpathSync(topLevel.stdout.trim())).toBe(fs.realpathSync(ws.root));
+    const detectedRoot = fs.statSync(topLevel.stdout.trim());
+    const workspaceRoot = fs.statSync(ws.root);
+    expect([detectedRoot.dev, detectedRoot.ino]).toEqual([workspaceRoot.dev, workspaceRoot.ino]);
 
     const staged = spawnSync('git', ['add', '-f', 'src/a.ts'], {
       cwd: ws.root,
