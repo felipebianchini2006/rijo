@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
 import { runWorkflow } from '../src/workflows/run.js';
+import { mapWorkflow } from '../src/workflows/map.js';
 import { reconcileTransactions } from '../src/core/txn.js';
 import { snapshotTree, diffTrees } from '../src/core/workspace.js';
 import { RijoPaths } from '../src/core/paths.js';
@@ -47,6 +48,8 @@ describe('milestone transaction crash safety (fault injection after every durabl
     await newWorkflow(golden, { planFile: '@PLANO.md' }, d);
     const run = await runWorkflow(golden, { target: 'all' }, d);
     expect(run.ok, run.message).toBe(true);
+    const mapped = await mapWorkflow(golden, {}, d);
+    expect(mapped.ok, mapped.message).toBe(true);
 
     // discover every injection point by recording a successful --next on a clone
     const probe = cloneFixture(golden);

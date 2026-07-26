@@ -57,7 +57,7 @@ describe('generateAdapters', () => {
   it("['claude'] creates skills, agents, CLAUDE.md block, statusline script and settings.json", () => {
     const report = generateAdapters(root, ['claude']);
 
-    for (const skill of ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check']) {
+    for (const skill of ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check']) {
       expect(fs.existsSync(path.join(root, '.claude', 'skills', skill, 'SKILL.md'))).toBe(true);
     }
     const workerAgentPath = path.join(root, '.claude', 'agents', 'rijo-worker.md');
@@ -138,6 +138,7 @@ describe('generateAdapters', () => {
   it("['codex'] creates .agents skills and AGENTS.md with transition-marker instructions", () => {
     generateAdapters(root, ['codex']);
 
+    expect(fs.existsSync(path.join(root, '.agents', 'skills', 'rijo-map', 'SKILL.md'))).toBe(true);
     expect(fs.existsSync(path.join(root, '.agents', 'skills', 'rijo-run', 'SKILL.md'))).toBe(true);
     const agentsMd = fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8');
     expect(agentsMd).toContain(BEGIN);

@@ -99,7 +99,7 @@ describe('milestone cycle', () => {
     const d2 = deps(root, { extraction: M2_EXTRACTION });
     await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, d2);
     // same research key was cached in M001 → no researcher spawned in M002
-    expect(d2.runner.executed.filter((t) => t.role === 'researcher')).toHaveLength(0);
+    expect(d2.runner.executed.filter((t) => t.id.startsWith('new-research'))).toHaveLength(0);
   });
 
   it('blocks --next when an execution checkpoint is open', async () => {

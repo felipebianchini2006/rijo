@@ -27,6 +27,11 @@ describe('ConfigSchema', () => {
       qa: 'economical-browser',
     });
     expect(config.git).toEqual({ tag_milestones: true, commit: true });
+    expect(config.decisions).toMatchObject({
+      mode: 'autonomous',
+      ask_user: 'blockers_only',
+      confidence_threshold: 0.7,
+    });
   });
 });
 

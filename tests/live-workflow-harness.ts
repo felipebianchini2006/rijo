@@ -164,7 +164,7 @@ export function haikuConfigYaml(provider: 'claude' | 'codex', ov: SupervisorOver
   const hardKill = ov.hardKillGraceMs ?? 5_000;
   const maxRepl = ov.maxReplacements ?? 1;
   return [
-    'schema_version: 2',
+    'schema_version: 3',
     'models:',
     '  lead: economical-research',
     '  reviewer: balanced-reasoning',
@@ -327,9 +327,9 @@ export function assertScenarioAOutcome(fixture: Fixture): void {
   const dirty = trackedDirty(fixture);
   expect(dirty, `tracked tree not clean: ${dirty.join(', ')}`).toEqual([]);
 
-  // `--status --json` is coherent: schema v2 and at least one SUCCEEDED task.
+  // `--status --json` is coherent: schema v3 and at least one SUCCEEDED task.
   const status = readStatusJson(fixture);
-  expect(status.schema_version).toBe(2);
+  expect(status.schema_version).toBe(3);
   const succeeded = status.supervisor.tasks.filter((t) => t.state === 'SUCCEEDED');
   expect(succeeded.length, `no SUCCEEDED supervised task in status: ${JSON.stringify(status.supervisor.tasks)}`).toBeGreaterThan(0);
 

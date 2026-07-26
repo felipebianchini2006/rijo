@@ -1,0 +1,436 @@
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { RijoPaths } from '../src/core/paths.js';
+import { SystemGit } from '../src/core/git.js';
+import { mapWorkflow, queryCodebaseMap, readCodebaseMapStatus } from '../src/workflows/map.js';
+import { newWorkflow } from '../src/workflows/new.js';
+import { runWorkflow } from '../src/workflows/run.js';
+import { collectGitHistory } from '../src/codebase/git.js';
+import { buildInventory } from '../src/codebase/inventory.js';
+import { runBaseline } from '../src/codebase/baseline.js';
+import { createContext } from '../src/workflows/shared.js';
+import { FakeShellRunner, type ShellRunner } from '../src/core/commands.js';
+import { SupervisorConfigSchema } from '../src/core/schemas/index.js';
+import { cleanup, deps, mapFragmentFor, tmpProject, writePlanFile } from './helpers.js';
+import { readStaleMarker } from '../src/codebase/state.js';
+import { initialState, writeState } from '../src/core/state.js';
+
+const ARTIFACTS = [
+  'SUMMARY.md',
+  'STACK.md',
+  'ARCHITECTURE.md',
+  'STRUCTURE.md',
+  'MODULES.md',
+  'CONVENTIONS.md',
+  'TESTING.md',
+  'APIS.md',
+  'DATA.md',
+  'INTEGRATIONS.md',
+  'OPERATIONS.md',
+  'HISTORY.md',
+  'CONCERNS.md',
+  'BASELINE.md',
+  'inventory.json',
+  'symbols.json',
+  'dependency-graph.json',
+  'surfaces.json',
+  'baseline.json',
+  'map-state.json',
+];
+
+function git(root: string, args: string[]): string {
+  return execFileSync('git', ['-c', 'user.name=RIJO Test', '-c', 'user.email=rijo@test.local', ...args], {
+    cwd: root,
+    encoding: 'utf8',
+  }).trim();
+}
+
+function seedBrownfield(root: string): void {
+  fs.mkdirSync(path.join(root, 'src', 'auth'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'tests'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'package.json'),
+    JSON.stringify({
+      name: 'brownfield',
+      scripts: { typecheck: 'tsc --noEmit', test: 'vitest run', build: 'tsc' },
+      dependencies: { zod: '^3.25.0' },
+    }),
+  );
+  fs.writeFileSync(path.join(root, 'src', 'index.ts'), "export { validateSession } from './auth/service.js';\n");
+  fs.writeFileSync(path.join(root, 'src', 'auth', 'service.ts'), 'export function validateSession() { return true; }\n');
+  fs.writeFileSync(path.join(root, 'tests', 'auth.test.ts'), 'it("validates", () => {});\n');
+  fs.writeFileSync(path.join(root, 'README.md'), '# Brownfield\n');
+  git(root, ['init', '-b', 'main']);
+  git(root, ['add', '.']);
+  git(root, ['commit', '-m', 'feat: initial brownfield architecture']);
+}
+
+describe('rijo map workflow', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = tmpProject('rijo-map-workflow-');
+    seedBrownfield(root);
+  });
+
+  afterEach(() => cleanup(root));
+
+  it('creates a complete evidence-backed map, records a real baseline, and preserves source bytes', async () => {
+    const before = fs.readFileSync(path.join(root, 'src', 'auth', 'service.ts'), 'utf8');
+    const d = deps(root);
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+    expect(outcome.ok).toBe(true);
+
+    const paths = new RijoPaths(root);
+    for (const artifact of ARTIFACTS) {
+      expect(fs.existsSync(path.join(paths.codebaseDir, artifact)), artifact).toBe(true);
+    }
+    const state = JSON.parse(fs.readFileSync(paths.codebaseMapState, 'utf8'));
+    expect(state.status).toBe('COMPLETE');
+    expect(state.coverage.claims_verified).toBe(1);
+    expect(state.module_ids.length).toBeGreaterThan(0);
+    const baseline = JSON.parse(fs.readFileSync(path.join(paths.codebaseDir, 'baseline.json'), 'utf8'));
+    expect(baseline.commands.every((c: any) => c.status === 'PASSED')).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'src', 'auth', 'service.ts'), 'utf8')).toBe(before);
+    const reviewer = d.runner.executed.find((task) => task.id === 'map-review')!;
+    expect(reviewer.objective).toContain('Do not execute repository commands');
+    expect(reviewer.return_format).toContain('Evidence must be structured objects');
+  });
+
+  it('refuses a dirty checkout without corrupting the durable checkpoint needed for a clean retry', async () => {
+    const paths = new RijoPaths(root);
+    fs.mkdirSync(paths.root, { recursive: true });
+    writeState(
+      paths,
+      {
+        ...initialState(),
+        milestone: 'M001',
+        phase: '01',
+        stage: 'DONE',
+        next_step: 'rijo map',
+      },
+      'Verified phase checkpoint.',
+    );
+    const checkpoint = fs.readFileSync(paths.state, 'utf8');
+    fs.appendFileSync(path.join(root, 'src', 'auth', 'service.ts'), '\n// uncommitted user edit\n');
+
+    const outcome = await mapWorkflow(root, {}, { ...deps(root), git: new SystemGit() });
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toMatch(/clean checkout/i);
+    expect(fs.readFileSync(paths.state, 'utf8')).toBe(checkpoint);
+    expect(fs.existsSync(paths.manifest)).toBe(false);
+  });
+
+  it('is a no-op while fresh, then incrementally refreshes only changed modules', async () => {
+    const d = deps(root);
+    const wired = { ...d, git: new SystemGit() };
+    expect((await mapWorkflow(root, {}, wired)).ok).toBe(true);
+    const firstTasks = d.runner.executed.filter((t) => t.id.startsWith('map-shard-')).length;
+
+    const noOp = await mapWorkflow(root, {}, wired);
+    expect(noOp.ok).toBe(true);
+    expect(noOp.message).toMatch(/fresh|current|no-op/i);
+    expect(d.runner.executed.filter((t) => t.id.startsWith('map-shard-')).length).toBe(firstTasks);
+
+    fs.appendFileSync(path.join(root, 'src', 'auth', 'service.ts'), '\nexport const authVersion = 2;\n');
+    git(root, ['add', 'src/auth/service.ts']);
+    git(root, ['commit', '-m', 'feat(auth): evolve public contract']);
+    const incremental = await mapWorkflow(root, {}, wired);
+    expect(incremental.ok).toBe(true);
+    const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
+    expect(state.last_operation).toBe('incremental');
+    expect(state.changed_paths_since_map).toContain('src/auth/service.ts');
+  });
+
+  it('answers deterministic queries and status without dispatching a model', async () => {
+    const d = deps(root);
+    await mapWorkflow(root, {}, { ...d, git: new SystemGit() });
+    const before = d.runner.executed.length;
+    const query = queryCodebaseMap(root, 'validateSession');
+    expect(query.matches.length).toBeGreaterThan(0);
+    expect(query.matches.some((m) => m.path === 'src/auth/service.ts')).toBe(true);
+    const status = readCodebaseMapStatus(root);
+    expect(status?.status).toBe('COMPLETE');
+    expect(d.runner.executed.length).toBe(before);
+  });
+
+  it('honors --paths and preserves unaffected evidence claims', async () => {
+    fs.mkdirSync(path.join(root, 'src', 'billing'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'billing', 'service.ts'), 'export const charge = () => true;\n');
+    git(root, ['add', 'src/billing/service.ts']);
+    git(root, ['commit', '-m', 'feat(billing): add contract']);
+    const d = deps(root);
+    const wired = { ...d, git: new SystemGit() };
+    expect((await mapWorkflow(root, { full: true }, wired)).ok).toBe(true);
+    const claimsPath = path.join(new RijoPaths(root).codebaseDir, 'claims.json');
+    const before = JSON.parse(fs.readFileSync(claimsPath, 'utf8'));
+    const billingClaim = before.claims.find((claim: any) =>
+      claim.evidence.some((evidence: any) => evidence.path === 'src/billing/service.ts'),
+    );
+    expect(billingClaim).toBeTruthy();
+
+    const outcome = await mapWorkflow(root, { paths: ['src/auth'] }, wired);
+    expect(outcome.ok).toBe(true);
+    const after = JSON.parse(fs.readFileSync(claimsPath, 'utf8'));
+    expect(after.claims).toContainEqual(billingClaim);
+    expect(JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8')).last_operation).toBe('paths');
+  });
+
+  it('keeps the last valid map when promotion crashes before the commit point, then recovers', async () => {
+    const initial = deps(root);
+    expect((await mapWorkflow(root, {}, { ...initial, git: new SystemGit() })).ok).toBe(true);
+    const statePath = new RijoPaths(root).codebaseMapState;
+    const validState = fs.readFileSync(statePath, 'utf8');
+
+    fs.appendFileSync(path.join(root, 'src', 'auth', 'service.ts'), '\nexport const secondGeneration = true;\n');
+    git(root, ['add', 'src/auth/service.ts']);
+    git(root, ['commit', '-m', 'refactor(auth): second generation']);
+    await expect(
+      mapWorkflow(root, {}, {
+        ...deps(root),
+        git: new SystemGit(),
+        txnHooks: {
+          afterWrite(step) {
+            if (step === 'stage:.rijo/codebase/SUMMARY.md') throw new Error('simulated map staging crash');
+          },
+        },
+      }),
+    ).rejects.toThrow('simulated map staging crash');
+    expect(fs.readFileSync(statePath, 'utf8')).toBe(validState);
+
+    const recovered = await mapWorkflow(root, {}, { ...deps(root), git: new SystemGit() });
+    expect(recovered.ok).toBe(true);
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8')).mapped_commit).toBe(git(root, ['rev-parse', 'HEAD~1']));
+  });
+
+  it('rejects a mapper that writes source inside its isolated read-only attempt', async () => {
+    const d = deps(root);
+    const original = fs.readFileSync(path.join(root, 'src', 'auth', 'service.ts'), 'utf8');
+    d.runner.on(
+      (task) => task.id.startsWith('map-shard-'),
+      (task) => {
+        const target = path.join(task.workspace!.root, 'src', 'auth', 'service.ts');
+        fs.writeFileSync(target, 'export const compromised = true;\n');
+        return {
+          task_id: task.id,
+          ok: true,
+          summary: 'attempted write',
+          files_written: [],
+          payload: mapFragmentFor(task),
+          scope_requests: [],
+        };
+      },
+    );
+    const outcome = await mapWorkflow(root, {}, { ...d, git: new SystemGit() });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toMatch(/read-only workspace/i);
+    expect(fs.readFileSync(path.join(root, 'src', 'auth', 'service.ts'), 'utf8')).toBe(original);
+    expect(fs.existsSync(new RijoPaths(root).codebaseMapState)).toBe(false);
+  });
+
+  it('replaces a failed mapper with a fresh isolated generation', async () => {
+    const d = deps(root);
+    let attempts = 0;
+    d.runner.on(
+      (task) => task.id.startsWith('map-shard-'),
+      (task) => {
+        attempts++;
+        if (attempts === 1) {
+          return {
+            task_id: task.id,
+            ok: false,
+            summary: 'simulated mapper process death',
+            files_written: [],
+            payload: null,
+            scope_requests: [],
+          };
+        }
+        return {
+          task_id: task.id,
+          ok: true,
+          summary: 'replacement completed',
+          files_written: [],
+          payload: mapFragmentFor(task),
+          scope_requests: [],
+        };
+      },
+    );
+    const outcome = await mapWorkflow(root, {}, {
+      ...d,
+      git: new SystemGit(),
+      supervisorConfig: SupervisorConfigSchema.parse({
+        max_replacements_per_task: 1,
+        replacement_backoff_ms: [0],
+      }),
+    });
+    expect(outcome.ok).toBe(true);
+    const generations = d.runner.executed.filter((task) => task.id.startsWith('map-shard-'));
+    expect(generations.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(generations.map((task) => task.workspace?.id)).size).toBeGreaterThanOrEqual(2);
+  });
+
+  it('falls back to a full map when the recorded base commit is no longer reachable', async () => {
+    const wired = { ...deps(root), git: new SystemGit() };
+    expect((await mapWorkflow(root, {}, wired)).ok).toBe(true);
+    const paths = new RijoPaths(root);
+    const previous = JSON.parse(fs.readFileSync(paths.codebaseMapState, 'utf8'));
+    expect(previous.mapped_commit).not.toBe('');
+    const mapHead = git(root, ['rev-parse', 'HEAD']);
+
+    git(root, ['checkout', '--orphan', 'rewritten']);
+    git(root, ['checkout', mapHead, '--', '.']);
+    git(root, ['add', '-A']);
+    git(root, ['commit', '-m', 'chore: rewritten reachable history']);
+    git(root, ['branch', '-D', 'main']);
+    git(root, ['reflog', 'expire', '--expire=now', '--all']);
+    git(root, ['gc', '--prune=now']);
+    expect(fs.existsSync(paths.codebaseMapState)).toBe(true);
+    expect(() => git(root, ['cat-file', '-e', `${previous.mapped_commit}^{commit}`])).toThrow();
+
+    const outcome = await mapWorkflow(root, {}, wired);
+    expect(outcome.ok).toBe(true);
+    const state = JSON.parse(fs.readFileSync(paths.codebaseMapState, 'utf8'));
+    expect(state.last_operation).toBe('full');
+    expect(state.stale_reasons).toContain('mapped commit is no longer accessible; full remap performed');
+  });
+});
+
+describe('Git history and brownfield baseline evidence', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = tmpProject('rijo-map-history-');
+    seedBrownfield(root);
+  });
+
+  afterEach(() => cleanup(root));
+
+  it('records renames, migrations, architectural changes, and bug hotspots economically', () => {
+    git(root, ['mv', 'src/auth/service.ts', 'src/auth/session.ts']);
+    git(root, ['commit', '-m', 'refactor(auth): rename session contract']);
+    fs.mkdirSync(path.join(root, 'migrations'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'migrations', '001_sessions.sql'), 'create table sessions(id text primary key);\n');
+    git(root, ['add', 'migrations/001_sessions.sql']);
+    git(root, ['commit', '-m', 'feat(schema): add session migration']);
+    fs.appendFileSync(path.join(root, 'src', 'auth', 'session.ts'), '\nexport const fixed = true;\n');
+    git(root, ['add', 'src/auth/session.ts']);
+    git(root, ['commit', '-m', 'fix(auth): session regression']);
+    const history = collectGitHistory(root);
+    expect(history.renames).toContainEqual(
+      expect.objectContaining({ from: 'src/auth/service.ts', to: 'src/auth/session.ts' }),
+    );
+    expect(history.migrations.map((entry) => entry.path)).toContain('migrations/001_sessions.sql');
+    expect(history.architectural_commits.length).toBeGreaterThan(0);
+    expect(history.hotspots.some((entry) => entry.path === 'src/auth/session.ts')).toBe(true);
+  });
+
+  it('distinguishes PASSED, FAILED, and BLOCKED_BY_SANDBOX from mere detection', () => {
+    const inventory = buildInventory(root);
+    const passed = runBaseline(
+      createContext(root, { ...deps(root), shell: new FakeShellRunner([], 0) }),
+      inventory,
+      'commit',
+      'tree',
+    );
+    expect(passed.overall_status).toBe('PASSED');
+    const failed = runBaseline(
+      createContext(root, { ...deps(root), shell: new FakeShellRunner([], 1) }),
+      inventory,
+      'commit',
+      'tree',
+    );
+    expect(failed.overall_status).toBe('FAILED');
+    const blockedShell: ShellRunner = {
+      run(command) {
+        return {
+          command,
+          exit_code: 126,
+          summary: 'blocked without exposing repository output',
+          duration_ms: 0,
+          blocked: true,
+          category: 'test',
+          sandbox: 'blocked',
+        };
+      },
+    };
+    const blocked = runBaseline(
+      createContext(root, { ...deps(root), shell: blockedShell }),
+      inventory,
+      'commit',
+      'tree',
+    );
+    expect(blocked.overall_status).toBe('BLOCKED_BY_SANDBOX');
+    const detected = runBaseline(createContext(root, deps(root)), inventory, 'commit', 'tree', false);
+    expect(detected.overall_status).toBe('DETECTED_NOT_RUN');
+    expect(detected.commands.every((command) => command.exit_code === null)).toBe(true);
+  });
+});
+
+describe('rijo new brownfield map integration', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = tmpProject('rijo-new-auto-map-');
+    seedBrownfield(root);
+    writePlanFile(root);
+    git(root, ['add', 'PLANO.md']);
+    git(root, ['commit', '-m', 'docs: add closed scope plan']);
+  });
+
+  afterEach(() => cleanup(root));
+
+  it('auto-maps under the existing new lock and gives the planner real paths and symbols', async () => {
+    const d = deps(root);
+    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() });
+    expect(outcome.ok).toBe(true);
+    expect(fs.existsSync(new RijoPaths(root).codebaseMapState)).toBe(true);
+    const extract = d.runner.executed.find((t) => t.id === 'new-extract')!;
+    expect(extract.notes).toContain('src/auth/service.ts');
+    expect(extract.notes).toContain('validateSession');
+    expect(extract.notes).toContain('AUTONOMOUS DECISION POLICY');
+  });
+
+  it('new --next refreshes a stale brownfield map before classifying the next milestone', async () => {
+    const first = deps(root);
+    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, { ...first, git: new SystemGit() })).ok).toBe(true);
+    fs.appendFileSync(
+      path.join(root, 'src', 'auth', 'service.ts'),
+      '\nexport function rotateSession() { return true; }\n',
+    );
+    fs.writeFileSync(path.join(root, 'PLANO2.md'), '# Próximo milestone\n\nAlterar rotação de sessão existente.\n');
+    git(root, ['add', 'src/auth/service.ts', 'PLANO2.md']);
+    git(root, ['commit', '-m', 'feat(auth): prepare session rotation milestone']);
+
+    const second = deps(root);
+    const outcome = await newWorkflow(
+      root,
+      { planFile: '@PLANO2.md', next: true },
+      { ...second, git: new SystemGit() },
+    );
+    expect(outcome.ok).toBe(true);
+    const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
+    expect(state.last_operation).toBe('incremental');
+    expect(state.changed_paths_since_map).toContain('src/auth/service.ts');
+    const extract = second.runner.executed.find((task) => task.id === 'new-extract')!;
+    expect(extract.notes).toContain('rotateSession');
+    expect(extract.notes.indexOf('rotateSession')).toBeLessThan(extract.notes.indexOf('PLAN CONTENT'));
+  });
+
+  it('marks only verified phase source paths stale for the next incremental map', async () => {
+    const d = deps(root);
+    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() })).ok).toBe(true);
+    const run = await runWorkflow(root, {}, { ...d, git: new SystemGit() });
+    expect(run.ok).toBe(true);
+    expect(d.runner.executed.find((task) => task.id === 'spec-01')?.notes).toContain('CODEBASE MAP CONTEXT');
+    expect(d.runner.executed.find((task) => task.id.startsWith('plan-01-r'))?.notes).toContain(
+      'CODEBASE MAP CONTEXT',
+    );
+    const stale = readStaleMarker(new RijoPaths(root));
+    expect(stale?.changed_paths).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts']));
+    expect(stale?.changed_paths.every((changed) => !changed.startsWith('.rijo/'))).toBe(true);
+  });
+});

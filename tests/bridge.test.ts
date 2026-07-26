@@ -7,7 +7,7 @@ import { AgentResultSchema, type AgentTask, type AgentResult } from '../src/agen
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRoadmap } from '../src/core/roadmap.js';
-import { tmpProject, cleanup, writePlanFile, EXTRACTION_PAYLOAD } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, EXTRACTION_PAYLOAD, mapFragmentFor } from './helpers.js';
 
 /**
  * Phase plan payload the fake host returns — self-contained (does not depend on
@@ -132,6 +132,9 @@ function fakeHostResult(task: AgentTask, root: string): AgentResult {
     fs.writeFileSync(specPath, `# Spec\n\nCenários observáveis de aceite.\n`, 'utf8');
     return okResult(task, { files_written: [task.write_scope[0]!] });
   }
+  if (task.id.startsWith('map-shard-')) {
+    return okResult(task, { payload: mapFragmentFor(task) });
+  }
   // researcher: sources payload
   if (task.id.startsWith('new-research')) {
     return okResult(task, {
@@ -242,12 +245,25 @@ describe('host↔core JSON-RPC bridge', () => {
     expect(host.capabilities.length).toBeGreaterThan(0);
     expect(host.capabilities[0]!.protocol_version).toBe(2);
     expect(host.capabilities[0]!.methods).toContain('agent.runTask');
+    expect(host.capabilities[0]!.methods).toContain('workflow.map');
 
     // M001 was created on disk
     const paths = new RijoPaths(root);
     const manifest = readManifest(paths)!;
     expect(manifest.active_milestone).toBe('M001');
     expect(manifest.milestones[0]).toMatchObject({ id: 'M001', status: 'ACTIVE' });
+  });
+
+  it('drives workflow.map over the bridge and promotes queryable artifacts', async () => {
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'api.ts'), 'export const publicApi = true;\n');
+    const host = startHost(root);
+    const response = await host.callWorkflow(7, 'workflow.map', { full: true });
+    expect(response.error).toBeUndefined();
+    expect(response.result).toMatchObject({ ok: true, status: 'completed' });
+    expect(host.seenTasks.some((id) => id.startsWith('map-shard-'))).toBe(true);
+    expect(host.seenTasks).toContain('map-review');
+    expect(fs.existsSync(path.join(new RijoPaths(root).codebaseDir, 'map-state.json'))).toBe(true);
   });
 
   it('drives a subsequent rijo run at least through the first phase', async () => {

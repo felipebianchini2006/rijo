@@ -63,6 +63,11 @@ describe('rijo run', () => {
     const workers = d.runner.executed.filter((t) => t.id.startsWith('exec-01-'));
     expect(workers).toHaveLength(2);
     expect(workers[0]!.write_scope).toEqual(['src/a.ts']);
+    expect(workers[0]!.objective).toContain("local file-inspection and patch/edit tools");
+    expect(workers[0]!.objective).toContain('Do NOT execute repository code');
+    const planner = d.runner.executed.find((task) => task.id === 'plan-01-r0')!;
+    expect(planner.objective).toContain('tests[] entry must be an executable verification command');
+    expect(planner.return_format).toContain('executable command strings only');
   });
 
   it('run all completes every phase respecting dependencies', async () => {

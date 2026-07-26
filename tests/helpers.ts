@@ -66,6 +66,32 @@ export function ok(task: AgentTask, extra: Partial<AgentResult> = {}): AgentResu
   };
 }
 
+/** Evidence-valid structured payload for a RIJO map shard fake. */
+export function mapFragmentFor(task: AgentTask): unknown {
+  const marker = 'SHARD INVENTORY:\n';
+  const raw = task.notes.slice(task.notes.indexOf(marker) + marker.length).split('\n\nAUTONOMOUS DECISION POLICY')[0]!;
+  const files = JSON.parse(raw) as Array<{
+    path: string;
+    module_id: string;
+    file_hash: string;
+    exports: string[];
+  }>;
+  const modules = [...new Set(files.map((file) => file.module_id))];
+  return {
+    shard_id: task.id,
+    module_ids: modules,
+    claims: modules.map((moduleId) => {
+      const anchor = files.find((file) => file.module_id === moduleId)!;
+      return {
+        kind: 'responsibility',
+        statement: `${moduleId} is owned by its mapped shard.`,
+        evidence: [{ path: anchor.path, file_hash: anchor.file_hash }],
+      };
+    }),
+    gaps: [],
+  };
+}
+
 export const EXTRACTION_PAYLOAD = {
   project_name: 'Loja Simples',
   project_summary: 'Loja online mínima com catálogo e checkout.',
@@ -193,6 +219,10 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
           : [{ type: 'quality_issue', severity: 'critical', description: 'blocking review finding', file: null }];
         return ok(t, { payload: { approved, findings } });
       },
+    )
+    .on(
+      (t) => t.id.startsWith('map-shard-'),
+      (t) => ok(t, { payload: mapFragmentFor(t) }),
     )
     .on(
       (t) => t.role === 'worker' && t.id.startsWith('exec-'),

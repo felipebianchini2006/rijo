@@ -56,7 +56,7 @@ function seedV1Project(root: string): RijoPaths {
   return paths;
 }
 
-describe('schema migration v1 → v2', () => {
+describe('schema migration from prior versions to the current schema', () => {
   let root: string;
   beforeEach(() => (root = tmpProject('rijo-mig-')));
   afterEach(() => cleanup(root));

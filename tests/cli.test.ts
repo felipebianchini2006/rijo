@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
 import { runCli } from '../src/cli/main.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
@@ -61,9 +62,9 @@ describe('runCli', () => {
 
     const parsed = JSON.parse(logged());
     expect(Object.keys(parsed).sort()).toEqual(
-      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'milestones', 'runtime', 'checkpoint', 'supervisor'].sort(),
+      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'milestones', 'runtime', 'checkpoint', 'supervisor', 'codebase'].sort(),
     );
-    expect(parsed.schema_version).toBe(2);
+    expect(parsed.schema_version).toBe(3);
     expect(parsed.rijo_version).toBe('0.1.0-alpha.1');
     expect(parsed.initialized).toBe(true);
     expect(parsed.active_milestone).toBe('M001');
@@ -72,5 +73,23 @@ describe('runCli', () => {
     expect(parsed.milestones[0]).toMatchObject({ id: 'M001' });
     expect(parsed).toHaveProperty('runtime');
     expect(parsed).toHaveProperty('checkpoint');
+  });
+
+  it('supports map full, status, and zero-model query from the CLI', async () => {
+    const source = `${root}/src/auth.ts`;
+    fs.mkdirSync(`${root}/src`, { recursive: true });
+    fs.writeFileSync(source, 'export const validateSession = () => true;\n');
+    const d = deps(root);
+    expect(await runCli(['map', '--full'], d, root)).toBe(0);
+    log.mockClear();
+    expect(await runCli(['map', '--status'], d, root)).toBe(0);
+    expect(JSON.parse(logged())).toMatchObject({ status: 'COMPLETE', freshness: 'FRESH' });
+    const calls = d.runner.executed.length;
+    log.mockClear();
+    expect(await runCli(['map', '--query', 'validateSession'], d, root)).toBe(0);
+    const result = JSON.parse(logged());
+    expect(result.model_calls).toBe(0);
+    expect(result.matches.some((match: { path: string | null }) => match.path === 'src/auth.ts')).toBe(true);
+    expect(d.runner.executed.length).toBe(calls);
   });
 });
