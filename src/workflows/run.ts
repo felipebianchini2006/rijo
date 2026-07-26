@@ -11,7 +11,7 @@ import { readRequirements, readRoadmap, writeRoadmap, nextPhase, type RoadmapDoc
 import { readPlan, writePlan, lintPlan, setTaskStatus, parallelGroups } from '../core/plan.js';
 import { validateStateIntegrity } from '../core/traceability.js';
 import { checkContextBudget } from '../core/contextBudget.js';
-import { snapshotFiles, diffSnapshots, type FileSnapshot } from '../core/scope.js';
+import { snapshotFiles, diffSnapshots, pathInScope, type FileSnapshot } from '../core/scope.js';
 import {
   AttemptWorkspace,
   snapshotTree,
@@ -69,6 +69,7 @@ type ReviewPayload = z.infer<typeof ReviewPayloadSchema>;
 
 const PhaseRecoveryBaselineSchema = z.object({
   snapshot: z.array(z.tuple([z.string(), z.string()])),
+  controlled_snapshot: z.array(z.tuple([z.string(), z.string()])),
   dirty_at_start: z.array(z.string()),
 });
 
@@ -80,12 +81,16 @@ function writePhaseRecoveryBaseline(
   target: string,
   snapshot: FileSnapshot,
   dirtyAtStart: Set<string>,
+  controlledSnapshot: FileSnapshot,
 ): void {
   writeFileAtomic(
     target,
     `${JSON.stringify(
       {
         snapshot: [...snapshot.entries()].sort(([left], [right]) => left.localeCompare(right)),
+        controlled_snapshot: [...controlledSnapshot.entries()].sort(([left], [right]) =>
+          left.localeCompare(right),
+        ),
         dirty_at_start: [...dirtyAtStart].sort(),
       },
       null,
@@ -96,7 +101,7 @@ function writePhaseRecoveryBaseline(
 
 function readPhaseRecoveryBaseline(
   target: string,
-): { snapshot: FileSnapshot; dirtyAtStart: Set<string> } | null {
+): { snapshot: FileSnapshot; controlledSnapshot: FileSnapshot; dirtyAtStart: Set<string> } | null {
   const raw = readTextIfExists(target);
   if (!raw) return null;
   let json: unknown;
@@ -109,6 +114,7 @@ function readPhaseRecoveryBaseline(
   if (!parsed.success) return null;
   return {
     snapshot: new Map(parsed.data.snapshot),
+    controlledSnapshot: new Map(parsed.data.controlled_snapshot),
     dirtyAtStart: new Set(parsed.data.dirty_at_start),
   };
 }
@@ -507,9 +513,36 @@ async function executePhase(
   }
   const phaseBaseline: FileSnapshot = recoveredBaseline?.snapshot ?? snapshotFiles(ctx.projectRoot);
   const dirtyAtStart = recoveredBaseline?.dirtyAtStart ?? initialDirtyAtStart;
-  if (!recoveredBaseline) {
-    writePhaseRecoveryBaseline(recoveryBaselinePath, phaseBaseline, dirtyAtStart);
+  let controlledSnapshot = recoveredBaseline?.controlledSnapshot ?? phaseBaseline;
+  if (recoveredBaseline) {
+    const resumeDelta = diffSnapshots(controlledSnapshot, snapshotFiles(ctx.projectRoot));
+    const overlapping = resumeDelta.changed.filter((changed) =>
+      plan.tasks.some((task) => pathInScope(changed, task.write_scope)),
+    );
+    if (overlapping.length > 0) {
+      return blocked(ctx, `Phase ${phase.id}: task paths changed after RIJO last controlled them.`, [
+        `Concurrent paths: ${overlapping.join(', ')}`,
+        'RIJO will not appropriate or overwrite these changes; reconcile them explicitly and retry.',
+      ]);
+    }
   }
+  if (!recoveredBaseline) {
+    writePhaseRecoveryBaseline(
+      recoveryBaselinePath,
+      phaseBaseline,
+      dirtyAtStart,
+      controlledSnapshot,
+    );
+  }
+  const checkpointControlledSnapshot = (): void => {
+    controlledSnapshot = snapshotFiles(ctx.projectRoot);
+    writePhaseRecoveryBaseline(
+      recoveryBaselinePath,
+      phaseBaseline,
+      dirtyAtStart,
+      controlledSnapshot,
+    );
+  };
 
   // Deterministic resume: a RUNNING task from a crashed run is reset (its
   // orphan workspace was already discarded — nothing it did survived); a
@@ -661,6 +694,7 @@ async function executePhase(
         message: `tarefa ${t.id} implementada (não verificada)`,
       });
     }
+    checkpointControlledSnapshot();
   }
 
   // ---- Evidence gate: a phase MUST produce real command evidence. A task may
@@ -729,6 +763,7 @@ async function executePhase(
         notes: failures.map((f) => `${f.command} → exit ${f.exit_code}\n${f.summary.slice(0, 800)}`).join('\n\n'),
       });
       if (repairOutcome) return repairOutcome;
+      checkpointControlledSnapshot();
       continue;
     }
 
@@ -791,6 +826,7 @@ async function executePhase(
         notes: `Reviewer verdict (unstructured): ${crRes.summary}`,
       });
       if (repairOutcome) return repairOutcome;
+      checkpointControlledSnapshot();
       continue;
     }
     writeReviewDoc(pp, cr.data, reviewLoops, now);
@@ -830,6 +866,7 @@ async function executePhase(
       notes: actionable.map((f) => `${f.type}/${f.severity}: ${f.description}${f.file ? ` (${f.file})` : ''}`).join('\n'),
     });
     if (repairOutcome) return repairOutcome;
+    checkpointControlledSnapshot();
   }
 
   // ---- UI_SMOKE (only for UI surfaces; honest about capability)

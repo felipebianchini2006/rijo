@@ -196,6 +196,35 @@ describe('rijo run', () => {
     expect(implementation.paths).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts']));
   });
 
+  it('blocks recovery when a task path changed after the isolated worker patch was applied', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (t) => t.id.startsWith('code-review-'),
+      (t) =>
+        ok(t, {
+          payload: {
+            approved: false,
+            findings: [
+              {
+                type: 'spec_gap',
+                severity: 'high',
+                description: 'hold finalization',
+                file: null,
+              },
+            ],
+          },
+        }),
+    );
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    expect((await runWorkflow(root, {}, d)).status).toBe('blocked');
+    fs.appendFileSync(path.join(root, 'src', 'a.ts'), '// concurrent user edit\n');
+
+    const resumed = await runWorkflow(root, {}, d);
+    expect(resumed.status).toBe('blocked');
+    expect(resumed.message).toContain('changed after RIJO last controlled');
+    expect(resumed.details?.join('\n')).toContain('src/a.ts');
+  });
+
   it('verification failure does not advance state (atomicity) and bounded repair applies', async () => {
     const d = deps(root);
     // shell always fails for the plan's test command
