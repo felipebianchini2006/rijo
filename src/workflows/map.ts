@@ -135,8 +135,12 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     message: 'validando raiz, checkout, symlinks e freshness',
   });
   const metadata = resolveRepositoryMetadata(projectRoot);
-  if (!sameFilesystemPath(metadata.root, fs.realpathSync(projectRoot))) {
-    return blocked(ctx, 'Map must run from the real repository root.', [`Resolved root: ${metadata.root}`]);
+  const requestedRoot = fs.realpathSync(projectRoot);
+  if (!sameFilesystemPath(metadata.root, requestedRoot)) {
+    return blocked(ctx, 'Map must run from the real repository root.', [
+      `Resolved root: ${metadata.root}`,
+      `Requested root: ${requestedRoot}`,
+    ]);
   }
   if (metadata.is_repo) {
     const dirty = dirtyApplicationPaths(projectRoot, options.allowedDirtyPaths);

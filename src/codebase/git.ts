@@ -41,11 +41,32 @@ export function sameFilesystemPath(
   right: string,
   caseInsensitive = process.platform === 'win32',
 ): boolean {
-  const normalizedLeft = path.normalize(left);
-  const normalizedRight = path.normalize(right);
-  return caseInsensitive
-    ? normalizedLeft.toLocaleLowerCase('en-US') === normalizedRight.toLocaleLowerCase('en-US')
-    : normalizedLeft === normalizedRight;
+  const canonical = (value: string): string => {
+    let normalized = caseInsensitive ? path.win32.resolve(value) : path.resolve(value);
+    if (caseInsensitive) {
+      // Node/Git may disagree about the Windows extended-length prefix while
+      // naming the same directory. path.resolve also removes trailing
+      // separators and normalizes slash direction on the active host.
+      normalized = normalized.replace(/^\\\\\?\\/, '').toLocaleLowerCase('en-US');
+    }
+    return normalized;
+  };
+  if (canonical(left) === canonical(right)) return true;
+
+  // Junctions and 8.3 aliases can remain textually different after both APIs
+  // report a real path. File identity is the final authoritative comparison;
+  // never accept the all-zero placeholder some filesystems expose.
+  try {
+    const leftStat = fs.statSync(left);
+    const rightStat = fs.statSync(right);
+    return (
+      (leftStat.ino !== 0 || leftStat.dev !== 0) &&
+      leftStat.dev === rightStat.dev &&
+      leftStat.ino === rightStat.ino
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function resolveRepositoryMetadata(start: string): RepositoryMetadata {

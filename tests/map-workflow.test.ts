@@ -44,7 +44,7 @@ it('compares Windows real paths with case-insensitive filesystem semantics', () 
   expect(
     sameFilesystemPath(
       'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\project',
-      'C:\\Users\\RUNNERADMIN\\AppData\\Local\\Temp\\project',
+      '\\\\?\\C:\\Users\\RUNNERADMIN\\AppData\\Local\\Temp\\project\\',
       true,
     ),
   ).toBe(true);
