@@ -31,6 +31,23 @@ export interface GitDrift {
   renames: Array<{ from: string; to: string }>;
 }
 
+/**
+ * Compare two already-resolved filesystem paths with the host filesystem's
+ * casing semantics. Windows may return the same real path with drive/directory
+ * casing inherited from different APIs (for example Git vs fs.realpathSync).
+ */
+export function sameFilesystemPath(
+  left: string,
+  right: string,
+  caseInsensitive = process.platform === 'win32',
+): boolean {
+  const normalizedLeft = path.normalize(left);
+  const normalizedRight = path.normalize(right);
+  return caseInsensitive
+    ? normalizedLeft.toLocaleLowerCase('en-US') === normalizedRight.toLocaleLowerCase('en-US')
+    : normalizedLeft === normalizedRight;
+}
+
 export function resolveRepositoryMetadata(start: string): RepositoryMetadata {
   const real = fs.realpathSync(start);
   const top = git(real, ['rev-parse', '--show-toplevel']);
@@ -222,4 +239,3 @@ export function collectGitHistory(root: string, limit = 250): HistoryRecord {
     hotspots,
   });
 }
-

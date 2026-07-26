@@ -7,7 +7,7 @@ import { SystemGit } from '../src/core/git.js';
 import { mapWorkflow, queryCodebaseMap, readCodebaseMapStatus } from '../src/workflows/map.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { runWorkflow } from '../src/workflows/run.js';
-import { collectGitHistory } from '../src/codebase/git.js';
+import { collectGitHistory, sameFilesystemPath } from '../src/codebase/git.js';
 import { buildInventory } from '../src/codebase/inventory.js';
 import { runBaseline } from '../src/codebase/baseline.js';
 import { createContext } from '../src/workflows/shared.js';
@@ -39,6 +39,17 @@ const ARTIFACTS = [
   'baseline.json',
   'map-state.json',
 ];
+
+it('compares Windows real paths with case-insensitive filesystem semantics', () => {
+  expect(
+    sameFilesystemPath(
+      'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\project',
+      'C:\\Users\\RUNNERADMIN\\AppData\\Local\\Temp\\project',
+      true,
+    ),
+  ).toBe(true);
+  expect(sameFilesystemPath('/tmp/Project', '/tmp/project', false)).toBe(false);
+});
 
 function git(root: string, args: string[]): string {
   return execFileSync('git', ['-c', 'user.name=RIJO Test', '-c', 'user.email=rijo@test.local', ...args], {
