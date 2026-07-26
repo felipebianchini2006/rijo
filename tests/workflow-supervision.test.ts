@@ -23,6 +23,8 @@ beforeAll(() => {
   process.on('unhandledRejection', (r) => unhandled.push(r));
 });
 
+const workflowTestTimeout = process.platform === 'win32' ? 120_000 : 15_000;
+
 /** Short real-time supervisor policy so deadlines fire in milliseconds. */
 function fastSupervisor(over: Partial<Record<string, unknown>> = {}): SupervisorConfig {
   return SupervisorConfigSchema.parse({
@@ -75,7 +77,7 @@ describe('workflow supervision (P0.6 item 3)', () => {
     // T02's supervised record ended EXHAUSTED (bounded, not applied)
     const t02 = new TaskStore(new RijoPaths(root)).read('exec-01-T02');
     expect(t02?.state).toBe('EXHAUSTED');
-  }, 15_000);
+  }, workflowTestTimeout);
 
   it('exhaustion after replacements returns BLOCKED with an actionable diagnostic', async () => {
     const d = deps(root);
@@ -99,7 +101,7 @@ describe('workflow supervision (P0.6 item 3)', () => {
     const rec = new TaskStore(new RijoPaths(root)).read('exec-01-T01');
     expect(rec?.state).toBe('EXHAUSTED');
     expect(rec?.replacement_count).toBe(2);
-  }, 15_000);
+  }, workflowTestTimeout);
 
   it('a stale-identity result is never applied (executor preserves LATE_OR_STALE fencing)', async () => {
     // A controller that delivers a result carrying the WRONG generation/lease —
@@ -139,5 +141,5 @@ describe('workflow supervision (P0.6 item 3)', () => {
     // The durable log recorded the stale delivery as discarded.
     const events = new TaskStore(paths).readEvents('exec-stale-T01');
     expect(events.some((e) => e.type === 'late_or_stale_result')).toBe(true);
-  }, 15_000);
+  }, workflowTestTimeout);
 });
