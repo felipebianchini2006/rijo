@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { exists, readText, readTextIfExists, writeFileAtomic, ensureDir } from '../core/fsx.js';
@@ -65,6 +66,52 @@ const ReviewPayloadSchema = z.object({
     .default([]),
 });
 type ReviewPayload = z.infer<typeof ReviewPayloadSchema>;
+
+const PhaseRecoveryBaselineSchema = z.object({
+  snapshot: z.array(z.tuple([z.string(), z.string()])),
+  dirty_at_start: z.array(z.string()),
+});
+
+function phaseRecoveryBaselinePath(ctx: WorkflowContext, milestone: string, phase: string): string {
+  return path.join(ctx.paths.runtimeDir, 'phase-baselines', `${milestone}-${phase}.json`);
+}
+
+function writePhaseRecoveryBaseline(
+  target: string,
+  snapshot: FileSnapshot,
+  dirtyAtStart: Set<string>,
+): void {
+  writeFileAtomic(
+    target,
+    `${JSON.stringify(
+      {
+        snapshot: [...snapshot.entries()].sort(([left], [right]) => left.localeCompare(right)),
+        dirty_at_start: [...dirtyAtStart].sort(),
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+function readPhaseRecoveryBaseline(
+  target: string,
+): { snapshot: FileSnapshot; dirtyAtStart: Set<string> } | null {
+  const raw = readTextIfExists(target);
+  if (!raw) return null;
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const parsed = PhaseRecoveryBaselineSchema.safeParse(json);
+  if (!parsed.success) return null;
+  return {
+    snapshot: new Map(parsed.data.snapshot),
+    dirtyAtStart: new Set(parsed.data.dirty_at_start),
+  };
+}
 
 const UiSmokePayloadSchema = z.object({
   passed: looseBool(false),
@@ -219,7 +266,7 @@ async function executePhase(
   // must never appropriate pre-existing user changes, and overlapping paths are
   // an explicit conflict rather than a silent sweep.
   const gitStatusAtStart = ctx.git.status(ctx.projectRoot);
-  const dirtyAtStart = new Set(gitStatusAtStart.dirtyFiles);
+  const initialDirtyAtStart = new Set(gitStatusAtStart.dirtyFiles);
 
   markPhase('IN_PROGRESS');
 
@@ -444,7 +491,25 @@ async function executePhase(
   // Baseline snapshot of the working tree (excluding .rijo internals) taken
   // before any worker patch is applied — the reviewer's diff and the phase
   // commit are computed against this.
-  const phaseBaseline: FileSnapshot = snapshotFiles(ctx.projectRoot);
+  const recoveryBaselinePath = phaseRecoveryBaselinePath(ctx, milestone.id, phase.id);
+  const taskStates = readPlan(pp.plan).tasks.map((task) => task.status);
+  const hasAppliedTaskProgress = taskStates.some((status) =>
+    ['IMPLEMENTED', 'VERIFYING', 'VERIFIED', 'DONE'].includes(status),
+  );
+  const recoveredBaseline = hasAppliedTaskProgress
+    ? readPhaseRecoveryBaseline(recoveryBaselinePath)
+    : null;
+  if (hasAppliedTaskProgress && !recoveredBaseline) {
+    return blocked(ctx, `Phase ${phase.id}: source baseline needed for safe recovery is missing.`, [
+      'Implemented task paths are present, but RIJO cannot prove which dirty bytes came from its isolated workers.',
+      'The checkout was left unchanged; restore the phase runtime baseline or reconcile the source changes explicitly.',
+    ]);
+  }
+  const phaseBaseline: FileSnapshot = recoveredBaseline?.snapshot ?? snapshotFiles(ctx.projectRoot);
+  const dirtyAtStart = recoveredBaseline?.dirtyAtStart ?? initialDirtyAtStart;
+  if (!recoveredBaseline) {
+    writePhaseRecoveryBaseline(recoveryBaselinePath, phaseBaseline, dirtyAtStart);
+  }
 
   // Deterministic resume: a RUNNING task from a crashed run is reset (its
   // orphan workspace was already discarded — nothing it did survived); a
@@ -819,7 +884,7 @@ async function executePhase(
   // phase — never a DONE phase without its commits. See workflows/finalize.ts;
   // an interrupted finalization is resumed under the lock by reconcileFinalization.
   stage('PERSIST', 'persistindo resumo, evidências e estado');
-  return stageFinalization(ctx, {
+  const finalization = await stageFinalization(ctx, {
     milestone,
     phase,
     pp,
@@ -829,6 +894,8 @@ async function executePhase(
     phaseBaseline,
     dirtyAtStart,
   });
+  if (finalization.ok) fs.rmSync(recoveryBaselinePath, { force: true });
+  return finalization;
 }
 
 /**

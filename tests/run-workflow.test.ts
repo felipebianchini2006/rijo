@@ -163,6 +163,39 @@ describe('rijo run', () => {
     expect(review).toContain('wording can be clarified');
   });
 
+  it('resumes verified worker changes after a review block and commits the original source delta', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (t) => t.id.startsWith('code-review-'),
+      (t) =>
+        ok(t, {
+          payload: {
+            approved: false,
+            findings: [
+              {
+                type: 'spec_gap',
+                severity: 'high',
+                description: 'clarify the contract before finalization',
+                file: null,
+              },
+            ],
+          },
+        }),
+    );
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const blockedRun = await runWorkflow(root, {}, d);
+    expect(blockedRun.status).toBe('blocked');
+
+    d.runner.on(
+      (t) => t.id.startsWith('code-review-'),
+      (t) => ok(t, { payload: { approved: true, findings: [] } }),
+    );
+    const resumed = await runWorkflow(root, {}, d);
+    expect(resumed.ok, resumed.message).toBe(true);
+    const implementation = d.git.commits.find((commit) => commit.message.includes('verified'))!;
+    expect(implementation.paths).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts']));
+  });
+
   it('verification failure does not advance state (atomicity) and bounded repair applies', async () => {
     const d = deps(root);
     // shell always fails for the plan's test command
