@@ -2,8 +2,21 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildInventory, MapPreflightError } from '../src/codebase/inventory.js';
-import { buildContextPacket, validatePlanMapReferences } from '../src/codebase/context.js';
-import { extractSymbols, validateFragmentDetailed } from '../src/codebase/analyze.js';
+import {
+  buildContextPacket,
+  gapsAffectingScope,
+  validatePlanMapReferences,
+} from '../src/codebase/context.js';
+import {
+  assessMapCoverage,
+  buildDependencyGraph,
+  expandImpactPaths,
+  extractSurfaces,
+  extractSymbols,
+  partitionInventory,
+  validateFragment,
+  validateFragmentDetailed,
+} from '../src/codebase/analyze.js';
 import { PhasePlanSchema } from '../src/core/schemas/index.js';
 import { EvidenceSchema, MapClaimSchema } from '../src/codebase/schemas.js';
 import { cleanup, tmpProject } from './helpers.js';
@@ -46,6 +59,36 @@ describe('codebase inventory', () => {
     );
     expect(JSON.stringify(result)).not.toContain('sk-this-value');
     expect(result.coverage.relevant_files_classified).toBe(1);
+  });
+
+  it('never reports 100% coverage while relevant files or mandatory map areas remain unanalyzed', () => {
+    const inventory = buildInventory(root);
+    inventory.excluded_paths.push({ path: 'src/unreadable.ts', reason: 'unreadable' });
+    const assessment = assessMapCoverage(
+      inventory,
+      extractSymbols(root, inventory),
+      extractSurfaces(root, inventory),
+      buildDependencyGraph(inventory),
+      [],
+      { baselineStatus: 'NOT_AVAILABLE', gaps: ['src/unreadable.ts could not be analyzed'] },
+    );
+
+    expect(Object.values(assessment.coverage).some((value) => value < 1)).toBe(true);
+    expect(assessment.status).toBe('PARTIAL');
+  });
+
+  it('derives BLOCKED when a critical ownership gap makes the map unsafe for planning', () => {
+    const inventory = buildInventory(root);
+    const assessment = assessMapCoverage(
+      inventory,
+      extractSymbols(root, inventory),
+      extractSurfaces(root, inventory),
+      buildDependencyGraph(inventory),
+      [],
+      { baselineStatus: 'PASSED', gaps: ['CRITICAL: conflicting owners for src/index.ts'] },
+    );
+
+    expect(assessment.status).toBe('BLOCKED');
   });
 
   it('fails closed when a symlink escapes the repository', () => {
@@ -113,6 +156,110 @@ describe('codebase inventory', () => {
       'secondaryApi',
     ]);
   });
+
+  it('accepts an exact named test-case anchor but still rejects an invented test label', () => {
+    fs.mkdirSync(path.join(root, 'test'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'test', 'counter.test.mjs'),
+      "import test from 'node:test';\ntest('current baseline', () => {});\n",
+    );
+    const inventory = buildInventory(root);
+    const testFile = inventory.files.find((entry) => entry.path === 'test/counter.test.mjs')!;
+    const fragment = (symbol: string) => ({
+      shard_id: 'map-shard-1',
+      module_ids: [testFile.module_id],
+      claims: [
+        {
+          kind: 'operation',
+          statement: 'The mapped test records the current counter baseline.',
+          evidence: [{ path: testFile.path, symbol, file_hash: testFile.file_hash }],
+        },
+      ],
+      gaps: [],
+    });
+
+    expect(
+      validateFragmentDetailed(
+        root,
+        inventory,
+        fragment("test('current baseline')"),
+        [testFile.module_id],
+      ).errors,
+    ).toEqual([]);
+    expect(
+      validateFragmentDetailed(
+        root,
+        inventory,
+        fragment("test('invented behavior')"),
+        [testFile.module_id],
+      ).errors,
+    ).toEqual([`symbol test('invented behavior') not found in ${testFile.path}`]);
+  });
+
+  it('rejects shard evidence owned by a module outside the assigned shard', () => {
+    fs.mkdirSync(path.join(root, 'src', 'billing'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'billing', 'invoice.ts'), 'export const invoice = true;\n');
+    const inventory = buildInventory(root);
+    const auth = inventory.files.find((file) => file.path === 'src/index.ts')!;
+    const billing = inventory.files.find((file) => file.path === 'src/billing/invoice.ts')!;
+    expect(
+      validateFragment(
+        root,
+        inventory,
+        {
+          shard_id: 'auth-only',
+          module_ids: [auth.module_id],
+          claims: [
+            {
+              kind: 'contract',
+              statement: 'Auth owns billing.',
+              evidence: [{ path: billing.path, file_hash: billing.file_hash }],
+            },
+          ],
+          gaps: [],
+        },
+        [auth.module_id],
+      ),
+    ).toBeNull();
+  });
+
+  it('subdivides a large module without exceeding the shard file limit', () => {
+    fs.mkdirSync(path.join(root, 'src', 'large', 'layer'), { recursive: true });
+    for (let i = 0; i < 23; i++) {
+      fs.writeFileSync(path.join(root, 'src', 'large', 'layer', `file-${i}.ts`), `export const f${i} = ${i};\n`);
+    }
+    const inventory = buildInventory(root);
+    const shards = partitionInventory(inventory, ['src/large'], 5, 10_000);
+
+    expect(shards.length).toBeGreaterThan(1);
+    expect(Math.max(...shards.map((shard) => shard.files.length))).toBeLessThanOrEqual(5);
+    expect(new Set(shards.flatMap((shard) => shard.files.map((file) => file.path))).size).toBe(23);
+  });
+
+  it('expands incremental impact to the owner, consumers and related tests', () => {
+    fs.mkdirSync(path.join(root, 'src', 'auth'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'src', 'api'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'auth', 'session.ts'), 'export const session = true;\n');
+    fs.writeFileSync(path.join(root, 'src', 'auth', 'index.ts'), "export { session } from './session.js';\n");
+    fs.writeFileSync(path.join(root, 'src', 'api', 'server.ts'), "import { session } from '../auth/session.js';\nexport const server = session;\n");
+    fs.writeFileSync(path.join(root, 'tests', 'auth.test.ts'), "import { session } from '../src/auth/session.js';\n");
+    const inventory = buildInventory(root);
+    const expanded = expandImpactPaths(
+      inventory,
+      buildDependencyGraph(inventory),
+      extractSurfaces(root, inventory),
+      ['src/auth/session.ts'],
+    );
+
+    expect(expanded).toEqual(
+      expect.arrayContaining([
+        'src/auth/session.ts',
+        'src/auth/index.ts',
+        'src/api/server.ts',
+        'tests/auth.test.ts',
+      ]),
+    );
+  });
 });
 
 describe('directed codebase context', () => {
@@ -168,6 +315,28 @@ describe('directed codebase context', () => {
     );
     fs.writeFileSync(path.join(dir, 'surfaces.json'), JSON.stringify({ schema_version: 1, surfaces: [] }));
     fs.writeFileSync(
+      path.join(dir, 'claims.json'),
+      JSON.stringify({
+        schema_version: 1,
+        claims: [
+          {
+            kind: 'contract',
+            statement: 'Authentication uses the mapped session validator.',
+            evidence: [{ path: 'src/auth/service.ts', symbol: 'AuthService.validateSession', file_hash: 'a'.repeat(64) }],
+          },
+          {
+            kind: 'risk',
+            statement: 'Session changes can invalidate checkout authentication.',
+            evidence: [{ path: 'src/auth/service.ts', file_hash: 'a'.repeat(64) }],
+          },
+        ],
+      }),
+    );
+    fs.writeFileSync(path.join(dir, 'CONVENTIONS.md'), '# Conventions\n\n- Keep auth validation in the auth module.\n');
+    fs.writeFileSync(path.join(dir, 'BASELINE.md'), '# Brownfield Baseline\n\nOverall status: **PASSED**.\n');
+    fs.writeFileSync(path.join(dir, 'CONCERNS.md'), '# Concerns\n\n- Session compatibility is a mapped risk.\n');
+    fs.writeFileSync(path.join(root, '.rijo', 'DECISIONS.md'), '# Decisions\n\n## DEC-auth\n- Selected: preserve session validation.\n');
+    fs.writeFileSync(
       path.join(dir, 'dependency-graph.json'),
       JSON.stringify({
         schema_version: 1,
@@ -220,6 +389,40 @@ describe('directed codebase context', () => {
     expect(packet.selected_modules).toContain('tests');
     expect(packet.bytes).toBeLessThanOrEqual(900);
     expect(packet.files_loaded).not.toContain(path.join(root, '.rijo', 'codebase', 'ARCHITECTURE.md'));
+  });
+
+  it('gives the planner directed conventions, baseline, risks, decisions, contracts, freshness and gaps', () => {
+    const statePath = path.join(root, '.rijo', 'codebase', 'map-state.json');
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    state.status = 'PARTIAL';
+    state.gaps = ['checkout/session integration has not been semantically reviewed'];
+    fs.writeFileSync(statePath, JSON.stringify(state));
+
+    const packet = buildContextPacket(root, 'Alterar validação de sessão no AuthService', 8_000);
+
+    expect(packet.text).toContain('Conventions');
+    expect(packet.text).toContain('Baseline');
+    expect(packet.text).toContain('Session changes can invalidate checkout authentication');
+    expect(packet.text).toContain('DEC-auth');
+    expect(packet.text).toContain('Authentication uses the mapped session validator');
+    expect(packet.text).toContain('PARTIAL');
+    expect(packet.text).toContain('checkout/session integration has not been semantically reviewed');
+    expect(packet.text).toContain(`src/auth/service.ts [code] sha256=${'a'.repeat(64)}`);
+    expect(packet.text).toContain(`tests/auth.test.ts [test] sha256=${'b'.repeat(64)}`);
+    expect(packet.bytes).toBeLessThanOrEqual(8_000);
+  });
+
+  it('blocks only partial-map gaps that intersect the factual planning scope', () => {
+    const gaps = [
+      'package-lock.json dependency details were not semantically reviewed',
+      'AGENTS.md references files outside its documentation shard',
+      'src/auth/session.ts public contract has not been reviewed',
+    ];
+
+    expect(gapsAffectingScope(gaps, 'Change the auth session contract in src/auth/session.ts')).toEqual([
+      'src/auth/session.ts public contract has not been reviewed',
+    ]);
+    expect(gapsAffectingScope(gaps, 'Change only src/counter.mjs; dependencies are out of scope')).toEqual([]);
   });
 
   it('rejects fabricated planner paths, symbols, and hashes before execution', () => {

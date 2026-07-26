@@ -45,7 +45,9 @@ import {
 } from './shared.js';
 import { inferSecurityTag, inferHighRisk } from './routing.js';
 import { stageFinalization } from './finalize.js';
-import { buildContextPacket, validatePlanMapReferences } from '../codebase/context.js';
+import { buildContextPacket, gapsAffectingScope, validatePlanMapReferences } from '../codebase/context.js';
+import { readMapState } from '../codebase/state.js';
+import { ensureCodebaseMap } from './map.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -267,6 +269,40 @@ async function executePhase(
     setTaskStatus(pp.plan, taskId, to);
     touchManifest(paths, () => {}, now);
   };
+
+  if (!exists(pp.plan) && readMapState(paths)) {
+    stage('LOAD', 'verificando freshness do mapa antes do planejamento da fase');
+    const ensured = await ensureCodebaseMap(ctx, { commit: true });
+    if (!ensured.outcome.ok) return ensured.outcome;
+    if (!ensured.state || ensured.state.status === 'BLOCKED') {
+      return blocked(ctx, `Phase ${phase.id}: current codebase map is not safe for planning.`, [
+        `Map status: ${ensured.state?.status ?? 'missing'}.`,
+        ...(ensured.state?.gaps ?? []),
+      ]);
+    }
+    const phaseRequirements = readRequirements(milestone.paths.requirements).requirements.filter(
+      (requirement) => requirement.phase === phase.id,
+    );
+    const phaseScope = [
+      phase.name,
+      ...phaseRequirements.flatMap((requirement) => [requirement.description, requirement.acceptance]),
+    ].join('\n');
+    const affectingGaps = gapsAffectingScope(ensured.state.gaps, phaseScope);
+    if (ensured.state.status === 'PARTIAL' && affectingGaps.length > 0) {
+      return blocked(ctx, `Phase ${phase.id}: codebase map gaps intersect the phase scope.`, affectingGaps);
+    }
+    bus.emit(
+      'run.map_context_fresh',
+      { message: `fase ${phase.id} usará mapa ${ensured.state.mapped_commit}` },
+      {
+        phase: phase.id,
+        mapped_commit: ensured.state.mapped_commit,
+        mapped_tree_hash: ensured.state.mapped_tree_hash,
+        last_operation: ensured.state.last_operation,
+        changed_paths: ensured.state.changed_paths_since_map,
+      },
+    );
+  }
 
   // Record which files were ALREADY dirty before this phase ran: a phase commit
   // must never appropriate pre-existing user changes, and overlapping paths are

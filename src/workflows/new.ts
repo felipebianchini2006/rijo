@@ -51,7 +51,7 @@ import {
 import { runCore } from './run.js';
 import { uiCore } from './ui.js';
 import { ensureCodebaseMap } from './map.js';
-import { buildContextPacket } from '../codebase/context.js';
+import { buildContextPacket, gapsAffectingScope } from '../codebase/context.js';
 
 export interface NewOptions {
   planFile: string;
@@ -184,10 +184,11 @@ export async function newWorkflow(
         allowedDirtyPaths: [path.relative(projectRoot, planPath).split(path.sep).join('/')],
       });
       if (!ensured.outcome.ok) return ensured.outcome;
-      if (!ensured.state || ensured.state.status !== 'COMPLETE') {
-        return blocked(ctx, 'Brownfield codebase map is not complete for planning.', [
+      if (!ensured.state || ensured.state.status === 'BLOCKED') {
+        return blocked(ctx, 'Brownfield codebase map is blocked for planning.', [
           `Map status: ${ensured.state?.status ?? 'missing'}.`,
           `Relevant stale paths: ${ensured.state?.changed_paths_since_map.join(', ') || 'unknown'}.`,
+          ...(ensured.state?.gaps ?? []),
         ]);
       }
       const packet = buildContextPacket(
@@ -195,6 +196,10 @@ export async function newWorkflow(
         planContent,
         Math.min(config.context_budget_bytes, Math.max(4096, Math.floor(config.context_budget_bytes * 0.6))),
       );
+      const affectingGaps = gapsAffectingScope(ensured.state.gaps, planContent);
+      if (ensured.state.status === 'PARTIAL' && affectingGaps.length > 0) {
+        return blocked(ctx, 'Brownfield codebase map has gaps in the requested planning scope.', affectingGaps);
+      }
       codebaseContext = packet.text;
       bus.emit(
         'new.map_context',
@@ -276,7 +281,7 @@ export async function newWorkflow(
       ensureDir(paths.researchDir);
       // volatile internals never enter version control
       writeFileAtomic(path.join(paths.root, '.gitignore'), ['runtime/', 'events.jsonl', 'archive/', ''].join('\n'));
-      saveConfig(paths, defaultConfig());
+    if (!exists(paths.config)) saveConfig(paths, defaultConfig());
       writeManifest(paths, newManifest(now));
     }
     const newId = nextMilestoneId(readManifest(paths));

@@ -44,6 +44,33 @@ function score(text: string, wanted: Set<string>): number {
   return total;
 }
 
+export function gapsAffectingScope(gaps: string[], scopeText: string): string[] {
+  const scopeTerms = terms(scopeText);
+  const pathPattern =
+    /(?:\.rijo\/[A-Za-z0-9_./-]+|(?:src|lib|app|apps|packages|tests?|migrations?|scripts?|config)\/[A-Za-z0-9_./-]+|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|swift|sql|json|ya?ml|toml|md))/gi;
+  return gaps.filter((gap) => {
+    if (/\b(?:critical|unsafe|contradiction|conflicting owners?|invented path|invented symbol)\b/i.test(gap)) {
+      return true;
+    }
+    if (/^Coverage gap in /i.test(gap) || /Brownfield baseline status is (?:FAILED|BLOCKED)/i.test(gap)) {
+      return true;
+    }
+    const paths = [...gap.matchAll(pathPattern)].map((match) => match[0]!.replace(/[.,;:]+$/, ''));
+    if (paths.length === 0) return true;
+    return paths.some((candidate) => {
+      if (candidate.startsWith('.rijo/')) return false;
+      const normalized = candidate.toLowerCase();
+      const basename = path.posix.basename(normalized, path.posix.extname(normalized));
+      const moduleParts = normalized.split('/').filter((part) => part.length >= 3);
+      return (
+        scopeText.toLowerCase().includes(normalized) ||
+        (basename.length >= 3 && scopeTerms.has(basename)) ||
+        moduleParts.some((part) => scopeTerms.has(part))
+      );
+    });
+  });
+}
+
 function boundedJoin(parts: string[], budget: number): string {
   let out = '';
   for (const part of parts) {
@@ -52,6 +79,11 @@ function boundedJoin(parts: string[], budget: number): string {
     out = candidate;
   }
   return out;
+}
+
+function clip(text: string, maxChars = 1_200): string {
+  const trimmed = text.trim();
+  return trimmed.length <= maxChars ? trimmed : `${trimmed.slice(0, maxChars)}…`;
 }
 
 export function buildContextPacket(projectRoot: string, planText: string, budgetBytes: number): CodebaseContextPacket {
@@ -70,15 +102,22 @@ export function buildContextPacket(projectRoot: string, planText: string, budget
   };
 
   const summary = loadText('SUMMARY.md');
+  const conventions = loadText('CONVENTIONS.md');
+  const baselineText = loadText('BASELINE.md');
+  const concerns = loadText('CONCERNS.md');
   const inventoryRaw = loadJson<unknown>('inventory.json');
   const symbolsRaw = loadJson<unknown>('symbols.json');
   const surfacesRaw = loadJson<unknown>('surfaces.json');
   const graphRaw = loadJson<unknown>('dependency-graph.json');
+  const claimsRaw = loadJson<unknown>('claims.json');
   const stateRaw = loadJson<unknown>('map-state.json');
+  loaded.push(paths.decisions);
+  const decisions = readTextIfExists(paths.decisions) ?? '';
   const inventory = InventoryDocumentSchema.safeParse(inventoryRaw);
   const symbols = SymbolsDocumentSchema.safeParse(symbolsRaw);
   const surfaces = SurfacesDocumentSchema.safeParse(surfacesRaw);
   const graph = DependencyGraphSchema.safeParse(graphRaw);
+  const claims = ClaimsDocumentSchema.safeParse(claimsRaw);
   const state = MapStateSchema.safeParse(stateRaw);
   if (!inventory.success || !symbols.success || !surfaces.success || !graph.success || !state.success) {
     const text = boundedJoin(['CODEBASE MAP: unavailable or invalid.', summary], budgetBytes);
@@ -118,22 +157,53 @@ export function buildContextPacket(projectRoot: string, planText: string, budget
     .slice(0, 30);
   const surfaceRows = surfaces.data.surfaces.filter((s) => selected.includes(s.module_id)).slice(0, 20);
   const graphRows = graph.data.modules.filter((m) => selected.includes(m.id));
+  const selectedPaths = new Set(files.map((file) => file.path));
+  const selectedClaims = claims.success
+    ? claims.data.claims.filter(
+        (claim) =>
+          claim.evidence.some((item) => selectedPaths.has(item.path)) ||
+          score(`${claim.kind} ${claim.statement}`, wanted) > 0,
+      )
+    : [];
+  const contractRows = selectedClaims.filter((claim) => claim.kind === 'contract');
+  const riskRows = selectedClaims.filter((claim) => claim.kind === 'risk');
+  const testRows = files.filter((file) => file.kind === 'test');
   const freshness = `${state.data.status} @ ${state.data.mapped_commit} (${state.data.mapped_at})`;
   const parts = [
     'CODEBASE MAP CONTEXT (deterministic local query; use cited existing paths/symbols, do not invent them)',
     `Freshness: ${freshness}`,
     summary.trim(),
-    `Related modules:\n${graphRows
-      .map((m) => `- ${m.id}: paths=${m.paths.join(', ')} dependencies=${m.dependencies.join(', ') || 'none'} consumers=${m.consumers.join(', ') || 'none'}`)
+    `Related files and contracts:\n${files
+      .map(
+        (f) =>
+          `- ${f.path} [${f.kind}] sha256=${f.file_hash} exports=${f.exports.join(', ') || 'none'}`,
+      )
       .join('\n')}`,
-    `Related files and contracts:\n${files.map((f) => `- ${f.path} [${f.kind}] exports=${f.exports.join(', ') || 'none'}`).join('\n')}`,
     `Related symbols:\n${symbolRows
       .map((s) => `- ${s.name} — ${s.evidence.path}${s.evidence.lines ? `:${s.evidence.lines}` : ''} sha256=${s.evidence.file_hash}`)
+      .join('\n')}`,
+    `Conventions:\n${clip(conventions) || '- No mapped convention for the selected scope.'}`,
+    `Brownfield Baseline:\n${clip(baselineText) || `- ${state.data.baseline_status}`}`,
+    `Risks:\n${
+      riskRows.length
+        ? riskRows.map((claim) => `- ${claim.statement} (${claim.evidence.map((item) => item.path).join(', ')})`).join('\n')
+        : clip(concerns) || '- No mapped risk for the selected scope.'
+    }`,
+    `Previous decisions:\n${clip(decisions) || '- No previous material decision recorded.'}`,
+    `Mapped contracts:\n${
+      contractRows.length
+        ? contractRows.map((claim) => `- ${claim.statement} (${claim.evidence.map((item) => item.path).join(', ')})`).join('\n')
+        : '- No additional claim-level contract for the selected scope.'
+    }`,
+    `Freshness gaps:\n${state.data.gaps.length ? state.data.gaps.map((gap) => `- ${gap}`).join('\n') : '- none'}`,
+    `Related tests:\n${testRows.length ? testRows.map((file) => `- ${file.path}`).join('\n') : '- none detected'}`,
+    `Related modules:\n${graphRows
+      .map((m) => `- ${m.id}: paths=${m.paths.join(', ')} dependencies=${m.dependencies.join(', ') || 'none'} consumers=${m.consumers.join(', ') || 'none'}`)
       .join('\n')}`,
     `Related surfaces:\n${surfaceRows.map((s) => `- ${s.kind} ${s.method ?? ''} ${s.path} — ${s.evidence.path}`).join('\n')}`,
   ].filter((p) => p.trim() !== '');
   let text = boundedJoin(parts, budgetBytes);
-  if (Buffer.byteLength(text) > budgetBytes) text = text.slice(0, Math.max(0, budgetBytes - 20));
+  while (Buffer.byteLength(text) > budgetBytes && text.length > 0) text = text.slice(0, -1);
   return {
     text,
     bytes: Buffer.byteLength(text),

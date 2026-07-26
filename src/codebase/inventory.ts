@@ -345,11 +345,11 @@ export function buildInventory(projectRoot: string, maxEntries = 50_000): Invent
 
   const sourceRoots = [...new Set(files.filter((f) => ['code', 'test', 'migration'].includes(f.kind)).map((f) => f.path.split('/')[0]!))].sort();
   const entrypoints = files.filter((f) => /(^|\/)(index|main|app|server|cli)\.[^.]+$/.test(f.path));
-  const modules = new Set(files.map((f) => f.module_id));
-  const publicContracts = files.filter((f) => f.exports.length > 0);
-  const dataFiles = files.filter((f) => f.kind === 'migration' || /(^|\/)(models?|schemas?|db)(\/|$)/i.test(f.path));
-  const testsOps = files.filter((f) => f.kind === 'test' || f.kind === 'script' || /Dockerfile|\.github\//.test(f.path));
-  const ratio = (covered: number, total: number): number => (total === 0 ? 1 : Math.min(1, covered / total));
+  const relevantExclusions = excluded.filter((item) => item.reason === 'large_file' || item.reason === 'unreadable');
+  const classifiedRatio =
+    files.length + relevantExclusions.length === 0
+      ? 0
+      : files.length / (files.length + relevantExclusions.length);
 
   return InventoryDocumentSchema.parse({
     schema_version: CODEBASE_SCHEMA_VERSION,
@@ -362,15 +362,14 @@ export function buildInventory(projectRoot: string, maxEntries = 50_000): Invent
     package_managers: packageManager(manifests, lockfiles),
     detected_commands: [...new Map(commands.map((c) => [c.command, c])).values()],
     coverage: {
-      relevant_files_classified: 1,
-      entrypoints_covered: ratio(entrypoints.length, entrypoints.length),
-      modules_covered: ratio(modules.size, modules.size),
-      public_contracts_covered: ratio(publicContracts.length, publicContracts.length),
-      surfaces_covered: 1,
-      data_covered: ratio(dataFiles.length, dataFiles.length),
-      tests_operations_covered: ratio(testsOps.length, testsOps.length),
-      claims_verified: 1,
+      relevant_files_classified: classifiedRatio,
+      entrypoints_covered: entrypoints.length === 0 ? 1 : 0,
+      modules_covered: 0,
+      public_contracts_covered: 0,
+      surfaces_covered: 0,
+      data_covered: 0,
+      tests_operations_covered: 0,
+      claims_verified: 0,
     },
   });
 }
-

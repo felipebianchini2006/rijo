@@ -37,6 +37,7 @@ const ARTIFACTS = [
   'dependency-graph.json',
   'surfaces.json',
   'baseline.json',
+  'review-receipts.json',
   'map-state.json',
 ];
 
@@ -105,9 +106,79 @@ describe('rijo map workflow', () => {
     const baseline = JSON.parse(fs.readFileSync(path.join(paths.codebaseDir, 'baseline.json'), 'utf8'));
     expect(baseline.commands.every((c: any) => c.status === 'PASSED')).toBe(true);
     expect(fs.readFileSync(path.join(root, 'src', 'auth', 'service.ts'), 'utf8')).toBe(before);
-    const reviewer = d.runner.executed.find((task) => task.id === 'map-review')!;
+    const reviewer = d.runner.executed.find((task) => task.id.startsWith('map-review'))!;
     expect(reviewer.objective).toContain('Do not execute repository commands');
     expect(reviewer.return_format).toContain('Evidence must be structured objects');
+  });
+
+  it('reviews every claim beyond 250 in bounded shards and persists structural and semantic receipts', async () => {
+    for (let index = 0; index < 130; index++) {
+      const dir = path.join(root, 'packages', `module-${String(index).padStart(3, '0')}`);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'index.ts'), `export const value${index} = ${index};\n`);
+    }
+    git(root, ['add', 'packages']);
+    git(root, ['commit', '-m', 'feat: add large modular codebase']);
+    const d = deps(root);
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+    expect(outcome.ok, outcome.message).toBe(true);
+
+    const claims = JSON.parse(
+      fs.readFileSync(path.join(new RijoPaths(root).codebaseDir, 'claims.json'), 'utf8'),
+    ).claims as Array<{ statement: string }>;
+    expect(claims.length).toBeGreaterThan(250);
+    const reviewedStatements = new Set<string>();
+    for (const task of d.runner.executed.filter((candidate) => candidate.id.startsWith('map-review-'))) {
+      const marker = 'CANDIDATE CLAIM SHARD:\n';
+      if (!task.notes.includes(marker)) continue;
+      const raw = task.notes
+        .slice(task.notes.indexOf(marker) + marker.length)
+        .split('\n\nAUTONOMOUS DECISION POLICY')[0]!;
+      for (const claim of JSON.parse(raw) as Array<{ statement: string }>) reviewedStatements.add(claim.statement);
+    }
+    expect(reviewedStatements.size).toBe(claims.length);
+
+    const receipts = JSON.parse(
+      fs.readFileSync(path.join(new RijoPaths(root).codebaseDir, 'review-receipts.json'), 'utf8'),
+    );
+    expect(receipts.claim_receipts).toHaveLength(claims.length);
+    expect(receipts.claim_receipts.every((receipt: any) => receipt.structural === 'PASSED')).toBe(true);
+    expect(receipts.claim_receipts.every((receipt: any) => receipt.semantic === 'APPROVED')).toBe(true);
+    expect(receipts.consolidation.status).toBe('APPROVED');
+  });
+
+  it('drops rejected enriched claims and promotes only a re-reviewed deterministic fallback', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id === 'map-review-001',
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'semantic overreach found',
+        files_written: [],
+        payload: {
+          approved: false,
+          findings: [
+            {
+              code: 'MISSING_EVIDENCE',
+              message: 'The enriched responsibility claim overreaches its evidence.',
+              evidence: [],
+            },
+          ],
+        },
+        scope_requests: [],
+      }),
+    );
+
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+    expect(outcome.ok, outcome.message).toBe(true);
+    const claims = JSON.parse(
+      fs.readFileSync(path.join(new RijoPaths(root).codebaseDir, 'claims.json'), 'utf8'),
+    ).claims as Array<{ statement: string }>;
+    expect(claims.some((claim) => claim.statement.includes('owned by its mapped shard'))).toBe(false);
+    expect(d.runner.executed.some((task) => task.id === 'map-review-fallback-001')).toBe(true);
+    const events = fs.readFileSync(new RijoPaths(root).events, 'utf8');
+    expect(events).toContain('map.review_fallback');
   });
 
   it('refuses a dirty checkout without corrupting the durable checkpoint needed for a clean retry', async () => {
@@ -154,6 +225,95 @@ describe('rijo map workflow', () => {
     const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
     expect(state.last_operation).toBe('incremental');
     expect(state.changed_paths_since_map).toContain('src/auth/service.ts');
+  });
+
+  it('does not turn a documentation-only incremental shard into a blocking code coverage gap', async () => {
+    const d = deps(root);
+    const wired = { ...d, git: new SystemGit() };
+    expect((await mapWorkflow(root, {}, wired)).ok).toBe(true);
+
+    fs.writeFileSync(path.join(root, 'PLANO.md'), '# Future work\n\nAdd a counter command in a later phase.\n');
+    git(root, ['add', 'PLANO.md']);
+    git(root, ['commit', '-m', 'docs: add future implementation plan']);
+    d.runner.on(
+      (task) => task.id.startsWith('map-shard-'),
+      (task) => {
+        const marker = 'SHARD INVENTORY:\n';
+        const inventory = JSON.parse(
+          task.notes.slice(task.notes.indexOf(marker) + marker.length).split('\n\nAUTONOMOUS DECISION POLICY')[0]!,
+        ) as Array<{
+          path: string;
+          module_id: string;
+          file_hash: string;
+        }>;
+        return {
+          task_id: task.id,
+          ok: true,
+          summary: 'documentation shard inspected',
+          files_written: [],
+          payload: {
+            shard_id: task.id,
+            module_ids: [...new Set(inventory.map((entry) => entry.module_id))],
+            claims: [],
+            gaps: [
+              'No source code (only this documentation file) is assigned to this shard, so no code-level responsibilities can be derived.',
+            ],
+          },
+          scope_requests: [],
+        };
+      },
+    );
+
+    const incremental = await mapWorkflow(root, {}, wired);
+
+    expect(incremental.ok, incremental.message).toBe(true);
+    const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
+    expect(state.status).toBe('COMPLETE');
+    expect(state.gaps).not.toContain(expect.stringMatching(/no source code/i));
+  });
+
+  it('records mapper observations but only lets reviewed or derived coverage gaps affect map status', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id.startsWith('map-shard-'),
+      (task) => {
+        const payload = mapFragmentFor(task) as {
+          shard_id: string;
+          module_ids: string[];
+          claims: unknown[];
+          gaps: string[];
+        };
+        payload.gaps = [
+          'No consumer of the newly exported revision marker is visible in the assigned shard.',
+        ];
+        return {
+          task_id: task.id,
+          ok: true,
+          summary: 'mapper observation recorded',
+          files_written: [],
+          payload,
+          scope_requests: [],
+        };
+      },
+    );
+
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const paths = new RijoPaths(root);
+    const state = JSON.parse(fs.readFileSync(paths.codebaseMapState, 'utf8'));
+    expect(state.status).toBe('COMPLETE');
+    expect(state.gaps).toEqual([]);
+    const receipts = JSON.parse(
+      fs.readFileSync(path.join(paths.codebaseDir, 'review-receipts.json'), 'utf8'),
+    );
+    expect(receipts.mapper_observations).toContainEqual(
+      expect.objectContaining({
+        shard_id: expect.stringMatching(/^map-shard-/),
+        message: expect.stringMatching(/no consumer/i),
+        review_status: 'APPROVED_NON_BLOCKING',
+      }),
+    );
   });
 
   it('answers deterministic queries and status without dispatching a model', async () => {
@@ -282,6 +442,37 @@ describe('rijo map workflow', () => {
     const generations = d.runner.executed.filter((task) => task.id.startsWith('map-shard-'));
     expect(generations.length).toBeGreaterThanOrEqual(2);
     expect(new Set(generations.map((task) => task.workspace?.id)).size).toBeGreaterThanOrEqual(2);
+  });
+
+  it('repairs one schema-invalid mapper payload in a fresh supervised shard attempt', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id === 'map-shard-1',
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'malformed evidence',
+        files_written: [],
+        payload: {
+          shard_id: task.id,
+          module_ids: ['src/auth'],
+          claims: [
+            {
+              kind: 'contract',
+              statement: 'Missing hash must be rejected.',
+              evidence: [{ path: 'src/auth/service.ts' }],
+            },
+          ],
+          gaps: [],
+        },
+        scope_requests: [],
+      }),
+    );
+
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    expect(d.runner.executed.some((task) => task.id === 'map-shard-1-correction')).toBe(true);
   });
 
   it('falls back to a full map when the recorded base commit is no longer reachable', async () => {
@@ -445,5 +636,39 @@ describe('rijo new brownfield map integration', () => {
     const stale = readStaleMarker(new RijoPaths(root));
     expect(stale?.changed_paths).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts']));
     expect(stale?.changed_paths.every((changed) => !changed.startsWith('.rijo/'))).toBe(true);
+  });
+
+  it('run --all incrementally remaps phase impact before planning the next phase', async () => {
+    const d = deps(root);
+    const created = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() });
+    expect(created.ok, created.message).toBe(true);
+    const outcome = await runWorkflow(root, { target: 'all' }, { ...d, git: new SystemGit() });
+    expect(outcome.ok, outcome.message).toBe(true);
+
+    const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
+    expect(state.last_operation).toBe('incremental');
+    expect(state.changed_paths_since_map).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts']));
+    const secondSpec = d.runner.executed.find((task) => task.id === 'spec-02')!;
+    expect(secondSpec.notes).toContain('src/a.ts');
+    expect(
+      d.runner.executed.filter((task) => task.id.startsWith('map-shard-')).some((task) =>
+        task.notes.includes('src/a.ts'),
+      ),
+    ).toBe(true);
+    const events = fs
+      .readFileSync(new RijoPaths(root).events, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'run.map_context_fresh',
+        data: expect.objectContaining({
+          phase: '02',
+          mapped_commit: state.mapped_commit,
+          last_operation: 'incremental',
+        }),
+      }),
+    );
   });
 });

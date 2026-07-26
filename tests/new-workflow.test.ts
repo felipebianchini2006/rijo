@@ -6,6 +6,7 @@ import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
+import { defaultConfig, loadConfig, saveConfig } from '../src/core/config.js';
 import { tmpProject, cleanup, writePlanFile, deps } from './helpers.js';
 
 describe('rijo new (greenfield)', () => {
@@ -43,6 +44,18 @@ describe('rijo new (greenfield)', () => {
     expect(state.milestone).toBe('M001');
     expect(fs.existsSync(path.join(mdir, 'SCOPE.md'))).toBe(true);
     expect(fs.existsSync(path.join(mdir, 'RESEARCH.md'))).toBe(true);
+  });
+
+  it('preserves a valid preconfigured runtime instead of replacing it with defaults', async () => {
+    const paths = new RijoPaths(root);
+    const configured = defaultConfig();
+    configured.context_budget_bytes = 12_345;
+    saveConfig(paths, configured);
+
+    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, deps(root));
+
+    expect(outcome.ok).toBe(true);
+    expect(loadConfig(paths).context_budget_bytes).toBe(12_345);
   });
 
   it('refuses re-initialization without --next (non-destructive)', async () => {

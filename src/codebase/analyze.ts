@@ -11,6 +11,7 @@ import {
   SymbolRecordSchema,
   SymbolsDocumentSchema,
   type CodebaseInventoryEntry,
+  type CodebaseCoverage,
   type DependencyGraph,
   type Evidence,
   type InventoryDocument,
@@ -114,8 +115,13 @@ export function extractSurfaces(root: string, inventory: InventoryDocument): Sur
 function resolveImport(from: string, imported: string, inventoryPaths: Set<string>): string | null {
   if (!imported.startsWith('.')) return null;
   const base = path.posix.normalize(path.posix.join(path.posix.dirname(from), imported));
+  const sourceBase = /\.[cm]?jsx?$/.test(base) ? base.replace(/\.[cm]?jsx?$/, '') : base;
   const candidates = [
     base,
+    `${sourceBase}.ts`,
+    `${sourceBase}.tsx`,
+    `${sourceBase}.mts`,
+    `${sourceBase}.cts`,
     `${base}.ts`,
     `${base}.tsx`,
     `${base}.js`,
@@ -163,6 +169,31 @@ export interface MapShard {
   files: CodebaseInventoryEntry[];
 }
 
+function moduleSegments(
+  moduleId: string,
+  files: CodebaseInventoryEntry[],
+  maxFiles: number,
+  maxBytes: number,
+): Array<{ moduleId: string; files: CodebaseInventoryEntry[] }> {
+  const segments: Array<{ moduleId: string; files: CodebaseInventoryEntry[] }> = [];
+  let current: CodebaseInventoryEntry[] = [];
+  let bytes = 0;
+  for (const file of [...files].sort((a, b) => {
+    const dirOrder = path.posix.dirname(a.path).localeCompare(path.posix.dirname(b.path));
+    return dirOrder || a.path.localeCompare(b.path);
+  })) {
+    if (current.length > 0 && (current.length + 1 > maxFiles || bytes + file.bytes > maxBytes)) {
+      segments.push({ moduleId, files: current });
+      current = [];
+      bytes = 0;
+    }
+    current.push(file);
+    bytes += file.bytes;
+  }
+  if (current.length > 0) segments.push({ moduleId, files: current });
+  return segments;
+}
+
 export function partitionInventory(
   inventory: InventoryDocument,
   scopedPaths: string[] = [],
@@ -182,18 +213,150 @@ export function partitionInventory(
   let current: MapShard = { id: 'map-shard-1', module_ids: [], files: [] };
   let bytes = 0;
   for (const [moduleId, files] of [...byModule.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    const moduleBytes = files.reduce((sum, file) => sum + file.bytes, 0);
-    if (current.files.length > 0 && (current.files.length + files.length > maxFiles || bytes + moduleBytes > maxBytes)) {
-      shards.push(current);
-      current = { id: `map-shard-${shards.length + 1}`, module_ids: [], files: [] };
-      bytes = 0;
+    for (const segment of moduleSegments(moduleId, files, maxFiles, maxBytes)) {
+      const segmentBytes = segment.files.reduce((sum, file) => sum + file.bytes, 0);
+      if (
+        current.files.length > 0 &&
+        (current.files.length + segment.files.length > maxFiles || bytes + segmentBytes > maxBytes)
+      ) {
+        shards.push(current);
+        current = { id: `map-shard-${shards.length + 1}`, module_ids: [], files: [] };
+        bytes = 0;
+      }
+      if (!current.module_ids.includes(segment.moduleId)) current.module_ids.push(segment.moduleId);
+      current.files.push(...segment.files);
+      bytes += segmentBytes;
     }
-    current.module_ids.push(moduleId);
-    current.files.push(...files);
-    bytes += moduleBytes;
   }
   if (current.files.length > 0) shards.push(current);
   return shards;
+}
+
+export function expandImpactPaths(
+  inventory: InventoryDocument,
+  graph: DependencyGraph,
+  surfaces: SurfacesDocument,
+  changedPaths: string[],
+): string[] {
+  const normalized = changedPaths.map((item) => item.replace(/\\/g, '/').replace(/\/+$/, ''));
+  const directlyChanged = inventory.files.filter((file) =>
+    normalized.some((scope) => file.path === scope || file.path.startsWith(`${scope}/`)),
+  );
+  const impactedModules = new Set(directlyChanged.map((file) => file.module_id));
+  for (const moduleId of [...impactedModules]) {
+    const module = graph.modules.find((candidate) => candidate.id === moduleId);
+    if (!module) continue;
+    for (const neighbor of [...module.dependencies, ...module.consumers]) impactedModules.add(neighbor);
+  }
+  for (const surface of surfaces.surfaces) {
+    if (directlyChanged.some((file) => file.path === surface.evidence.path)) impactedModules.add(surface.module_id);
+  }
+  const ownerTerms = new Set(
+    directlyChanged.flatMap((file) => [
+      file.module_id.split('/').at(-1)!.toLowerCase(),
+      path.posix.basename(file.path, path.posix.extname(file.path)).toLowerCase(),
+    ]),
+  );
+  const impacted = inventory.files.filter((file) => {
+    if (impactedModules.has(file.module_id)) return true;
+    if (!['test', 'migration', 'script', 'configuration'].includes(file.kind)) return false;
+    const searchable = `${file.path} ${file.imports.join(' ')}`.toLowerCase();
+    return [...ownerTerms].some((term) => term.length >= 3 && searchable.includes(term));
+  });
+  return [...new Set([...normalized, ...impacted.map((file) => file.path)])].sort();
+}
+
+export interface MapCoverageAssessment {
+  coverage: CodebaseCoverage;
+  status: 'COMPLETE' | 'PARTIAL' | 'BLOCKED';
+  gaps: string[];
+}
+
+export function assessMapCoverage(
+  inventory: InventoryDocument,
+  symbols: SymbolsDocument,
+  surfaces: SurfacesDocument,
+  graph: DependencyGraph,
+  claims: MapClaim[],
+  options: { baselineStatus: string; gaps: string[] },
+): MapCoverageAssessment {
+  const analyzedEvidence = new Set([
+    ...claims.flatMap((claim) => claim.evidence.map((item) => item.path)),
+    ...symbols.symbols.map((symbol) => symbol.evidence.path),
+    ...surfaces.surfaces.map((surface) => surface.evidence.path),
+  ]);
+  const ratio = (covered: number, total: number, emptyValue = 1): number =>
+    total === 0 ? emptyValue : Math.min(1, covered / total);
+  const relevantExclusions = inventory.excluded_paths.filter((item) =>
+    ['large_file', 'unreadable'].includes(item.reason),
+  );
+  const entrypoints = inventory.files.filter((file) => /(^|\/)(index|main|app|server|cli)\.[^.]+$/.test(file.path));
+  const modulesCovered = new Set(
+    claims.flatMap((claim) =>
+      claim.evidence
+        .map((item) => inventory.files.find((file) => file.path === item.path)?.module_id)
+        .filter((moduleId): moduleId is string => Boolean(moduleId)),
+    ),
+  );
+  const exportedSymbols = inventory.files.flatMap((file) =>
+    file.exports.map((name) => `${file.path}\0${name}`),
+  );
+  const coveredSymbols = new Set(
+    symbols.symbols.map((symbol) => `${symbol.evidence.path}\0${symbol.name.split('.').at(-1)}`),
+  );
+  const dataFiles = inventory.files.filter(
+    (file) => file.kind === 'migration' || /(^|\/)(models?|schemas?|db)(\/|$)/i.test(file.path),
+  );
+  const testsOperations = inventory.files.filter(
+    (file) => file.kind === 'test' || file.kind === 'script' || /Dockerfile|\.github\//i.test(file.path),
+  );
+  const baselinePassed = options.baselineStatus === 'PASSED';
+  const coverage = {
+    relevant_files_classified: ratio(inventory.files.length, inventory.files.length + relevantExclusions.length),
+    entrypoints_covered: ratio(entrypoints.filter((file) => analyzedEvidence.has(file.path)).length, entrypoints.length),
+    modules_covered: ratio(modulesCovered.size, graph.modules.length, 0),
+    public_contracts_covered: ratio(
+      exportedSymbols.filter((key) => coveredSymbols.has(key)).length,
+      exportedSymbols.length,
+    ),
+    surfaces_covered: ratio(
+      surfaces.surfaces.filter((surface) => analyzedEvidence.has(surface.evidence.path)).length,
+      surfaces.surfaces.length,
+    ),
+    data_covered: ratio(dataFiles.filter((file) => analyzedEvidence.has(file.path)).length, dataFiles.length),
+    tests_operations_covered: ratio(
+      testsOperations.filter((file) => baselinePassed || analyzedEvidence.has(file.path)).length,
+      testsOperations.length,
+    ),
+    claims_verified: ratio(claims.length, claims.length, 0),
+  } satisfies CodebaseCoverage;
+  const derivedGaps = [...options.gaps];
+  if (relevantExclusions.length > 0) {
+    derivedGaps.push(
+      `${relevantExclusions.length} relevant file(s) were not analyzed: ${relevantExclusions
+        .slice(0, 20)
+        .map((item) => item.path)
+        .join(', ')}`,
+    );
+  }
+  for (const [area, value] of Object.entries(coverage)) {
+    if (value < 1) derivedGaps.push(`Coverage gap in ${area}: ${(value * 100).toFixed(1)}%`);
+  }
+  if (['FAILED', 'BLOCKED_BY_SANDBOX', 'DETECTED_NOT_RUN'].includes(options.baselineStatus)) {
+    derivedGaps.push(`Brownfield baseline status is ${options.baselineStatus}.`);
+  }
+  const uniqueGaps = [...new Set(derivedGaps)];
+  const criticalGap = uniqueGaps.some((gap) =>
+    /\b(?:critical|unsafe|contradiction|conflicting owners?|ownership conflict|invented path|invented symbol)\b/i.test(gap),
+  );
+  const mandatoryPass = Object.values(coverage).every((value) => value === 1);
+  const status =
+    criticalGap || inventory.files.length === 0 || graph.modules.length === 0
+      ? 'BLOCKED'
+      : uniqueGaps.length === 0 && mandatoryPass
+        ? 'COMPLETE'
+        : 'PARTIAL';
+  return { coverage, status, gaps: uniqueGaps };
 }
 
 export function deterministicClaims(inventory: InventoryDocument, graph: DependencyGraph): MapClaim[] {
@@ -238,6 +401,15 @@ export function validateFragment(
   return validateFragmentDetailed(projectRoot, inventory, raw, allowedModules).fragment;
 }
 
+function evidenceSymbolExists(fileText: string, symbol: string): boolean {
+  const leaf = symbol.split('.').at(-1)!;
+  if (fileText.includes(leaf)) return true;
+  const testAnchor = /^(test|it|describe)\((['"])(.*)\2\)$/.exec(symbol);
+  if (!testAnchor) return false;
+  const [, call, , label] = testAnchor;
+  return fileText.includes(`${call}('${label}'`) || fileText.includes(`${call}("${label}"`);
+}
+
 export function validateFragmentDetailed(
   projectRoot: string,
   inventory: InventoryDocument,
@@ -260,6 +432,12 @@ export function validateFragmentDetailed(
     for (const ev of claim.evidence) {
       const entry = byPath.get(ev.path);
       if (!entry) return { fragment: null, errors: [`unmapped evidence path: ${ev.path}`] };
+      if (!allowedModules.includes(entry.module_id)) {
+        return {
+          fragment: null,
+          errors: [`evidence path ${ev.path} is owned by ${entry.module_id}, outside assigned shard modules`],
+        };
+      }
       if (entry.file_hash !== ev.file_hash) {
         return { fragment: null, errors: [`hash mismatch for ${ev.path}`] };
       }
@@ -276,8 +454,7 @@ export function validateFragmentDetailed(
       }
       if (ev.symbol) {
         const fileText = fs.readFileSync(absolute, 'utf8');
-        const leaf = ev.symbol.split('.').at(-1)!;
-        if (!fileText.includes(leaf)) {
+        if (!evidenceSymbolExists(fileText, ev.symbol)) {
           return { fragment: null, errors: [`symbol ${ev.symbol} not found in ${ev.path}`] };
         }
       }

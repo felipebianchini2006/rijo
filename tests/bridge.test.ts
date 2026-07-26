@@ -262,7 +262,7 @@ describe('host↔core JSON-RPC bridge', () => {
     expect(response.error).toBeUndefined();
     expect(response.result).toMatchObject({ ok: true, status: 'completed' });
     expect(host.seenTasks.some((id) => id.startsWith('map-shard-'))).toBe(true);
-    expect(host.seenTasks).toContain('map-review');
+    expect(host.seenTasks).toContain('map-review-001');
     expect(fs.existsSync(path.join(new RijoPaths(root).codebaseDir, 'map-state.json'))).toBe(true);
   });
 

@@ -14,6 +14,7 @@ import {
   failed,
   dispatchBatch,
   dispatch,
+  dispatchReadOnly,
   replaceableAttempt,
   guardSchema,
   type WorkflowContext,
@@ -23,7 +24,9 @@ import {
 import { buildInventory, MapPreflightError } from '../codebase/inventory.js';
 import {
   buildDependencyGraph,
+  assessMapCoverage,
   deterministicClaims,
+  expandImpactPaths,
   extractSurfaces,
   extractSymbols,
   partitionInventory,
@@ -46,6 +49,7 @@ import {
   MapStateSchema,
   type BaselineDocument,
   type CodebaseMapState,
+  type InventoryDocument,
   type MapClaim,
 } from '../codebase/schemas.js';
 import { clearStaleMarker, readMapState, readStaleMarker } from '../codebase/state.js';
@@ -120,7 +124,7 @@ export async function ensureCodebaseMap(
   ctx: WorkflowContext,
   options: Omit<MapCoreOptions, 'nested'> = {},
 ): Promise<{ outcome: WorkflowOutcome; state: CodebaseMapState | null }> {
-  const outcome = await mapCore(ctx, { ...options, nested: true, commit: false });
+  const outcome = await mapCore(ctx, { ...options, nested: true, commit: options.commit ?? false });
   return { outcome, state: readMapState(ctx.paths) };
 }
 
@@ -195,10 +199,12 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   const symbols = extractSymbols(projectRoot, inventory);
   const surfaces = extractSurfaces(projectRoot, inventory);
   const graph = buildDependencyGraph(inventory);
-  const shards = partitionInventory(inventory, effectiveScopes);
+  const impactScopes = operation === 'full' ? [] : expandImpactPaths(inventory, graph, surfaces, effectiveScopes);
+  const shards = partitionInventory(inventory, impactScopes);
   const deterministic = deterministicClaims(inventory, graph);
   const agentClaims: MapClaim[] = [];
   const gaps: string[] = [];
+  const mapperObservations: Array<{ shard_id: string; message: string }> = [];
 
   if (ctx.executor.capabilities.subagents && shards.length > 0) {
     bus.emit('map.shards', {
@@ -211,7 +217,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
       id: shard.id,
       role: 'researcher',
       objective:
-        'Map only the assigned shard. Return evidence-backed JSON about responsibilities, contracts, invariants, conventions, data flow, operations, and risks. Do not read files outside code_files, do not write any file, and do not infer a claim from a path name alone.',
+        'Map only the assigned shard. Return evidence-backed JSON about responsibilities, contracts, invariants, conventions, data flow, operations, and risks. Do not read files outside code_files, do not write any file, and do not infer a claim from a path name alone. For a shard containing only documentation or assets, zero claims and zero gaps is valid; absence of source code is not a coverage gap.',
       canonical_files: [],
       code_files: shard.files.map((file) => path.join(projectRoot, file.path)),
       write_scope: [],
@@ -262,11 +268,53 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     }
     for (let i = 0; i < results.length; i++) {
       const shard = shards[i]!;
-      const result = results[i]!;
+      let result = results[i]!;
       if (!result.ok) {
         return blocked(ctx, `Supervised mapper ${shard.id} failed; the valid map was not replaced.`, [result.summary]);
       }
-      const validation = validateFragmentDetailed(projectRoot, inventory, result.payload, shard.module_ids);
+      let validation = validateFragmentDetailed(projectRoot, inventory, result.payload, shard.module_ids);
+      if (!validation.fragment) {
+        const correctionBefore = snapshotTree(projectRoot);
+        const correction = replaceableAttempt(
+          ctx,
+          {
+            ...tasks[i]!,
+            id: `${shard.id}-correction`,
+            objective: `${tasks[i]!.objective} Correct the previous structured payload using the exact schema errors below; do not repeat or omit them.`,
+            notes: `PREVIOUS PAYLOAD ERRORS:\n${validation.errors.join('\n')}\n\n${tasks[i]!.notes ?? ''}`,
+          },
+          {},
+          {
+            stage: 'RESEARCH',
+            paths: shard.files.map((file) => path.join(projectRoot, file.path)),
+            requirementTags: ['codebase-discovery'],
+          },
+        );
+        try {
+          result = await dispatch(
+            ctx,
+            correction.attempt.task,
+            {
+              stage: 'RESEARCH',
+              paths: correction.attempt.task.code_files,
+              requirementTags: ['codebase-discovery'],
+            },
+            { prepareReplacement: correction.prepareReplacement },
+          );
+          correction.attempt.workspace.validate();
+        } catch (error) {
+          return blocked(ctx, `Mapper ${shard.id} correction violated its isolated workspace.`, [
+            (error as Error).message,
+          ]);
+        } finally {
+          correction.attempt.workspace.discard();
+        }
+        const correctionViolation = diffTrees(correctionBefore, snapshotTree(projectRoot)).changed;
+        if (correctionViolation.length > 0) {
+          return blocked(ctx, `Mapper ${shard.id} correction modified the controlled checkout.`, correctionViolation);
+        }
+        validation = validateFragmentDetailed(projectRoot, inventory, result.payload, shard.module_ids);
+      }
       if (!validation.fragment) {
         return blocked(ctx, `Mapper ${shard.id} returned invalid or unsupported evidence; the valid map was not replaced.`, [
           'Expected a Zod-valid fragment whose paths, hashes, lines, symbols, and module ownership match the assigned shard.',
@@ -275,7 +323,18 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
       }
       const fragment = validation.fragment;
       agentClaims.push(...fragment.claims);
-      gaps.push(...fragment.gaps.map((gap) => `${shard.id}: ${gap}`));
+      mapperObservations.push(
+        ...fragment.gaps.map((message) => ({ shard_id: shard.id, message })),
+      );
+      const requiresCodeSemanticCoverage = shard.files.some(
+        (file) => file.kind !== 'documentation' && file.kind !== 'asset',
+      );
+      if (!requiresCodeSemanticCoverage && fragment.gaps.length > 0) {
+        bus.emit('map.non_blocking_documentation_gap', {
+          stage: 'MAP_SYNTHESIS',
+          message: `${shard.id}: recorded ${fragment.gaps.length} non-code mapper observation(s)`,
+        });
+      }
     }
   } else {
     gaps.push('No agent runtime was bound; deterministic inventory, symbols, surfaces, dependencies, history, and claims were used.');
@@ -288,66 +347,74 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
       : ClaimsDocumentSchema.safeParse(readJsonIfExists<unknown>(path.join(paths.codebaseDir, 'claims.json')));
   const retainedClaims =
     previousClaims?.success
-      ? previousClaims.data.claims.filter((claim) => claimStillCurrent(claim, inventory, effectiveScopes))
+      ? previousClaims.data.claims.filter((claim) => claimStillCurrent(claim, inventory, impactScopes))
       : [];
-  const claims = dedupeClaims([...retainedClaims, ...deterministic, ...agentClaims]);
+  let claims = dedupeClaims([...retainedClaims, ...deterministic, ...agentClaims]);
   const claimErrors = validateClaims(projectRoot, inventory, claims);
   if (claimErrors.length > 0) return blocked(ctx, 'Map synthesis contains invalid evidence.', claimErrors);
+  const provisionalAssessment = assessMapCoverage(inventory, symbols, surfaces, graph, claims, {
+    baselineStatus: 'NOT_AVAILABLE',
+    gaps,
+  });
+  inventory.coverage = provisionalAssessment.coverage;
 
   bus.emit('map.review', { stage: 'MAP_REVIEW', message: 'revalidando paths, hashes, símbolos, contradições e cobertura' });
+  const claimReceipts: Array<{
+    claim_hash: string;
+    review_shard: string;
+    structural: 'PASSED';
+    semantic: 'APPROVED' | 'NOT_REVIEWED';
+  }> = [];
+  let consolidationStatus: 'APPROVED' | 'NOT_REVIEWED' = 'NOT_REVIEWED';
+  const contradictions = detectClaimContradictions(claims);
+  if (contradictions.length > 0) {
+    return blocked(ctx, 'Map synthesis contains contradictory cross-module claims.', contradictions);
+  }
   if (ctx.executor.capabilities.subagents) {
-    const reviewBefore = snapshotTree(projectRoot);
-    const reviewTask: AgentTaskDraft = {
-      id: 'map-review',
-      role: 'reviewer',
-      objective:
-        'Independently review the candidate map claims for contradictions, invented paths or symbols, missing evidence, and material application-coverage gaps. Use only the supplied candidate, deterministic inventory/coverage summary, and read-only file inspection. Do not execute repository commands, tests, npm, git, network tools, or project processes, and do not write files. Static source evidence may establish an observed contract; never describe a detected test command as executed. Approve when claims are evidence-valid and the core coverage summary accounts for the application, even if tool-generated RIJO adapter documentation is not exhaustively paraphrased.',
-      canonical_files: [],
-      code_files: [],
-      write_scope: [],
-      acceptance_criteria: ['Findings use the declared review codes', 'Approval requires evidence-backed claims'],
-      verification_commands: [],
-      return_format:
-        'AgentResult.payload JSON: {approved:boolean, findings:[{code:MISSING_EVIDENCE|BAD_PATH|BAD_HASH|BAD_SYMBOL|CONTRADICTION|COVERAGE_GAP,message,evidence:[{path,symbol?,lines?,file_hash}]}]}. Evidence must be structured objects copied from the candidate, never descriptive strings; use [] only when no specific file applies.',
-      notes: `CORE INVENTORY COVERAGE (validated deterministically):\n${JSON.stringify(
-        inventory.coverage,
-      )}\nDOCUMENTED GAPS:\n${JSON.stringify(gaps)}\nCANDIDATE CLAIMS (core will independently validate regardless):\n${JSON.stringify(claims.slice(0, 250))}`,
-    };
-    const reviewAttempt = replaceableAttempt(ctx, reviewTask, {}, {
-      stage: 'CODE_REVIEW',
-      requirementTags: ['security'],
-      highRisk: true,
-      authorProfiles: ['discovery-analyst', 'system-architect'],
-    });
-    let result;
-    try {
-      result = await dispatch(
-        ctx,
-        reviewAttempt.attempt.task,
-        {
-          stage: 'CODE_REVIEW',
-          requirementTags: ['security'],
-          highRisk: true,
-          authorProfiles: ['discovery-analyst', 'system-architect'],
-        },
-        { prepareReplacement: reviewAttempt.prepareReplacement },
+    const reviewContext = [
+      ...gaps,
+      ...mapperObservations.map((observation) => `${observation.shard_id}: ${observation.message}`),
+    ];
+    let review = await reviewClaimSet(ctx, inventory, claims, reviewContext, 'map-review');
+    if (review.status === 'INVALID') {
+      return blocked(ctx, 'Independent map review did not produce a valid verdict; the valid map was not replaced.', review.details);
+    }
+    if (review.status === 'REJECTED') {
+      bus.emit(
+        'map.review_fallback',
+        { message: 'claims enriquecidas rejeitadas; refazendo candidato apenas com claims determinísticas' },
+        { findings: review.details },
       );
-      reviewAttempt.attempt.workspace.validate();
-    } catch (error) {
-      return blocked(ctx, 'Map reviewer violated its isolated read-only workspace.', [(error as Error).message]);
-    } finally {
-      reviewAttempt.attempt.workspace.discard();
+      claims = dedupeClaims(deterministic);
+      const fallbackErrors = validateClaims(projectRoot, inventory, claims);
+      if (fallbackErrors.length > 0) {
+        return blocked(ctx, 'Deterministic map fallback contains invalid evidence.', fallbackErrors);
+      }
+      inventory.coverage = assessMapCoverage(inventory, symbols, surfaces, graph, claims, {
+        baselineStatus: 'NOT_AVAILABLE',
+        gaps,
+      }).coverage;
+      review = await reviewClaimSet(ctx, inventory, claims, reviewContext, 'map-review-fallback');
+      if (review.status !== 'APPROVED') {
+        return blocked(
+          ctx,
+          review.status === 'INVALID'
+            ? 'Deterministic map fallback did not receive a valid verdict.'
+            : 'Independent map review rejected the deterministic fallback.',
+          review.details,
+        );
+      }
     }
-    const violation = diffTrees(reviewBefore, snapshotTree(projectRoot)).changed;
-    if (violation.length > 0) return blocked(ctx, 'Map reviewer modified the controlled checkout.', violation);
-    const review = MapReviewSchema.safeParse(result.payload);
-    if (!result.ok || !review.success) {
-      return blocked(ctx, 'Independent map review did not produce a valid verdict; the valid map was not replaced.', [
-        result.summary,
-      ]);
-    }
-    if (!review.data.approved) {
-      return blocked(ctx, 'Independent map review rejected the candidate.', review.data.findings.map((finding) => finding.message));
+    claimReceipts.push(...review.receipts);
+    consolidationStatus = review.consolidation;
+  } else {
+    for (const claim of claims) {
+      claimReceipts.push({
+        claim_hash: sha256(JSON.stringify(claim)),
+        review_shard: 'deterministic-only',
+        structural: 'PASSED',
+        semantic: 'NOT_REVIEWED',
+      });
     }
   }
 
@@ -362,6 +429,11 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   } else {
     baseline = runBaseline(ctx, inventory, metadata.head, currentTreeHash, true);
   }
+  const assessment = assessMapCoverage(inventory, symbols, surfaces, graph, claims, {
+    baselineStatus: baseline.overall_status,
+    gaps,
+  });
+  inventory.coverage = assessment.coverage;
 
   const staleReasons = [
     ...(baseUnavailable ? ['mapped commit is no longer accessible; full remap performed'] : []),
@@ -375,7 +447,8 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     history,
     baseline,
     claims,
-    gaps,
+    gaps: assessment.gaps,
+    observations: mapperObservations,
     commit: metadata.head,
     branch: metadata.branch,
     sourceTreeHash: currentTreeHash,
@@ -383,6 +456,15 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     changedPaths,
     staleReasons,
     operation,
+    status: assessment.status,
+    reviewReceipts: {
+      claim_receipts: claimReceipts,
+      mapper_observations: mapperObservations.map((observation) => ({
+        ...observation,
+        review_status: 'APPROVED_NON_BLOCKING' as const,
+      })),
+      consolidation: { status: consolidationStatus, contradictions },
+    },
   });
   validateCandidate(candidate.artifacts, candidate.state);
 
@@ -415,11 +497,238 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   }
 
   bus.emit('map.done', {
-    status: 'completed',
+    status: candidate.state.status === 'BLOCKED' ? 'blocked' : 'completed',
     stage: 'MAP_DONE',
-    message: `mapa ${operation} completo: ${inventory.files.length} arquivos, ${graph.modules.length} módulos`,
+    message: `mapa ${operation} ${candidate.state.status.toLowerCase()}: ${inventory.files.length} arquivos, ${graph.modules.length} módulos`,
   });
-  return completed(ctx, `Codebase map ${operation} complete (${inventory.files.length} files, ${graph.modules.length} modules).`);
+  if (candidate.state.status === 'BLOCKED') {
+    return blockedReadOnly(ctx, `Codebase map ${operation} is BLOCKED for safe planning.`, candidate.state.gaps);
+  }
+  return completed(
+    ctx,
+    `Codebase map ${operation} ${candidate.state.status.toLowerCase()} (${inventory.files.length} files, ${graph.modules.length} modules).`,
+  );
+}
+
+type ClaimReviewReceipt = {
+  claim_hash: string;
+  review_shard: string;
+  structural: 'PASSED';
+  semantic: 'APPROVED';
+};
+
+type ClaimReviewOutcome =
+  | { status: 'APPROVED'; details: string[]; receipts: ClaimReviewReceipt[]; consolidation: 'APPROVED' }
+  | { status: 'REJECTED' | 'INVALID'; details: string[]; receipts: []; consolidation: 'NOT_REVIEWED' };
+
+async function reviewClaimSet(
+  ctx: WorkflowContext,
+  inventory: InventoryDocument,
+  claims: MapClaim[],
+  gaps: string[],
+  idPrefix: string,
+): Promise<ClaimReviewOutcome> {
+  const before = snapshotTree(ctx.projectRoot);
+  const claimShards: MapClaim[][] = [];
+  for (let index = 0; index < claims.length; index += 100) claimShards.push(claims.slice(index, index + 100));
+  const reviewTasks: AgentTaskDraft[] = claimShards.map((claimShard, index) => ({
+    id: `${idPrefix}-${String(index + 1).padStart(3, '0')}`,
+    role: 'reviewer',
+    objective:
+      'Independently review every claim in this bounded shard for contradictions, invented paths or symbols, missing evidence, semantic overreach, and material application-coverage gaps. Mapper observations are non-blocking unless they make an accurate map unsafe; absence of a consumer, optional convention, or inferred purpose is not itself a coverage gap. Use only the supplied claim shard, deterministic inventory/coverage summary, and read-only file inspection. Do not execute repository commands, tests, npm, git, network tools, or project processes, and do not write files. Static source evidence may establish an observed contract; never describe a detected test command as executed.',
+    canonical_files: [],
+    code_files: [
+      ...new Set(claimShard.flatMap((claim) => claim.evidence.map((item) => path.join(ctx.projectRoot, item.path)))),
+    ],
+    write_scope: [],
+    acceptance_criteria: ['Every supplied claim receives semantic review', 'Findings use the declared review codes'],
+    verification_commands: [],
+    return_format:
+      'AgentResult.payload JSON: {approved:boolean, findings:[{code:MISSING_EVIDENCE|BAD_PATH|BAD_HASH|BAD_SYMBOL|CONTRADICTION|COVERAGE_GAP,message,evidence:[{path,symbol?,lines?,file_hash}]}]}. Evidence must be structured objects copied from the candidate, never descriptive strings; use [] only when no specific file applies.',
+    notes: `CORE INVENTORY COVERAGE:\n${JSON.stringify(inventory.coverage)}\nDOCUMENTED GAPS AND MAPPER OBSERVATIONS:\n${JSON.stringify(
+      gaps,
+    )}\nCANDIDATE CLAIM SHARD:\n${JSON.stringify(claimShard)}`,
+  }));
+  let results;
+  try {
+    results = await dispatchBatch(
+      ctx,
+      reviewTasks,
+      ctx.config.limits.max_parallel_agents,
+      () => ({
+        stage: 'CODE_REVIEW',
+        requirementTags: ['security'],
+        highRisk: true,
+        authorProfiles: ['discovery-analyst', 'system-architect'],
+      }),
+    );
+  } catch (error) {
+    return {
+      status: 'INVALID',
+      details: [`Map reviewer violated its isolated read-only workspace: ${(error as Error).message}`],
+      receipts: [],
+      consolidation: 'NOT_REVIEWED',
+    };
+  }
+  const violation = diffTrees(before, snapshotTree(ctx.projectRoot)).changed;
+  if (violation.length > 0) {
+    return {
+      status: 'INVALID',
+      details: ['Map reviewer modified the controlled checkout.', ...violation],
+      receipts: [],
+      consolidation: 'NOT_REVIEWED',
+    };
+  }
+  const receipts: ClaimReviewReceipt[] = [];
+  const rejected: string[] = [];
+  for (let index = 0; index < results.length; index++) {
+    const result = results[index]!;
+    const review = MapReviewSchema.safeParse(result.payload);
+    if (!result.ok || !review.success) {
+      return {
+        status: 'INVALID',
+        details: [result.summary],
+        receipts: [],
+        consolidation: 'NOT_REVIEWED',
+      };
+    }
+    for (const finding of review.data.findings) {
+      const evidenceErrors = validateClaims(ctx.projectRoot, inventory, [
+        { kind: 'risk', statement: finding.message, evidence: finding.evidence },
+      ]);
+      if (evidenceErrors.length > 0) {
+        return {
+          status: 'INVALID',
+          details: [`Reviewer finding contains invented evidence: ${evidenceErrors.join('; ')}`],
+          receipts: [],
+          consolidation: 'NOT_REVIEWED',
+        };
+      }
+    }
+    if (!review.data.approved || review.data.findings.length > 0) {
+      rejected.push(
+        ...(review.data.findings.length > 0
+          ? review.data.findings.map((finding) => finding.message)
+          : [result.summary]),
+      );
+      continue;
+    }
+    for (const claim of claimShards[index]!) {
+      receipts.push({
+        claim_hash: sha256(JSON.stringify(claim)),
+        review_shard: reviewTasks[index]!.id,
+        structural: 'PASSED',
+        semantic: 'APPROVED',
+      });
+    }
+  }
+  if (rejected.length > 0) {
+    return { status: 'REJECTED', details: rejected, receipts: [], consolidation: 'NOT_REVIEWED' };
+  }
+  if (claimShards.length > 1) {
+    const { result, violation: consolidationViolation } = await dispatchReadOnlyMapConsolidation(
+      ctx,
+      claimShards,
+      receipts,
+      `${idPrefix}-consolidation`,
+    );
+    if (consolidationViolation.length > 0) {
+      return {
+        status: 'INVALID',
+        details: ['Map consolidation reviewer modified the controlled checkout.', ...consolidationViolation],
+        receipts: [],
+        consolidation: 'NOT_REVIEWED',
+      };
+    }
+    const review = MapReviewSchema.safeParse(result.payload);
+    if (!result.ok || !review.success) {
+      return {
+        status: 'INVALID',
+        details: [result.summary],
+        receipts: [],
+        consolidation: 'NOT_REVIEWED',
+      };
+    }
+    if (!review.data.approved || review.data.findings.length > 0) {
+      return {
+        status: 'REJECTED',
+        details: review.data.findings.map((finding) => finding.message),
+        receipts: [],
+        consolidation: 'NOT_REVIEWED',
+      };
+    }
+  }
+  return { status: 'APPROVED', details: [], receipts, consolidation: 'APPROVED' };
+}
+
+async function dispatchReadOnlyMapConsolidation(
+  ctx: WorkflowContext,
+  claimShards: MapClaim[][],
+  receipts: Array<{ claim_hash: string; review_shard: string; structural: 'PASSED'; semantic: 'APPROVED' | 'NOT_REVIEWED' }>,
+  taskId = 'map-review-consolidation',
+): Promise<{ result: import('../agents/protocol.js').AgentResult; violation: string[] }> {
+  const summaries = claimShards.map((shard, index) => ({
+    shard: `map-review-${String(index + 1).padStart(3, '0')}`,
+    claims: shard.map((claim) => ({
+      kind: claim.kind,
+      statement: claim.statement,
+      evidence_paths: claim.evidence.map((item) => item.path),
+      claim_hash: sha256(JSON.stringify(claim)),
+    })),
+  }));
+  return dispatchReadOnly(
+    ctx,
+    {
+      id: taskId,
+      role: 'reviewer',
+      objective:
+        'Consolidate the independently reviewed claim shards. Detect semantic contradictions between modules and cross-cutting documents. Do not repeat per-file validation, execute commands, or write files.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: [],
+      acceptance_criteria: [
+        'Every shard has structural and semantic receipts',
+        'Cross-shard contradictions are reported with the declared review codes',
+      ],
+      verification_commands: [],
+      return_format:
+        'AgentResult.payload JSON: {approved:boolean, findings:[{code:MISSING_EVIDENCE|BAD_PATH|BAD_HASH|BAD_SYMBOL|CONTRADICTION|COVERAGE_GAP,message,evidence:[]}]}',
+      notes: `REVIEWED SHARD SUMMARIES:\n${JSON.stringify(summaries)}\nRECEIPT COUNT: ${receipts.length}`,
+    },
+    {
+      stage: 'CODE_REVIEW',
+      requirementTags: ['security'],
+      highRisk: true,
+      authorProfiles: ['discovery-analyst', 'system-architect'],
+    },
+  );
+}
+
+function detectClaimContradictions(claims: MapClaim[]): string[] {
+  const byEvidence = new Map<string, MapClaim[]>();
+  for (const claim of claims) {
+    const key = `${claim.kind}\0${claim.evidence.map((item) => item.path).sort().join('|')}`;
+    const existing = byEvidence.get(key) ?? [];
+    existing.push(claim);
+    byEvidence.set(key, existing);
+  }
+  const contradictions: string[] = [];
+  for (const group of byEvidence.values()) {
+    for (let left = 0; left < group.length; left++) {
+      for (let right = left + 1; right < group.length; right++) {
+        const a = group[left]!.statement.toLowerCase();
+        const b = group[right]!.statement.toLowerCase();
+        const normalizedA = a.replace(/\b(?:not|never|no)\b/g, '').replace(/\s+/g, ' ').trim();
+        const normalizedB = b.replace(/\b(?:not|never|no)\b/g, '').replace(/\s+/g, ' ').trim();
+        const aNegated = normalizedA !== a.replace(/\s+/g, ' ').trim();
+        const bNegated = normalizedB !== b.replace(/\s+/g, ' ').trim();
+        if (normalizedA === normalizedB && aNegated !== bNegated) {
+          contradictions.push(`Contradictory claims for ${group[left]!.evidence.map((item) => item.path).join(', ')}`);
+        }
+      }
+    }
+  }
+  return contradictions;
 }
 
 function dedupeClaims(claims: MapClaim[]): MapClaim[] {
@@ -437,7 +746,16 @@ function validateCandidate(artifacts: Record<string, string>, state: CodebaseMap
     const body = artifacts[name];
     if (body === undefined || sha256(body) !== expected) throw new Error(`Candidate artifact hash mismatch: ${name}`);
   }
-  for (const name of ['inventory.json', 'symbols.json', 'dependency-graph.json', 'surfaces.json', 'claims.json', 'baseline.json', 'map-state.json']) {
+  for (const name of [
+    'inventory.json',
+    'symbols.json',
+    'dependency-graph.json',
+    'surfaces.json',
+    'claims.json',
+    'baseline.json',
+    'review-receipts.json',
+    'map-state.json',
+  ]) {
     if (!artifacts[name]) throw new Error(`Candidate artifact missing: ${name}`);
     JSON.parse(artifacts[name]);
   }

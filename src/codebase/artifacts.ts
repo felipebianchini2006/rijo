@@ -23,6 +23,7 @@ export interface MapArtifactInput {
   baseline: BaselineDocument;
   claims: MapClaim[];
   gaps: string[];
+  observations: Array<{ shard_id: string; message: string }>;
   commit: string;
   branch: string;
   sourceTreeHash: string;
@@ -30,6 +31,21 @@ export interface MapArtifactInput {
   changedPaths: string[];
   staleReasons: string[];
   operation: CodebaseMapState['last_operation'];
+  status: CodebaseMapState['status'];
+  reviewReceipts: {
+    claim_receipts: Array<{
+      claim_hash: string;
+      review_shard: string;
+      structural: 'PASSED';
+      semantic: 'APPROVED' | 'NOT_REVIEWED';
+    }>;
+    mapper_observations: Array<{
+      shard_id: string;
+      message: string;
+      review_status: 'APPROVED_NON_BLOCKING';
+    }>;
+    consolidation: { status: 'APPROVED' | 'NOT_REVIEWED'; contradictions: string[] };
+  };
 }
 
 function json(value: unknown): string {
@@ -257,6 +273,13 @@ export function buildMapArtifacts(input: MapArtifactInput): { artifacts: Record<
       '',
       '## Coverage and gaps',
       ...input.gaps.map((gap) => `- ${gap}`),
+      '',
+      '## Reviewed non-blocking mapper observations',
+      ...(input.observations.length
+        ? input.observations.map(
+            (observation) => `- **${observation.shard_id}**: ${observation.message}`,
+          )
+        : ['- None.']),
       `- Exclusions are explicit in \`inventory.json\`; sensitive paths (${input.inventory.excluded_paths.filter((e) => e.reason === 'sensitive').length}) were never read.`,
       '',
     ].join('\n'),
@@ -267,12 +290,13 @@ export function buildMapArtifacts(input: MapArtifactInput): { artifacts: Record<
     'surfaces.json': json(input.surfaces),
     'claims.json': json({ schema_version: CODEBASE_SCHEMA_VERSION, claims: input.claims }),
     'baseline.json': json(input.baseline),
+    'review-receipts.json': json(input.reviewReceipts),
   };
   const artifactHashes = Object.fromEntries(Object.entries(artifacts).map(([name, body]) => [name, sha256(body)]));
   const state = MapStateSchema.parse({
     schema_version: CODEBASE_SCHEMA_VERSION,
     mapper_version: MAPPER_VERSION,
-    status: 'COMPLETE',
+    status: input.status,
     mapped_commit: input.commit,
     mapped_tree_hash: input.sourceTreeHash,
     mapped_at: input.mappedAt,
