@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -58,6 +59,37 @@ function fingerprint(dir: string): string {
   walk(dir);
   return createHash('sha256').update(lines.join('\n')).digest('hex');
 }
+
+describe('attempt workspaces are Git-isolated from the controlled checkout', () => {
+  let root: string;
+  beforeEach(() => {
+    root = tmpProject('rijo-git-barrier-');
+    seedProject(root);
+    expect(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status).toBe(0);
+  });
+  afterEach(() => cleanup(root));
+
+  it('prevents a host git command from discovering or staging into the parent repository', () => {
+    const ws = AttemptWorkspace.create(root, { taskId: 'spec-01', writeScope: ['src/a.ts'] });
+
+    const topLevel = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: ws.root,
+      encoding: 'utf8',
+    });
+    expect(topLevel.status).toBe(0);
+    expect(fs.realpathSync(topLevel.stdout.trim())).toBe(fs.realpathSync(ws.root));
+
+    const staged = spawnSync('git', ['add', '-f', 'src/a.ts'], {
+      cwd: ws.root,
+      encoding: 'utf8',
+    });
+    expect(staged.status).toBe(0);
+    ws.discard();
+    expect(
+      spawnSync('git', ['status', '--porcelain', '-uall'], { cwd: root, encoding: 'utf8' }).stdout,
+    ).not.toContain('.rijo/runtime/workspaces/');
+  });
+});
 
 describe('node_modules is cloned, never shared with the checkout', () => {
   let root: string;

@@ -6,6 +6,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { detectClaudeCli } from '../src/hosts/detect.js';
 import {
   assertScenarioAOutcome,
+  assertPhaseConsumedMap,
+  commitExternalCounterChange,
+  createBrownfieldMapFixture,
   createFixture,
   gitSubjects,
   haikuConfigYaml,
@@ -194,6 +197,43 @@ describe('LIVE full-workflow E2E (Claude)', () => {
       }
     },
     TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'Scenario MAP — brownfield map, phase, external change, incremental remap, then fresh next phase',
+    async (ctx) => {
+      if (!gate(ctx)) return;
+      const fixture = createBrownfieldMapFixture(tarball!, 'rijo-wf-map-claude-', haikuConfigYaml('claude'));
+      try {
+        const fullMap = runRijo(fixture, ['map', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
+        expect(fullMap.status, `initial Claude map failed:\n${fullMap.combined}`).toBe(0);
+
+        const created = runRijo(fixture, ['new', '@PLANO.md', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
+        expect(created.status, `Claude new failed:\n${created.combined}`).toBe(0);
+
+        const phaseOne = runRijo(fixture, ['run', '01', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
+        expect(phaseOne.status, `Claude phase 01 failed:\n${phaseOne.combined}`).toBe(0);
+
+        const externalCommit = commitExternalCounterChange(fixture);
+        const incremental = runRijo(fixture, ['map', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
+        expect(incremental.status, `Claude incremental map failed:\n${incremental.combined}`).toBe(0);
+        const mapState = JSON.parse(
+          fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
+        );
+        expect(mapState.last_operation).toBe('incremental');
+        expect(mapState.mapped_commit).toBe(externalCommit);
+        expect(mapState.changed_paths_since_map).toContain('src/counter.mjs');
+
+        const phaseTwo = runRijo(fixture, ['run', '02', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
+        expect(phaseTwo.status, `Claude phase 02 failed:\n${phaseTwo.combined}`).toBe(0);
+        assertPhaseConsumedMap(fixture, '02', externalCommit);
+        execFileSync('npm', ['test'], { cwd: fixture.root, encoding: 'utf8' });
+        expect(trackedDirty(fixture)).toEqual([]);
+      } finally {
+        rmFixture(fixture);
+      }
+    },
+    2_400_000,
   );
 });
 

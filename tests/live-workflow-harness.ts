@@ -88,6 +88,30 @@ export const PLAN_CONTENT = [
   '',
 ].join('\n');
 
+export const BROWNFIELD_MAP_PLAN_CONTENT = [
+  '# Plan — Extend the existing counter safely',
+  '',
+  '## Objective',
+  'Extend the existing `src/counter.mjs` public module in exactly two sequential phases.',
+  'Preserve its current `current()` behavior and the existing Node test setup.',
+  '',
+  '## Requirements',
+  '1. Phase 01 — increment. Add an exported `increment(value)` function that returns `value + 1`,',
+  '   plus real `node:test` coverage. Acceptance: `increment(1) === 2` and the existing test stays green.',
+  '2. Phase 02 — decrement. After phase 01, add an exported `decrement(value)` function that returns',
+  '   `value - 1`, plus real `node:test` coverage. Acceptance: `decrement(1) === 0` and all tests pass.',
+  '',
+  '## Mandatory phase structure',
+  '- Create exactly two phases in this order: 01 Increment, then 02 Decrement.',
+  '- Phase 02 depends on phase 01. Do not merge the requirements into one phase.',
+  '- Modify only `src/counter.mjs` and `test/counter.test.mjs`.',
+  '- Verification command: `npm test`.',
+  '',
+  '## Out of scope',
+  '- Dependencies, frameworks, build tooling, UI, network, storage, or other source files.',
+  '',
+].join('\n');
+
 /**
  * Create a pristine fixture: fresh tmp dir, `npm init -y`, a package.json whose
  * only verification script is `node --test`, the installed tarball, a real git
@@ -122,6 +146,69 @@ export function createFixture(tarball: string, prefix: string, configYaml: strin
   fs.writeFileSync(path.join(root, '.rijo', 'config.yml'), configYaml);
 
   return { root, cliEntry };
+}
+
+/** A clean, committed brownfield fixture with real Git history and passing tests. */
+export function createBrownfieldMapFixture(tarball: string, prefix: string, configYaml: string): Fixture {
+  const fixture = createFixture(tarball, prefix, configYaml);
+  fs.mkdirSync(path.join(fixture.root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(fixture.root, 'test'), { recursive: true });
+  fs.writeFileSync(
+    path.join(fixture.root, 'src', 'counter.mjs'),
+    'export function current() { return 0; }\n',
+  );
+  fs.writeFileSync(
+    path.join(fixture.root, 'test', 'counter.test.mjs'),
+    [
+      "import test from 'node:test';",
+      "import assert from 'node:assert/strict';",
+      "import { current } from '../src/counter.mjs';",
+      "test('current baseline', () => assert.equal(current(), 0));",
+      '',
+    ].join('\n'),
+  );
+  fs.writeFileSync(path.join(fixture.root, 'PLANO.md'), BROWNFIELD_MAP_PLAN_CONTENT);
+  execFileSync('git', ['add', '-A'], { cwd: fixture.root, encoding: 'utf8' });
+  execFileSync('git', ['commit', '-m', 'feat: seed brownfield counter with history'], {
+    cwd: fixture.root,
+    encoding: 'utf8',
+  });
+  execFileSync('npm', ['test'], { cwd: fixture.root, encoding: 'utf8' });
+  return fixture;
+}
+
+/** Commit an external related change between phase 01 and the incremental remap. */
+export function commitExternalCounterChange(fixture: Fixture): string {
+  fs.appendFileSync(
+    path.join(fixture.root, 'src', 'counter.mjs'),
+    '\nexport const externalRevision = 2;\n',
+  );
+  execFileSync('git', ['add', 'src/counter.mjs'], { cwd: fixture.root, encoding: 'utf8' });
+  execFileSync('git', ['commit', '-m', 'feat(counter): external related revision'], {
+    cwd: fixture.root,
+    encoding: 'utf8',
+  });
+  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: fixture.root, encoding: 'utf8' }).trim();
+}
+
+/** Prove phase 02 planned against the exact incrementally refreshed map commit. */
+export function assertPhaseConsumedMap(fixture: Fixture, phase: string, mappedCommit: string): void {
+  const eventsPath = path.join(fixture.root, '.rijo', 'events.jsonl');
+  const events = fs
+    .readFileSync(eventsPath, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as { type: string; data: Record<string, unknown> });
+  expect(events).toContainEqual(
+    expect.objectContaining({
+      type: 'run.map_context_fresh',
+      data: expect.objectContaining({
+        phase,
+        mapped_commit: mappedCommit,
+        last_operation: 'incremental',
+      }),
+    }),
+  );
 }
 
 /** (Re)write the fixture RIJO config, e.g. before `rijo run` to change supervisor policy. */

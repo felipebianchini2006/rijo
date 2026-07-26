@@ -1,14 +1,20 @@
 import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { detectCodexCli } from '../src/hosts/detect.js';
 import {
   assertScenarioAOutcome,
+  assertPhaseConsumedMap,
+  commitExternalCounterChange,
+  createBrownfieldMapFixture,
   createFixture,
   haikuConfigYaml,
   packTarball,
   quotaBlocked,
   rmFixture,
   runRijo,
+  trackedDirty,
 } from './live-workflow-harness.js';
 
 /**
@@ -73,5 +79,48 @@ describe('LIVE full-workflow E2E (Codex)', () => {
       }
     },
     TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'Scenario MAP — brownfield map, phase, external change, incremental remap, then fresh next phase',
+    async (ctx) => {
+      if (!LIVE) {
+        ctx.skip('SKIPPED: set RIJO_LIVE_CODEX_E2E=1 to run the live Codex brownfield map E2E.');
+        return;
+      }
+      if (!codex.available) {
+        ctx.skip('SKIPPED: the Codex CLI is not detected on PATH (honest gate — nothing is faked).');
+        return;
+      }
+      const fixture = createBrownfieldMapFixture(tarball!, 'rijo-wf-map-codex-', haikuConfigYaml('codex'));
+      try {
+        const execute = (args: string[], label: string) => {
+          const result = runRijo(fixture, [...args, '--host', 'codex'], { timeoutMs: TEST_TIMEOUT_MS });
+          if (result.status !== 0 && quotaBlocked(result.combined)) {
+            throw new Error(`BLOCKED_BY_QUOTA during ${label}: ${result.combined.replace(/\s+/g, ' ').slice(-500)}`);
+          }
+          expect(result.status, `${label} failed:\n${result.combined}`).toBe(0);
+          return result;
+        };
+        execute(['map'], 'initial Codex map');
+        execute(['new', '@PLANO.md'], 'Codex new');
+        execute(['run', '01'], 'Codex phase 01');
+        const externalCommit = commitExternalCounterChange(fixture);
+        execute(['map'], 'Codex incremental map');
+        const mapState = JSON.parse(
+          fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
+        );
+        expect(mapState.last_operation).toBe('incremental');
+        expect(mapState.mapped_commit).toBe(externalCommit);
+        expect(mapState.changed_paths_since_map).toContain('src/counter.mjs');
+        execute(['run', '02'], 'Codex phase 02');
+        assertPhaseConsumedMap(fixture, '02', externalCommit);
+        execFileSync('npm', ['test'], { cwd: fixture.root, encoding: 'utf8' });
+        expect(trackedDirty(fixture)).toEqual([]);
+      } finally {
+        rmFixture(fixture);
+      }
+    },
+    2_400_000,
   );
 });

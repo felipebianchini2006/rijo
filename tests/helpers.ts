@@ -29,7 +29,7 @@ export function tmpProject(prefix = 'rijo-test-'): string {
 }
 
 export function cleanup(dir: string): void {
-  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 export function writePlanFile(root: string, name = 'PLANO.md', content?: string): string {

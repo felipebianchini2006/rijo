@@ -274,6 +274,14 @@ export class AttemptWorkspace {
     if (escaping.length > 0) throw new SymlinkEscapeError(opts.taskId, escaping, 'pre-create');
     ensureDir(root);
     copyTree(projectRoot, root, baseline);
+    // The workspace lives below the controlled checkout. Without a local Git
+    // boundary, `git add`/`git status` run by a host climbs to the parent's
+    // `.git` directory and can stage volatile workspace paths in the real
+    // repository. A minimal valid repository makes Git stop at the attempt
+    // root; commands may use a disposable local index but can never mutate the
+    // controlled checkout. `.git` is excluded from snapshots and deltas, so
+    // the barrier can never be applied back as task output.
+    initializeGitBarrier(root);
     const droppedDependencyLinks = isolateNodeModules(projectRoot, root);
     return new AttemptWorkspace(
       id,
@@ -386,6 +394,29 @@ export class AttemptWorkspace {
   private assertLive(): void {
     if (this.discarded) throw new Error(`Workspace ${this.id} was discarded`);
   }
+}
+
+function initializeGitBarrier(workspaceRoot: string): void {
+  const gitDir = path.join(workspaceRoot, '.git');
+  ensureDir(path.join(gitDir, 'objects'));
+  ensureDir(path.join(gitDir, 'refs', 'heads'));
+  fs.writeFileSync(path.join(gitDir, 'HEAD'), 'ref: refs/heads/rijo-attempt\n');
+  fs.writeFileSync(
+    path.join(gitDir, 'config'),
+    [
+      '[core]',
+      '\trepositoryformatversion = 0',
+      '\tfilemode = false',
+      '\tbare = false',
+      '\tlogallrefupdates = false',
+      '',
+    ].join('\n'),
+  );
+  // Seed only the disposable local index. This makes `git diff`/`git status`
+  // useful to cooperative hosts without creating a commit or touching the
+  // parent repository. If Git is unavailable, the on-disk boundary above still
+  // prevents repository discovery from escaping the workspace.
+  spawnSync('git', ['add', '-A'], { cwd: workspaceRoot, stdio: 'ignore' });
 }
 
 /**
