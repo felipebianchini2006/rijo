@@ -74,6 +74,8 @@ export const AgentResultSchema = z.object({
   payload: z.unknown().nullable().default(null),
   /** requested out-of-scope writes; require a new allocation from the orchestrator */
   scope_requests: z.array(z.string()).default([]),
+  /** material choices and true blockers proposed for deterministic core validation */
+  decision_proposals: z.array(z.unknown()).optional(),
   /** echo of the attempt identity — required for a supervised result to be accepted */
   attempt_id: z.string().nullable().default(null),
   generation: z.number().int().nullable().default(null),

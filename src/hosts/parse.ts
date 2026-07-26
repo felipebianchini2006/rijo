@@ -16,6 +16,7 @@ export function buildHostPrompt(task: AgentTask): string {
     files_written: [],
     payload: null,
     scope_requests: [],
+    decision_proposals: [],
     attempt_id: null,
     generation: null,
     lease_id: null,
@@ -36,6 +37,7 @@ export function buildHostPrompt(task: AgentTask): string {
     '- `files_written`: paths you actually wrote, relative to your working directory.',
     '- `payload`: the structured data the return format asks for, or null.',
     '- `scope_requests`: paths you needed to write but were outside your write scope.',
+    '- `decision_proposals`: every material choice or true blocker; use [] when none. The core validates evidence, blocker category, confidence, reversibility, consequences and review condition.',
   ].join('\n');
 }
 

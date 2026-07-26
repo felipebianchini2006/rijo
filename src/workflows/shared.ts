@@ -24,6 +24,11 @@ import { SystemGit } from '../core/git.js';
 import type { Clock } from '../supervisor/clock.js';
 import { defaultExecutor, type TaskExecutor, type SupervisedDispatch } from './executor.js';
 import { prepareDispatchedTask, type DispatchRouting } from './routing.js';
+import {
+  DecisionProposalSchema,
+  resolveDecision,
+  type DecisionProposal,
+} from '../core/decisions.js';
 
 export type { DispatchRouting } from './routing.js';
 
@@ -42,6 +47,8 @@ export interface WorkflowContext {
   txnHooks: TxnHooks;
   /** Test seam: fault injection at each durable phase-finalization step. */
   finalizeHooks: FinalizeHooks;
+  /** Validated proposals are persisted only after workflow-specific read-only/workspace fences pass. */
+  pendingDecisions: DecisionProposal[];
 }
 
 export interface WorkflowDeps {
@@ -95,6 +102,7 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     now,
     txnHooks: deps.txnHooks ?? {},
     finalizeHooks: deps.finalizeHooks ?? {},
+    pendingDecisions: [],
   };
 }
 
@@ -235,11 +243,12 @@ export async function dispatch(
 ): Promise<AgentResult> {
   const routed = prepareDispatchedTask(ctx.config, task, routing);
   const full: AgentTask = AgentTaskSchema.parse(routed);
-  return ctx.executor.run({
+  const result = await ctx.executor.run({
     task: full,
     role: full.role,
     ...(options.prepareReplacement ? { prepareReplacement: options.prepareReplacement } : {}),
   });
+  return validateAgentDecisions(ctx, result);
 }
 
 /**
@@ -260,7 +269,43 @@ export async function dispatchBatch(
     const prep = replacement?.(t, i);
     return { task: full, role: full.role, ...(prep ? { prepareReplacement: prep } : {}) };
   });
-  return ctx.executor.runBatch(reqs, max ?? ctx.config.limits.max_parallel_agents);
+  const results = await ctx.executor.runBatch(reqs, max ?? ctx.config.limits.max_parallel_agents);
+  return results.map((result) => validateAgentDecisions(ctx, result));
+}
+
+function validateAgentDecisions(ctx: WorkflowContext, result: AgentResult): AgentResult {
+  for (const raw of result.decision_proposals ?? []) {
+    try {
+      const proposal = DecisionProposalSchema.parse(raw);
+      const outcome = resolveDecision(
+        ctx.paths,
+        { ...ctx.config.decisions, record_material_decisions: false },
+        proposal,
+        ctx.now,
+      );
+      if (outcome.status === 'BLOCKED') {
+        return {
+          ...result,
+          ok: false,
+          summary: `BLOCKED (${outcome.category}): ${outcome.missing_fact}. ${outcome.question}`,
+        };
+      }
+      ctx.pendingDecisions.push(proposal);
+    } catch (error) {
+      return {
+        ...result,
+        ok: false,
+        summary: `Decision proposal rejected by core: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+  return result;
+}
+
+function flushPendingDecisions(ctx: WorkflowContext): void {
+  const pending = ctx.pendingDecisions.splice(0);
+  for (const proposal of pending) resolveDecision(ctx.paths, ctx.config.decisions, proposal, ctx.now);
+  if (pending.length > 0 && exists(ctx.paths.manifest)) touchManifest(ctx.paths, () => {}, ctx.now);
 }
 
 /** Attempt bundle: the dispatched task plus its isolated workspace. */
@@ -396,6 +441,7 @@ export function isWorkflowCancellation(result: AgentResult): boolean {
 }
 
 export function blocked(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
+  flushPendingDecisions(ctx);
   ctx.bus.emit('workflow.blocked', { status: 'blocked', message }, { details });
   // Persist the blocked state durably ONLY when a run is actually in progress
   // (a phase is active) — so a later `rijo --status` and the next run see the
@@ -427,16 +473,19 @@ export function blocked(ctx: WorkflowContext, message: string, details: string[]
  * the RIJO metadata dirty too and could prevent a clean retry.
  */
 export function blockedReadOnly(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
+  flushPendingDecisions(ctx);
   ctx.bus.emit('workflow.blocked', { status: 'blocked', message }, { details });
   return { ok: false, status: 'blocked', message, details };
 }
 
 export function failed(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
+  flushPendingDecisions(ctx);
   ctx.bus.emit('workflow.failed', { status: 'failed', message }, { details });
   return { ok: false, status: 'failed', message, details };
 }
 
 export function completed(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
+  flushPendingDecisions(ctx);
   ctx.bus.emit('workflow.completed', { status: 'completed', message }, { details });
   return { ok: true, status: 'completed', message, details };
 }
