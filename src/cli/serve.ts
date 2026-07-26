@@ -7,6 +7,7 @@ import { runWorkflow } from '../workflows/run.js';
 import { uiWorkflow } from '../workflows/ui.js';
 import { fixWorkflow } from '../workflows/fix.js';
 import { checkWorkflow } from '../workflows/check.js';
+import { mapWorkflow } from '../workflows/map.js';
 
 const DEFAULT_CAPABILITIES: RunnerCapabilities = { subagents: true, parallelism: false, browser: false };
 
@@ -315,6 +316,17 @@ function dispatch(
   deps: WorkflowDeps,
 ): Promise<WorkflowOutcome> {
   switch (name) {
+    case 'map':
+      return mapWorkflow(
+        cwd,
+        {
+          full: Boolean(params.full),
+          paths: (params.paths as string[] | undefined) ?? [],
+          query: params.query as string | undefined,
+          status: Boolean(params.status),
+        },
+        deps,
+      );
     case 'new':
       return newWorkflow(
         cwd,
@@ -342,6 +354,6 @@ function dispatch(
     case 'check':
       return checkWorkflow(cwd, { fix: Boolean(params.fix), production: Boolean(params.production) }, deps);
     default:
-      throw new Error(`unknown workflow "${name}" (expected new|run|ui|fix|check)`);
+      throw new Error(`unknown workflow "${name}" (expected map|new|run|ui|fix|check)`);
   }
 }

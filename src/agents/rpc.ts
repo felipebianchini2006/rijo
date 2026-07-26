@@ -40,6 +40,7 @@ export const PROTOCOL_VERSION = 2;
 
 /** Methods advertised in the host.capabilities handshake. */
 export const CORE_METHODS = [
+  'workflow.map',
   'workflow.new',
   'workflow.run',
   'workflow.ui',

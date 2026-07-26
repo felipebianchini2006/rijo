@@ -17,6 +17,7 @@ import {
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
+import { markCodebasePathsStale } from '../codebase/state.js';
 
 export interface FixOptions {
   description: string;
@@ -188,6 +189,9 @@ export async function fixWorkflow(
       finalize(fixPath, 'ESCALATED', `Fix not verified after ${config.limits.fix_attempts} attempts; escalate to a normal phase.`, now);
       return blocked(ctx, `Fix escalated after ${config.limits.fix_attempts} failed attempts.`, []);
     }
+    const changedApplicationPaths = diffSnapshots(fixBaseline, snapshotFiles(projectRoot)).changed.filter(
+      (changedPath) => changedPath !== '.rijo' && !changedPath.startsWith('.rijo/'),
+    );
 
     // ---- closeout THEN commit, following the same two-commit model as run:
     // C1 contains the code changes + the fix record WITHOUT any self-hash;
@@ -223,9 +227,8 @@ export async function fixWorkflow(
     if (vcsEnabled) {
       // stage only the files the fix actually changed, plus the fix record —
       // never `git add -A`, so pre-existing user edits are not swept in.
-      const changed = diffSnapshots(fixBaseline, snapshotFiles(projectRoot)).changed;
       const rel = path.relative(projectRoot, fixPath).split(path.sep).join('/');
-      const toCommit = [...new Set([...changed.filter((p) => pathInScope(p, ['**'])), rel])];
+      const toCommit = [...new Set([...changedApplicationPaths.filter((p) => pathInScope(p, ['**'])), rel])];
       commit = ctx.git.commitPaths(projectRoot, `rijo(fix): ${slug || 'fix'} — ${repair.change_summary.slice(0, 60)}`, toCommit);
       if (!commit) {
         return blocked(ctx, 'Fix commit (C1) failed while git commits are enabled.', [
@@ -243,6 +246,7 @@ export async function fixWorkflow(
         return blocked(ctx, 'Fix evidence commit touched non-evidence paths.', illegal);
       }
     }
+    markCodebasePathsStale(paths, changedApplicationPaths, `verified fix ${slug || 'fix'}`, now);
     bus.emit('fix.done', { status: 'completed', message: `correção verificada${commit ? ` (commit ${commit.slice(0, 8)})` : ''}` });
     return completed(ctx, `Fix done: ${repair.change_summary}${commit ? ` (tested commit ${commit})` : ''}.`, [
       `Record: ${path.relative(projectRoot, fixPath)}`,

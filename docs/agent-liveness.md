@@ -118,14 +118,14 @@ state: SUSPECT
 
 ### Machine-readable (`rijo --status --json`)
 
-The JSON envelope is `schema_version: 2` and adds a `supervisor.tasks[]`
+The JSON envelope is `schema_version: 3` and includes `supervisor.tasks[]`
 block alongside the pre-existing `runtime`/`checkpoint`/manifest fields —
 additive over v1, so older consumers reading only the original top-level
 keys keep working:
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "rijo_version": "0.1.0-alpha.1",
   "initialized": true,
   "active_milestone": "M001",

@@ -38,6 +38,8 @@ export interface WorkflowContext {
   shell: ShellRunner;
   git: GitOps;
   now: () => Date;
+  /** Crash-injection and durability hooks shared by canonical transactions, including codebase-map promotion. */
+  txnHooks: TxnHooks;
   /** Test seam: fault injection at each durable phase-finalization step. */
   finalizeHooks: FinalizeHooks;
 }
@@ -91,6 +93,7 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     shell: deps.shell ?? new SystemShellRunner(config.execution),
     git: deps.git ?? new SystemGit(),
     now,
+    txnHooks: deps.txnHooks ?? {},
     finalizeHooks: deps.finalizeHooks ?? {},
   };
 }
@@ -414,6 +417,17 @@ export function blocked(ctx: WorkflowContext, message: string, details: string[]
   } catch {
     /* never let checkpoint persistence mask the original blocker */
   }
+  return { ok: false, status: 'blocked', message, details };
+}
+
+/**
+ * Report a blocker without rewriting the durable phase checkpoint. Use this
+ * for read-only preflight refusals whose cause lives outside RIJO state (for
+ * example, a dirty application checkout). Persisting that refusal would make
+ * the RIJO metadata dirty too and could prevent a clean retry.
+ */
+export function blockedReadOnly(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
+  ctx.bus.emit('workflow.blocked', { status: 'blocked', message }, { details });
   return { ok: false, status: 'blocked', message, details };
 }
 

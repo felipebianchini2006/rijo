@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import {
   ensureDir,
@@ -49,6 +50,8 @@ import {
 } from './shared.js';
 import { runCore } from './run.js';
 import { uiCore } from './ui.js';
+import { ensureCodebaseMap } from './map.js';
+import { buildContextPacket } from '../codebase/context.js';
 
 export interface NewOptions {
   planFile: string;
@@ -167,14 +170,38 @@ export async function newWorkflow(
     }
 
     // ---- brownfield detection
-    const brown = detectBrownfield(ctx, hasRijo);
+    const brown = detectBrownfield(ctx);
     if (brown.isBrownfield) {
-      bus.emit('new.brownfield', { message: 'projeto brownfield detectado; mapeando convenções' }, { notes: brown.stackNotes });
+      bus.emit('new.brownfield', { message: 'projeto brownfield detectado; garantindo mapa da codebase' }, { notes: brown.stackNotes });
     }
 
     // ---- read the plan and extract structure via planner agent
     bus.emit('new.analyze', { stage: 'ANALYZE', message: 'extraindo escopo e requisitos do plano' });
     const planContent = readText(planPath);
+    let codebaseContext = '';
+    if (brown.isBrownfield) {
+      const ensured = await ensureCodebaseMap(ctx, {
+        allowedDirtyPaths: [path.relative(projectRoot, planPath).split(path.sep).join('/')],
+      });
+      if (!ensured.outcome.ok) return ensured.outcome;
+      if (!ensured.state || ensured.state.status !== 'COMPLETE') {
+        return blocked(ctx, 'Brownfield codebase map is not complete for planning.', [
+          `Map status: ${ensured.state?.status ?? 'missing'}.`,
+          `Relevant stale paths: ${ensured.state?.changed_paths_since_map.join(', ') || 'unknown'}.`,
+        ]);
+      }
+      const packet = buildContextPacket(
+        projectRoot,
+        planContent,
+        Math.min(config.context_budget_bytes, Math.max(4096, Math.floor(config.context_budget_bytes * 0.6))),
+      );
+      codebaseContext = packet.text;
+      bus.emit(
+        'new.map_context',
+        { message: `contexto direcionado do mapa: ${packet.selected_modules.length} módulos, ${packet.bytes} bytes` },
+        { modules: packet.selected_modules, bytes: packet.bytes, freshness: packet.freshness },
+      );
+    }
     const previousContext = opts.next ? summarizePreviousMilestones(ctx) : '';
     const extractTask: AgentTaskDraft = {
       id: 'new-extract',
@@ -191,7 +218,9 @@ export async function newWorkflow(
       verification_commands: [],
       return_format:
         'JSON payload matching the PlanExtraction schema: {project_name, project_summary, stack_summary, rules[], out_of_scope[], acceptance[], requirements[{description, acceptance, non_functional, classification}], phases[{name, requirement_indexes[], depends_on_indexes[], ui_surface}], research_topics[{key, topic, volatile}]}',
-      notes: [previousContext, brown.stackNotes.join('\n')].filter(Boolean).join('\n\n') + `\n\nPLAN CONTENT:\n${planContent}`,
+      notes:
+        [previousContext, brown.stackNotes.join('\n'), codebaseContext].filter(Boolean).join('\n\n') +
+        `\n\nPLAN CONTENT:\n${planContent}`,
     };
     // Extraction is a payload-returning dispatch: a model occasionally answers
     // ok:true but leaves the structured data in prose (payload null) or emits a
@@ -597,10 +626,16 @@ export async function newWorkflow(
   });
 }
 
-function detectBrownfield(ctx: { projectRoot: string }, hasRijo: boolean): BrownfieldInfo {
+function detectBrownfield(ctx: { projectRoot: string }): BrownfieldInfo {
   const inv = inventory(ctx.projectRoot, { skipDirs: ['node_modules', '.git', 'dist', '.rijo', '.next', 'coverage'] });
   const codeFiles = inv.filter((f) => /\.(ts|tsx|js|jsx|py|go|rs|java|rb|php|cs)$/.test(f.relPath));
-  const isBrownfield = !hasRijo && codeFiles.length > 3;
+  // An initialized but unborn repository is still a greenfield workspace:
+  // untracked source there is protected as pre-existing user work by run's
+  // conflict gate, not treated as a committed brownfield architecture.
+  const unbornRepository =
+    exists(path.join(ctx.projectRoot, '.git')) &&
+    spawnSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: ctx.projectRoot, stdio: 'ignore' }).status !== 0;
+  const isBrownfield = codeFiles.length > 0 && !unbornRepository;
   const stackNotes: string[] = [];
   const baselineCommands: string[] = [];
   const pkgRaw = readTextIfExists(path.join(ctx.projectRoot, 'package.json'));
@@ -668,14 +703,16 @@ function buildGlobalArtifacts(
   out.push({
     path: paths.stack,
     content: serializeFrontmatter(
-      { updated_at: ts, validated_at: ts },
+      { updated_at: ts },
       [
         '# Stack',
         '',
         extraction.stack_summary || 'To be determined by phase 01 research.',
         '',
         ...(brown.stackNotes.length ? ['## Detected environment', ...brown.stackNotes.map((n) => `- ${n}`)] : []),
-        ...(brown.baselineCommands.length ? ['', '## Verified commands', ...brown.baselineCommands.map((c) => `- \`${c}\``)] : []),
+        ...(brown.baselineCommands.length
+          ? ['', '## Detected commands (execution evidence is in .rijo/codebase/BASELINE.md)', ...brown.baselineCommands.map((c) => `- \`${c}\``)]
+          : []),
         '',
       ].join('\n'),
     ),

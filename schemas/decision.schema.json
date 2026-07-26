@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rijo.dev/schemas/decision.schema.json",
+  "title": "RIJO material decision proposal/record",
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "required": ["path", "file_hash"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string" },
+        "lines": { "type": "string", "pattern": "^\\d+(?:-\\d+)?$" },
+        "file_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "required": ["category", "missing_fact", "question"],
+      "properties": {
+        "category": {
+          "enum": [
+            "external_business_rule",
+            "explicit_requirement_conflict",
+            "required_external_access",
+            "production_destructive_operation",
+            "legal_fiscal_regulatory_compliance",
+            "paid_commitment_or_lock_in",
+            "data_loss_risk"
+          ]
+        },
+        "missing_fact": { "type": "string", "minLength": 1 },
+        "question": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "type": "object",
+  "required": [
+    "id",
+    "context",
+    "selected_option",
+    "rationale",
+    "material",
+    "confidence",
+    "reversible",
+    "consequences",
+    "review_condition",
+    "evidence"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^DEC-[A-Za-z0-9][A-Za-z0-9._-]*$" },
+    "context": { "type": "string", "minLength": 1 },
+    "selected_option": { "type": ["string", "null"] },
+    "rationale": { "type": "string", "minLength": 1 },
+    "material": { "type": "boolean" },
+    "impact": { "enum": ["low", "medium", "high"], "default": "medium" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "reversible": { "type": "boolean" },
+    "consequences": { "type": "array", "items": { "type": "string" } },
+    "review_condition": { "type": "string", "minLength": 1 },
+    "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "blocker": { "oneOf": [{ "$ref": "#/$defs/blocker" }, { "type": "null" }] }
+  }
+}

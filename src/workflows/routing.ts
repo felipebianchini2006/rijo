@@ -2,6 +2,7 @@ import type { ModelRole, RijoConfig, Stage } from '../core/schemas/index.js';
 import type { AgentTaskDraft } from '../agents/protocol.js';
 import { tierFor } from '../agents/roles.js';
 import { routeProfiles, validateProfiles } from '../experts/router.js';
+import { decisionPolicyBrief } from '../core/decisions.js';
 
 /**
  * Explicit context the deterministic expert router needs to pick the lenses
@@ -71,5 +72,9 @@ export function prepareDispatchedTask(
   profiles = profiles.slice(0, 3);
   validateProfiles(profiles);
 
-  return { ...draft, tier, expert_profiles: profiles };
+  const policy = decisionPolicyBrief(config.decisions);
+  const notes = draft.notes?.includes('AUTONOMOUS DECISION POLICY')
+    ? draft.notes
+    : [draft.notes ?? '', policy].filter(Boolean).join('\n\n');
+  return { ...draft, notes, tier, expert_profiles: profiles };
 }

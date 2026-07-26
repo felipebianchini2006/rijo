@@ -18,6 +18,7 @@ import {
   type FinalizeMarker,
 } from '../core/finalize.js';
 import { blocked, completed, type WorkflowContext, type WorkflowOutcome } from './shared.js';
+import { markCodebasePathsStale } from '../codebase/state.js';
 
 /**
  * Transactional, resumable phase finalization (P0.7).
@@ -276,6 +277,7 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
   // A fully sealed finalization is complete on disk and in git; do not rewrite
   // anything (a wall-clock manifest touch would dirty the tree) — just finish.
   if (vcsEnabled && marker.sealed) {
+    markCodebasePathsStale(paths, marker.authorized_source, `verified phase ${phase.id}`, now);
     removeFinalizeMarker(paths);
     return finishOutcome(ctx, phase, marker.tested_commit);
   }
@@ -301,6 +303,7 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
 
   if (!vcsEnabled) {
     // No VCS: DONE state on disk IS the completed form. Removal completes it.
+    markCodebasePathsStale(paths, marker.authorized_source, `verified phase ${phase.id}`, now);
     removeFinalizeMarker(paths);
     return finishOutcome(ctx, phase, null);
   }
@@ -382,6 +385,7 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
   }
 
   // ---- Completion: removing the marker is the single durable "done" signal.
+  markCodebasePathsStale(paths, marker.authorized_source, `verified phase ${phase.id}`, now);
   removeFinalizeMarker(paths);
   return finishOutcome(ctx, phase, c1);
 }

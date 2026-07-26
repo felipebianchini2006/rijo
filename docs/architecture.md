@@ -53,10 +53,19 @@ src/
     redact.ts       # secret redaction for prompts/logs/reports
   research/
     cache.ts        # cache.json + sources.json, fail-closed volatile-decision validation, compaction
+    decisions.ts    # autonomous decision policy, blocker gate, append-only material records
   agents/
     protocol.ts     # AgentTask / AgentResult contracts (zod)
     runner.ts       # AgentRunner interface + capability detection + sequential fallback
     roles.ts        # role->tier routing from config.yml
+  codebase/
+    inventory.ts    # deterministic secret-safe inventory and stack detection
+    git.ts          # commit/tree freshness, renames, churn, co-change, hotspots
+    analyze.ts      # symbols, surfaces, dependency graph, dynamic shards, evidence gates
+    artifacts.ts    # codebase documents and stable query indices
+    context.ts      # budgeted directed planner context and plan-reference validation
+  workflows/
+    map.ts          # full/no-op/incremental mapping and transactional promotion
     prompts.ts      # compact prompt builders per role (spec/plan/execute/review/research/qa)
   workflows/
     new.ts          # rijo new (greenfield/brownfield/--next milestone cycle)

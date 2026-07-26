@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rijo.dev/schemas/codebase-map.schema.json",
+  "title": "RIJO codebase map state (.rijo/codebase/map-state.json)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mapper_version",
+    "status",
+    "mapped_commit",
+    "mapped_tree_hash",
+    "mapped_at",
+    "branch",
+    "source_roots",
+    "module_ids",
+    "file_count",
+    "coverage",
+    "excluded_paths",
+    "artifact_hashes",
+    "baseline_status",
+    "changed_paths_since_map",
+    "stale_reasons",
+    "gaps",
+    "last_operation"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "mapper_version": { "type": "string" },
+    "status": { "enum": ["COMPLETE", "PARTIAL", "BLOCKED"] },
+    "mapped_commit": { "type": "string" },
+    "mapped_tree_hash": { "type": "string" },
+    "mapped_at": { "type": "string", "format": "date-time" },
+    "branch": { "type": "string" },
+    "source_roots": { "type": "array", "items": { "type": "string" } },
+    "module_ids": { "type": "array", "items": { "type": "string" } },
+    "file_count": { "type": "integer", "minimum": 0 },
+    "coverage": {
+      "type": "object",
+      "required": [
+        "relevant_files_classified",
+        "entrypoints_covered",
+        "modules_covered",
+        "public_contracts_covered",
+        "surfaces_covered",
+        "data_covered",
+        "tests_operations_covered",
+        "claims_verified"
+      ],
+      "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+    },
+    "excluded_paths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "reason"],
+        "properties": { "path": { "type": "string" }, "reason": { "type": "string" } }
+      }
+    },
+    "artifact_hashes": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+    },
+    "baseline_status": {
+      "enum": ["DETECTED_NOT_RUN", "PASSED", "FAILED", "BLOCKED_BY_SANDBOX", "NOT_AVAILABLE", "WAIVED"]
+    },
+    "changed_paths_since_map": { "type": "array", "items": { "type": "string" } },
+    "stale_reasons": { "type": "array", "items": { "type": "string" } },
+    "gaps": { "type": "array", "items": { "type": "string" } },
+    "last_operation": { "enum": ["full", "incremental", "paths", "no-op"] }
+  }
+}

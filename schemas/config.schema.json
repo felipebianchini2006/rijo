@@ -6,7 +6,7 @@
   "properties": {
     "schema_version": {
       "type": "integer",
-      "default": 2
+      "default": 3
     },
     "models": {
       "type": "object",
@@ -288,6 +288,22 @@
         "max_sources": {
           "type": "integer",
           "default": 500
+        }
+      }
+    },
+    "decisions": {
+      "type": "object",
+      "description": "Formal autonomous gray-area decision policy. Technical preferences are resolved without menus; only categorized factual blockers may ask one question.",
+      "properties": {
+        "mode": { "const": "autonomous", "default": "autonomous" },
+        "ask_user": { "const": "blockers_only", "default": "blockers_only" },
+        "preserve_existing_architecture": { "type": "boolean", "default": true },
+        "prefer_reversible": { "type": "boolean", "default": true },
+        "record_material_decisions": { "type": "boolean", "default": true },
+        "confidence_threshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
+        "scale_horizon": {
+          "const": "current_scope_plus_next_milestone",
+          "default": "current_scope_plus_next_milestone"
         }
       }
     },

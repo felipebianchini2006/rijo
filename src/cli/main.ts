@@ -13,6 +13,7 @@ import { runWorkflow } from '../workflows/run.js';
 import { uiWorkflow } from '../workflows/ui.js';
 import { fixWorkflow } from '../workflows/fix.js';
 import { checkWorkflow } from '../workflows/check.js';
+import { mapWorkflow, queryCodebaseMap, readCodebaseMapStatus } from '../workflows/map.js';
 import { serve } from './serve.js';
 import { generateAdapters, type AdapterName } from '../adapters/index.js';
 import type { WorkflowDeps, WorkflowOutcome } from '../workflows/shared.js';
@@ -30,6 +31,32 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
   }
 
   switch (command) {
+    case 'map': {
+      const { values } = parseArgs({
+        args: rest,
+        options: {
+          full: { type: 'boolean' },
+          paths: { type: 'string' },
+          query: { type: 'string' },
+          status: { type: 'boolean' },
+          host: { type: 'string' },
+        },
+      });
+      if (values.query !== undefined) {
+        console.log(JSON.stringify(queryCodebaseMap(cwd, values.query), null, 2));
+        return 0;
+      }
+      if (values.status) {
+        const status = readCodebaseMapStatus(cwd);
+        if (!status) return report({ ok: false, status: 'failed', message: 'No codebase map exists.' });
+        console.log(JSON.stringify(status, null, 2));
+        return 0;
+      }
+      const scopes = values.paths?.split(',').map((value) => value.trim()).filter(Boolean);
+      return withHost(cwd, values.host, deps, (d) =>
+        mapWorkflow(cwd, { full: Boolean(values.full), paths: scopes }, d),
+      );
+    }
     case 'new': {
       const { positionals, values } = parseArgs({
         args: rest,
@@ -101,7 +128,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       return 0;
     }
     default:
-      return usage(`unknown command "${command}". Workflows: new, run, ui, fix, check.`);
+      return usage(`unknown command "${command}". Workflows: map, new, run, ui, fix, check.`);
   }
 }
 
@@ -221,20 +248,22 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   const status = readStatus(paths);
   const state = readState(paths);
   const supervised = readSupervisedTasks(paths);
+  const codebase = readCodebaseMapStatus(cwd);
 
   if (values.json) {
     console.log(
       JSON.stringify(
         {
-          // v2 is additive over v1: the original fields are unchanged and the
-          // supervisor block is new — older consumers keep working.
-          schema_version: 2,
+          // v3 is additive over v2: codebase-map status is added; all v2
+          // fields keep their shape for older consumers.
+          schema_version: 3,
           rijo_version: RIJO_VERSION,
           initialized: manifest !== null,
           active_milestone: manifest?.active_milestone ?? null,
           milestones: manifest?.milestones ?? [],
           runtime: status,
           checkpoint: state,
+          codebase,
           supervisor: {
             tasks: supervised.map((t) => ({
               logical_task_id: t.logical_task_id,
@@ -310,6 +339,7 @@ function readSupervisedTasks(paths: RijoPaths): TaskRecord[] {
 const HELP = `rijo — context and autonomous execution framework
 
 workflows:
+  rijo map [--full] [--paths src/a,src/b] [--query "term"] [--status] [--host claude|codex]
   rijo new @PLANO.md [--next] [--ui @design.zip] [--run]
   rijo run [next|all|NN]
   rijo ui @design.zip | @index.html | @dir/

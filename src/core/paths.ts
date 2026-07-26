@@ -31,6 +31,16 @@ export class RijoPaths {
   get decisions(): string {
     return path.join(this.root, 'DECISIONS.md');
   }
+  get codebaseDir(): string {
+    return path.join(this.root, 'codebase');
+  }
+  get codebaseMapState(): string {
+    return path.join(this.codebaseDir, 'map-state.json');
+  }
+  /** Volatile delta marker written after verified phases/fixes; consumed by the next map/new. */
+  get codebaseStale(): string {
+    return path.join(this.runtimeDir, 'codebase-stale.json');
+  }
   get researchDir(): string {
     return path.join(this.root, 'research');
   }

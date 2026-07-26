@@ -26,11 +26,11 @@ export class MigrationError extends Error {
  * interrupted migration is re-runnable (the version stamp only advances after
  * every artifact has been rewritten).
  *
- * v1 → v2:
+ * v1/v2 → v3:
  *  - PLAN.md tasks gain `status` (derived from the legacy `done` flag);
- *  - config.yml is re-serialized so the new qa/execution/research/providers
- *    sections exist explicitly with their defaults;
- *  - manifest.schema_version becomes 2.
+ *  - config.yml receives the v3 stamp; the autonomous decision policy and
+ *    codebase-map defaults materialize deterministically through ConfigSchema;
+ *  - manifest.schema_version becomes 3.
  */
 export function migrateProject(paths: RijoPaths, now: () => Date = () => new Date()): MigrationReport {
   const manifest = readJsonIfExists<{ schema_version?: number }>(paths.manifest);

@@ -44,6 +44,7 @@ import {
 } from './shared.js';
 import { inferSecurityTag, inferHighRisk } from './routing.js';
 import { stageFinalization } from './finalize.js';
+import { buildContextPacket, validatePlanMapReferences } from '../codebase/context.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -230,6 +231,11 @@ async function executePhase(
     stage('SPEC_READY', 'gerando especificação da fase');
     const reqDoc = readRequirements(milestone.paths.requirements);
     const phaseReqs = reqDoc.requirements.filter((r) => r.phase === phase.id);
+    const specMapContext = buildContextPacket(
+      ctx.projectRoot,
+      [phase.name, ...phaseReqs.flatMap((requirement) => [requirement.description, requirement.acceptance])].join('\n'),
+      config.context_budget_bytes,
+    );
     const specRel = path.relative(ctx.projectRoot, pp.spec).split(path.sep).join('/');
     const specTask: AgentTaskDraft = {
       id: `spec-${phase.id}`,
@@ -241,7 +247,10 @@ async function executePhase(
       acceptance_criteria: phaseReqs.map((r) => `${r.id}: ${r.acceptance}`),
       verification_commands: [],
       return_format: 'Write SPEC.md to disk (inside your workspace); return a one-line confirmation.',
-      notes: `Requirements in this phase:\n${phaseReqs.map((r) => `- ${r.id}: ${r.description}`).join('\n')}`,
+      notes: [
+        `Requirements in this phase:\n${phaseReqs.map((r) => `- ${r.id}: ${r.description}`).join('\n')}`,
+        specMapContext.text,
+      ].join('\n\n'),
       workspace: null,
       canonical_baseline: null,
     };
@@ -267,6 +276,16 @@ async function executePhase(
   // ---- PLAN + PLAN_LINT + PLAN_REVIEW (bounded loop)
   const reqDoc = readRequirements(milestone.paths.requirements);
   const knownReqs = new Set(reqDoc.requirements.map((r) => r.id));
+  const planningMapContext = buildContextPacket(
+    ctx.projectRoot,
+    [
+      phase.name,
+      ...reqDoc.requirements
+        .filter((requirement) => requirement.phase === phase.id)
+        .flatMap((requirement) => [requirement.description, requirement.acceptance]),
+    ].join('\n'),
+    config.context_budget_bytes,
+  );
   let plan: PhasePlan | null = exists(pp.plan) ? readPlan(pp.plan) : null;
   let revisions = 0;
   let reviewNotes: string[] = [];
@@ -276,15 +295,20 @@ async function executePhase(
       const planTask: AgentTaskDraft = {
         id: `plan-${phase.id}-r${revisions}`,
         role: 'planner',
-        objective: `Produce the execution plan for phase ${phase.id}: between 2 and 4 tasks, exact files or code regions, dependencies, per-worker write scope, tests and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
+        objective: `Produce the execution plan for phase ${phase.id}: between 2 and 4 tasks, exact files or code regions, dependencies, per-worker write scope, executable test commands and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Each tests[] entry must be an executable verification command such as "npm test", never a prose scenario or expected result. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
         canonical_files: [paths.rules, pp.spec, milestone.paths.requirements].filter(exists),
         code_files: [],
         write_scope: [],
         acceptance_criteria: ['2-4 tasks', 'every task writes at least one concrete file (non-empty files[] and write_scope[])', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
         verification_commands: [],
         return_format:
-          'JSON payload matching PhasePlan: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 real path*/], write_scope[/*>=1 real path*/], depends_on[], parallel, tdd, tests[], evidence_expected}]}. Never leave files[] or write_scope[] empty.',
-        notes: reviewNotes.length ? `Previous review issues to address:\n${reviewNotes.join('\n')}` : '',
+          'JSON payload matching PhasePlan: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 real path*/], mapped_references:[{path,symbol?,file_hash}] /* required for every existing file/contract; omit only for genuinely new files */, write_scope[/*>=1 real path*/], depends_on[], parallel, tdd, tests[/*executable command strings only, e.g. "npm test"*/], evidence_expected}]}. Never leave files[] or write_scope[] empty. Copy hashes and symbols exactly from the supplied codebase map context. Put behavioral scenarios in evidence_expected, not tests[].',
+        notes: [
+          planningMapContext.text,
+          reviewNotes.length ? `Previous review issues to address:\n${reviewNotes.join('\n')}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
         workspace: null,
         canonical_baseline: null,
       };
@@ -338,6 +362,12 @@ async function executePhase(
     stage('PLAN_LINT', 'validação determinística do plano');
     const phaseRequirements = reqDoc.requirements.filter((r) => r.phase === phase.id).map((r) => r.id);
     const lintIssues = lintPlan(plan, { knownRequirements: knownReqs, phaseRequirements });
+    const mapReferenceIssues = validatePlanMapReferences(ctx.projectRoot, plan).map((issue) => ({
+      code: issue.code,
+      message: `${issue.task_id}: ${issue.message}`,
+      fix: 'Use an existing path/symbol/hash from the current codebase map, or declare a genuinely new file below an existing directory.',
+    }));
+    lintIssues.push(...mapReferenceIssues);
     if (lintIssues.length > 0) {
       if (revisions >= config.limits.plan_revisions) {
         return blocked(ctx, `Phase ${phase.id}: plan lint failed after ${revisions} revisions.`, lintIssues.map((i) => `${i.code}: ${i.message} — ${i.fix}`));
@@ -458,7 +488,7 @@ async function executePhase(
       const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
-        objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You have NO shell — do NOT run the verification commands, tests, npm, git or any other process yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
+        objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
         canonical_files: [ctx.paths.rules, pp.spec, pp.plan].filter(exists),
         code_files: t.files.map((f) => path.resolve(ctx.projectRoot, f)),
         write_scope: t.write_scope,
@@ -806,7 +836,7 @@ async function runRepairAttempt(
   const repairTask: AgentTaskDraft = {
     id: spec.id,
     role: 'worker',
-    objective: `${spec.objective} You have NO shell — do NOT run the verification commands, tests, npm, git or any other process yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
+    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
     canonical_files: [pp.spec, pp.plan].filter(exists),
     code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
     write_scope: plan.tasks.flatMap((t) => t.write_scope),

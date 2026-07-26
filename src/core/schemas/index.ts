@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * A boolean field an LLM fills that may arrive as a string ("true"/"false"/
@@ -248,6 +248,17 @@ export const ResearchConfigSchema = z.object({
 });
 export type ResearchConfig = z.infer<typeof ResearchConfigSchema>;
 
+export const DecisionPolicyConfigSchema = z.object({
+  mode: z.literal('autonomous').default('autonomous'),
+  ask_user: z.literal('blockers_only').default('blockers_only'),
+  preserve_existing_architecture: z.boolean().default(true),
+  prefer_reversible: z.boolean().default(true),
+  record_material_decisions: z.boolean().default(true),
+  confidence_threshold: z.number().min(0).max(1).default(0.7),
+  scale_horizon: z.literal('current_scope_plus_next_milestone').default('current_scope_plus_next_milestone'),
+});
+export type DecisionPolicyConfig = z.infer<typeof DecisionPolicyConfigSchema>;
+
 export const ConfigSchema = z.object({
   schema_version: z.number().int().default(SCHEMA_VERSION),
   models: z
@@ -285,6 +296,7 @@ export const ConfigSchema = z.object({
   qa: QaConfigSchema.default({}),
   execution: ExecutionConfigSchema.default({}),
   research: ResearchConfigSchema.default({}),
+  decisions: DecisionPolicyConfigSchema.default({}),
   supervisor: SupervisorConfigSchema.default({}),
   host: HostConfigSchema.default({}),
 });
@@ -319,6 +331,15 @@ export const RunStatusSchema = z.enum(['idle', 'running', 'waiting', 'blocked', 
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
 export const StageSchema = z.enum([
+  'MAP_PREFLIGHT',
+  'MAP_INVENTORY',
+  'MAP_HISTORY',
+  'MAP_SHARDS',
+  'MAP_SYNTHESIS',
+  'MAP_REVIEW',
+  'MAP_BASELINE',
+  'MAP_COMMIT',
+  'MAP_DONE',
   'LOAD',
   'RESEARCH_DELTA',
   'SPEC_READY',
@@ -451,6 +472,20 @@ export const PlanTaskSchema = z.object({
   requirement_ids: z.array(z.string()).default([]),
   technical_justification: z.string().nullable().default(null),
   files: z.array(z.string()).min(1),
+  /**
+   * Evidence for existing code paths/symbols used by the plan. New files do
+   * not need an entry; every claimed existing contract does. The codebase-map
+   * gate verifies these references before any worker is dispatched.
+   */
+  mapped_references: z
+    .array(
+      z.object({
+        path: z.string().min(1),
+        symbol: z.string().min(1).optional(),
+        file_hash: z.string().regex(/^[a-f0-9]{64}$/),
+      }),
+    )
+    .default([]),
   write_scope: z.array(z.string()).min(1),
   depends_on: z.array(z.string()).default([]),
   parallel: looseBool(false),

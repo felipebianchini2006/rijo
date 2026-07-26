@@ -40,6 +40,7 @@ processo real, supervisiona cada tentativa (heartbeat, deadlines e orçamento de
 substituição da `config.supervisor`) e roda o workflow de ponta a ponta:
 
 ```bash
+rijo map --host codex                    # mapeia brownfield antes do planejamento
 rijo run all --host claude              # executa todas as fases contra o Claude Code
 rijo new @PLANO.md --host codex --run    # cria o milestone e já executa, via Codex
 rijo check --host claude                 # decisão de prontidão turnkey
@@ -87,9 +88,14 @@ Antes da publicação no npm, instale por tag Git — mesmo CLI, mesmo layout:
 npm install --save-dev git+https://github.com/<owner>/rijo.git#v0.1.0
 ```
 
-## Os cinco comandos
+## Os seis comandos
 
 ```text
+rijo map                                # full, no-op ou incremental, decidido pelo core
+rijo map --full
+rijo map --paths src/auth,packages/api
+rijo map --query "validateSession"       # índice local; zero chamadas de modelo
+rijo map --status
 rijo new @PLANO.md                      # cria M001 a partir do plano
 rijo new @NOVO-PLANO.md --next          # sela o milestone atual e cria o próximo
 rijo new @PLANO.md --ui @design.zip --run
@@ -99,7 +105,8 @@ rijo ui @design.zip                     # importa design como referência visual
 rijo fix "descrição do problema" @log.txt
 rijo check [--fix] [--production]       # decisão READY/NOT_READY/BLOCKED
 
-# turnkey por host: adicione --host claude|codex a new/run/check/ui/fix
+# turnkey por host: adicione --host claude|codex a map/new/run/check/ui/fix
+rijo map --host codex
 rijo run all --host claude
 rijo new @PLANO.md --host codex --run
 ```
@@ -123,6 +130,18 @@ rijo --watch         # acompanha o status sem chamadas de modelo
   de drift são código. Agentes fazem pesquisa, especificação, planejamento,
   implementação e revisão — cada um com contexto fresco e brief explícito
   (objetivo, arquivos, escopo de escrita, critérios, comandos, formato).
+- **Mapa brownfield dirigido por evidência.** `rijo map` inventaria sem ler
+  segredos, calcula histórico e dependências, divide módulos sem owner
+  duplicado, valida cada claim por path/hash/símbolo e promove os 20+ artefatos
+  de `.rijo/codebase/` por transação recuperável. `rijo new` cria ou atualiza
+  esse mapa sob o mesmo lock e envia ao planner somente o pacote de contexto
+  relacionado ao plano.
+- **Decisões autônomas formais.** A política `decisions` é injetada em
+  `map/new/run/ui/fix/check`: preserva arquitetura, prefere alternativas
+  simples e reversíveis e registra apenas decisões materiais em
+  `.rijo/DECISIONS.md`. Perguntas técnicas de preferência e menus de opções são
+  proibidos; somente fatos externos nas categorias de blocker permitidas podem
+  interromper o fluxo.
 - **Evidência antes de conclusão.** Nenhuma fase fecha sem comandos executados,
   códigos de saída e commit registrados em `VERIFICATION.md`.
 - **Loops limitados.** 2 revisões de plano, 2 ciclos de review/reparo,
@@ -169,6 +188,10 @@ const outcome = await runWorkflow(process.cwd(), { target: 'all' }, { runner: my
 
 Sem runtime vinculado, os workflows param com diagnóstico preciso — nunca
 simulam trabalho de agente.
+
+O mapa também está disponível na API pública (`mapWorkflow`,
+`ensureCodebaseMap`, `queryCodebaseMap`, schemas de mapa e decisão) e na ponte
+JSON-RPC como `workflow.map`. Veja [docs/codebase-map.md](docs/codebase-map.md).
 
 ## Supervisão resiliente
 

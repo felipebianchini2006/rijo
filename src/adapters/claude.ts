@@ -8,7 +8,7 @@ import { EXPERT_PROFILES } from '../experts/catalog.js';
 import { renderProfileBrief } from '../experts/embed.js';
 import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
 
-const SKILLS = ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
+const SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
 
 /**
  * Specialized Claude Code agents. Each carries the RIJO `role` it fills so the

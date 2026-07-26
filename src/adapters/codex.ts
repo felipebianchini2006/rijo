@@ -8,7 +8,7 @@ import { EXPERT_PROFILES } from '../experts/catalog.js';
 import { renderProfileBrief } from '../experts/embed.js';
 import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
 
-const SKILLS = ['rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
+const SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
 
 /**
  * Codex adapter: repository skills in .agents/skills/, idempotent AGENTS.md
