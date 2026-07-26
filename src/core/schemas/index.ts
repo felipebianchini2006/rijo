@@ -545,16 +545,32 @@ export type Readiness = z.infer<typeof ReadinessSchema>;
 export const FindingSeveritySchema = z.enum(['blocker', 'critical', 'high', 'medium', 'low']);
 export type FindingSeverity = z.infer<typeof FindingSeveritySchema>;
 
-export const ReviewFindingTypeSchema = z.enum([
-  'intent_gap',
-  'spec_gap',
-  'implementation_bug',
-  'test_gap',
-  'security_risk',
-  'quality_issue',
-  'defer',
-  'reject',
-]);
+const REVIEW_FINDING_TYPE_ALIASES: Record<string, string> = {
+  evidence_incoherence: 'quality_issue',
+  specification_gap: 'spec_gap',
+  coverage_gap: 'test_gap',
+  coverage_asymmetry: 'test_gap',
+  test_coverage_gap: 'test_gap',
+  implementation_error: 'implementation_bug',
+  security_issue: 'security_risk',
+};
+
+export const ReviewFindingTypeSchema = z.preprocess(
+  (value) =>
+    typeof value === 'string'
+      ? (REVIEW_FINDING_TYPE_ALIASES[value.trim().toLowerCase()] ?? value.trim().toLowerCase())
+      : value,
+  z.enum([
+    'intent_gap',
+    'spec_gap',
+    'implementation_bug',
+    'test_gap',
+    'security_risk',
+    'quality_issue',
+    'defer',
+    'reject',
+  ]),
+);
 export type ReviewFindingType = z.infer<typeof ReviewFindingTypeSchema>;
 
 export const StateFrontmatterSchema = z.object({

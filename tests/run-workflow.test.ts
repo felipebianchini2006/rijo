@@ -68,6 +68,8 @@ describe('rijo run', () => {
     const planner = d.runner.executed.find((task) => task.id === 'plan-01-r0')!;
     expect(planner.objective).toContain('tests[] entry must be an executable verification command');
     expect(planner.return_format).toContain('executable command strings only');
+    const planReviewer = d.runner.executed.find((task) => task.id === 'plan-review-01-r0')!;
+    expect(planReviewer.return_format).toContain('type MUST be exactly one of intent_gap|spec_gap');
   });
 
   it('run all completes every phase respecting dependencies', async () => {

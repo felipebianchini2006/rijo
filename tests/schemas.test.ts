@@ -3,6 +3,7 @@ import {
   ConfigSchema,
   StatusSchema,
   RequirementSchema,
+  ReviewFindingTypeSchema,
   SCHEMA_VERSION,
 } from '../src/core/schemas/index.js';
 
@@ -32,6 +33,15 @@ describe('ConfigSchema', () => {
       ask_user: 'blockers_only',
       confidence_threshold: 0.7,
     });
+  });
+});
+
+describe('ReviewFindingTypeSchema', () => {
+  it('normalizes observed host aliases without accepting arbitrary finding types', () => {
+    expect(ReviewFindingTypeSchema.parse('evidence_incoherence')).toBe('quality_issue');
+    expect(ReviewFindingTypeSchema.parse('specification_gap')).toBe('spec_gap');
+    expect(ReviewFindingTypeSchema.parse('coverage_asymmetry')).toBe('test_gap');
+    expect(ReviewFindingTypeSchema.safeParse('looks_concerning').success).toBe(false);
   });
 });
 

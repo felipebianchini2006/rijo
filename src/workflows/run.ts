@@ -388,7 +388,8 @@ async function executePhase(
       write_scope: [],
       acceptance_criteria: [],
       verification_commands: [],
-      return_format: 'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}',
+      return_format:
+        'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}. type MUST be exactly one of intent_gap|spec_gap|implementation_bug|test_gap|security_risk|quality_issue|defer|reject; severity MUST be blocker|critical|high|medium|low.',
       notes: '',
       workspace: null,
       canonical_baseline: null,
