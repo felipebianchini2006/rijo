@@ -134,6 +134,35 @@ describe('rijo run', () => {
     expect(roadmap.phases[0]!.status).not.toBe('DONE');
   });
 
+  it('records low-severity review uncertainty without manufacturing a technical blocker', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (t) => t.id.startsWith('code-review-'),
+      (t) =>
+        ok(t, {
+          payload: {
+            approved: false,
+            findings: [
+              {
+                type: 'spec_gap',
+                severity: 'low',
+                description: 'wording can be clarified without changing observable behavior',
+                file: null,
+              },
+            ],
+          },
+        }),
+    );
+    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.ok, outcome.message).toBe(true);
+    const review = fs.readFileSync(
+      path.join(milestoneDir(root), 'phases', '01-catalogo', 'REVIEW.md'),
+      'utf8',
+    );
+    expect(review).toContain('wording can be clarified');
+  });
+
   it('verification failure does not advance state (atomicity) and bounded repair applies', async () => {
     const d = deps(root);
     // shell always fails for the plan's test command

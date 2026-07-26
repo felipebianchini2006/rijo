@@ -730,7 +730,10 @@ async function executePhase(
     }
     writeReviewDoc(pp, cr.data, reviewLoops, now);
     touchManifest(paths, () => {}, now);
-    const specGaps = cr.data.findings.filter((f) => f.type === 'intent_gap' || f.type === 'spec_gap');
+    const blockingSeverities = new Set(['blocker', 'critical', 'high']);
+    const specGaps = cr.data.findings.filter(
+      (f) => (f.type === 'intent_gap' || f.type === 'spec_gap') && blockingSeverities.has(f.severity),
+    );
     if (specGaps.length > 0) {
       return blocked(
         ctx,
@@ -738,7 +741,13 @@ async function executePhase(
         specGaps.map((f) => `${f.type}: ${f.description}`),
       );
     }
-    const actionable = cr.data.findings.filter((f) => !['defer', 'reject'].includes(f.type));
+    // Medium/low review observations are recorded in REVIEW.md, but cannot
+    // overturn green executable evidence or manufacture a technical blocker.
+    // This is the operational form of the autonomous-decision policy: only a
+    // high-impact finding enters the bounded repair/block path.
+    const actionable = cr.data.findings.filter(
+      (f) => !['defer', 'reject'].includes(f.type) && blockingSeverities.has(f.severity),
+    );
     if (cr.data.approved || actionable.length === 0) break;
     if (reviewLoops >= config.limits.review_loops) {
       return blocked(
