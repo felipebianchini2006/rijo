@@ -33,6 +33,18 @@ function shouldSkip(rel: string): boolean {
   const parts = rel.split('/');
   if (parts.some((p) => SKIP_DIRS.has(p))) return true;
   if (parts[0] === '.rijo' && parts.length > 1 && RIJO_VOLATILE.has(parts[1]!)) return true;
+  if (
+    parts[0] === '.rijo' &&
+    parts[1] === 'state' &&
+    (
+      parts[2] === 'rijo.db' ||
+      parts[2] === 'rijo.db-wal' ||
+      parts[2] === 'rijo.db-shm' ||
+      parts[2] === 'backups'
+    )
+  ) {
+    return true;
+  }
   // Credentials never enter a workspace: excluded from the snapshot, therefore
   // from the copy, from the delta and from any patch applied back.
   if (isSensitivePath(rel)) return true;

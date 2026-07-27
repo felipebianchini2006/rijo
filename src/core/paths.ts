@@ -62,8 +62,40 @@ export class RijoPaths {
   get runtimeDir(): string {
     return path.join(this.root, 'runtime');
   }
+  /** Local transactional state. Database, WAL/SHM and backups are never committed. */
+  get durableStateDir(): string {
+    return path.join(this.root, 'state');
+  }
+  get durableDb(): string {
+    return path.join(this.durableStateDir, 'rijo.db');
+  }
+  get durableBackupsDir(): string {
+    return path.join(this.durableStateDir, 'backups');
+  }
+  get durableMigrationsDir(): string {
+    return path.join(this.durableStateDir, 'migrations');
+  }
+  /** Portable, commit-safe recovery material exported from the local database. */
+  get ledgerDir(): string {
+    return path.join(this.root, 'ledger');
+  }
+  get eventSegmentsDir(): string {
+    return path.join(this.ledgerDir, 'event-segments');
+  }
+  get snapshotsDir(): string {
+    return path.join(this.ledgerDir, 'snapshots');
+  }
+  get latestSnapshot(): string {
+    return path.join(this.ledgerDir, 'latest.json');
+  }
+  get checkpointsDir(): string {
+    return path.join(this.root, 'checkpoints');
+  }
   get status(): string {
     return path.join(this.runtimeDir, 'status.json');
+  }
+  get supervisorStatus(): string {
+    return path.join(this.runtimeDir, 'supervisor.json');
   }
   get run(): string {
     return path.join(this.runtimeDir, 'run.json');

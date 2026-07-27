@@ -10,6 +10,10 @@ const PATTERNS: Array<{ re: RegExp; label: string }> = [
   { re: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, label: 'JWT' },
   { re: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, label: 'PRIVATE_KEY' },
   {
+    re: /\bBearer\s+[A-Za-z0-9._~+/-]{8,}={0,2}/gi,
+    label: 'BEARER_TOKEN',
+  },
+  {
     re: /((?:password|passwd|secret|token|api[_-]?key|authorization)\s*[=:]\s*)(["']?)[^\s"']{6,}\2/gi,
     label: 'CREDENTIAL',
   },

@@ -79,6 +79,7 @@ export type Viewport = z.infer<typeof ViewportSchema>;
  * (never a shell string).
  */
 export const QaConfigSchema = z.object({
+  surface: z.enum(['auto', 'web', 'non_web']).default('auto'),
   start_command: z.array(z.string()).default([]),
   base_url: z.string().default('http://127.0.0.1:3000'),
   health_url: z.string().default(''),
@@ -145,6 +146,17 @@ export const SupervisorConfigSchema = z.object({
   replacement_backoff_ms: z.array(z.number().int().nonnegative()).default([1_000, 5_000]),
 });
 export type SupervisorConfig = z.infer<typeof SupervisorConfigSchema>;
+
+/** Deterministic parent-process policy for the RIJO orchestration engine. */
+export const EngineSupervisorConfigSchema = z.object({
+  poll_interval_ms: z.number().int().positive().default(1_000),
+  no_progress_timeout_ms: z.number().int().positive().default(120_000),
+  hard_deadline_ms: z.number().int().positive().default(24 * 60 * 60 * 1_000),
+  cancel_grace_ms: z.number().int().positive().default(15_000),
+  kill_grace_ms: z.number().int().positive().default(5_000),
+  max_restarts: z.number().int().min(0).default(3),
+});
+export type EngineSupervisorConfig = z.infer<typeof EngineSupervisorConfigSchema>;
 
 /**
  * Host runtime binding. `provider` names the CLI host RIJO drives turnkey
@@ -298,6 +310,7 @@ export const ConfigSchema = z.object({
   research: ResearchConfigSchema.default({}),
   decisions: DecisionPolicyConfigSchema.default({}),
   supervisor: SupervisorConfigSchema.default({}),
+  engine_supervisor: EngineSupervisorConfigSchema.default({}),
   host: HostConfigSchema.default({}),
 });
 export type RijoConfig = z.infer<typeof ConfigSchema>;
@@ -576,6 +589,22 @@ export type ResearchSource = z.infer<typeof SourceSchema>;
 
 export const ReadinessSchema = z.enum(['READY', 'NOT_READY', 'BLOCKED']);
 export type Readiness = z.infer<typeof ReadinessSchema>;
+
+/** Terminal and active states of the transactional Durable State ledger. */
+export const DurableRunStatusSchema = z.enum([
+  'CREATED',
+  'RUNNING',
+  'READY',
+  'NOT_READY',
+  'BLOCKED',
+]);
+export type DurableRunStatus = z.infer<typeof DurableRunStatusSchema>;
+
+export const DurableOutboxStatusSchema = z.enum(['PENDING', 'PROJECTED', 'FAILED']);
+export type DurableOutboxStatus = z.infer<typeof DurableOutboxStatusSchema>;
+
+export const DurableLeaseStateSchema = z.enum(['ACTIVE', 'REVOKED', 'EXPIRED']);
+export type DurableLeaseState = z.infer<typeof DurableLeaseStateSchema>;
 
 export const FindingSeveritySchema = z.enum(['blocker', 'critical', 'high', 'medium', 'low']);
 export type FindingSeverity = z.infer<typeof FindingSeveritySchema>;

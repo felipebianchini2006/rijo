@@ -15,6 +15,11 @@ export {
   type CodebaseQueryResult,
 } from './workflows/map.js';
 export { runCli } from './cli/main.js';
+export {
+  requiresEngineSupervisor,
+  runCliEntrypoint,
+  type CliBootstrapDeps,
+} from './cli/bootstrap.js';
 export { serve } from './cli/serve.js';
 export { StdioTransport, RpcAgentRunner, type RpcTransport } from './agents/rpc.js';
 export type { WorkflowContext, WorkflowDeps, WorkflowOutcome } from './workflows/shared.js';
@@ -54,4 +59,15 @@ export {
   type HostEnvResult,
 } from './security/hostEnv.js';
 export * from './hosts/index.js';
+export * from './durable/index.js';
+export {
+  EngineSupervisor,
+} from './supervisor/engineSupervisor.js';
+export type {
+  EngineProcessFactory,
+  EngineSupervisorConfig,
+  EngineSupervisorLedger,
+  EngineSupervisorResult,
+  EngineSupervisorState,
+} from './supervisor/engineTypes.js';
 export * as schemas from './core/schemas/index.js';

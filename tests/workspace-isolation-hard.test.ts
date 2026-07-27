@@ -9,6 +9,7 @@ import {
   SymlinkEscapeError,
   PatchConflictError,
   findEscapingSymlinks,
+  snapshotTree,
 } from '../src/core/workspace.js';
 import { tmpProject, cleanup } from './helpers.js';
 
@@ -90,6 +91,24 @@ describe('attempt workspaces are Git-isolated from the controlled checkout', () 
     expect(
       spawnSync('git', ['status', '--porcelain', '-uall'], { cwd: root, encoding: 'utf8' }).stdout,
     ).not.toContain('.rijo/runtime/workspaces/');
+  });
+
+  it('excludes only volatile SQLite files while retaining durable migrations', () => {
+    const state = path.join(root, '.rijo', 'state');
+    fs.mkdirSync(path.join(state, 'backups'), { recursive: true });
+    fs.mkdirSync(path.join(state, 'migrations'), { recursive: true });
+    for (const name of ['rijo.db', 'rijo.db-wal', 'rijo.db-shm']) {
+      fs.writeFileSync(path.join(state, name), name);
+    }
+    fs.writeFileSync(path.join(state, 'backups', '1.sqlite'), 'backup');
+    fs.writeFileSync(path.join(state, 'migrations', '001.sql'), 'SELECT 1;');
+
+    const snapshot = snapshotTree(root);
+    expect(snapshot.has('.rijo/state/rijo.db')).toBe(false);
+    expect(snapshot.has('.rijo/state/rijo.db-wal')).toBe(false);
+    expect(snapshot.has('.rijo/state/rijo.db-shm')).toBe(false);
+    expect(snapshot.has('.rijo/state/backups/1.sqlite')).toBe(false);
+    expect(snapshot.has('.rijo/state/migrations/001.sql')).toBe(true);
   });
 });
 

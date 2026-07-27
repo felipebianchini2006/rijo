@@ -29,6 +29,13 @@ describe('redact', () => {
     expect(out).toBe('password: [REDACTED]');
   });
 
+  it('redacts the complete bearer credential rather than only the Bearer prefix', () => {
+    const secret = 'secret-value-123456789';
+    const out = redact(`Authorization: Bearer ${secret}`);
+    expect(out).not.toContain(secret);
+    expect(out).toContain('[REDACTED]');
+  });
+
   it('redacts credentials embedded in urls but keeps the host', () => {
     const out = redact('fetch https://admin:s3cretpw@example.com/path now');
     expect(out).toBe('fetch https://[REDACTED]@example.com/path now');

@@ -77,16 +77,24 @@ describe('distribution E2E (npm pack + install)', () => {
       fs.writeFileSync(
         path.join(fixture, 'import-check.mjs'),
         [
-          "import { runWorkflow, newWorkflow, FakeAgentRunner, serve } from 'rijo';",
+          "import { runWorkflow, newWorkflow, FakeAgentRunner, serve, SqliteStateStore } from 'rijo';",
           "if (typeof runWorkflow !== 'function') { console.error('runWorkflow missing'); process.exit(1); }",
           "if (typeof newWorkflow !== 'function') { console.error('newWorkflow missing'); process.exit(1); }",
           "if (typeof serve !== 'function') { console.error('serve missing'); process.exit(1); }",
           "if (typeof FakeAgentRunner !== 'function') { console.error('FakeAgentRunner missing'); process.exit(1); }",
-          "console.log('import-ok');",
+          "if (typeof SqliteStateStore !== 'function') { console.error('SqliteStateStore missing'); process.exit(1); }",
+          "const store = new SqliteStateStore({ projectRoot: process.cwd() });",
+          "await store.initialize();",
+          "const integrity = await store.integrityCheck();",
+          "if (!integrity.ok) { console.error(integrity.errors.join('; ')); process.exit(1); }",
+          "await store.createBackup('.rijo/state/backups/pack-install.sqlite');",
+          "await store.close();",
+          "console.log('import-sqlite-backup-ok');",
         ].join('\n'),
       );
       const importOut = execSync('node import-check.mjs', { cwd: fixture, encoding: 'utf8' });
-      expect(importOut.trim()).toBe('import-ok');
+      expect(importOut.trim()).toBe('import-sqlite-backup-ok');
+      expect(fs.existsSync(path.join(fixture, '.rijo', 'state', 'backups', 'pack-install.sqlite'))).toBe(true);
     } finally {
       fs.rmSync(tarball, { force: true });
       cleanup(fixture);

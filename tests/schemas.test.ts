@@ -33,6 +33,14 @@ describe('ConfigSchema', () => {
       ask_user: 'blockers_only',
       confidence_threshold: 0.7,
     });
+    expect(config.engine_supervisor).toEqual({
+      poll_interval_ms: 1_000,
+      no_progress_timeout_ms: 120_000,
+      hard_deadline_ms: 86_400_000,
+      cancel_grace_ms: 15_000,
+      kill_grace_ms: 5_000,
+      max_restarts: 3,
+    });
   });
 });
 
