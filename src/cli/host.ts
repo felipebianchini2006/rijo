@@ -56,17 +56,17 @@ export async function buildHostExecutor(opts: HostExecutorOptions): Promise<Host
   if (!availability.available) {
     return {
       ok: false,
-      message: `Host CLI "${bin}" indisponível (--host ${opts.provider}).`,
+      message: `Host CLI "${bin}" is unavailable (--host ${opts.provider}).`,
       details: [
-        `Instale "${bin}" e garanta que "${bin} --version" funcione no PATH.`,
-        'Sem o CLI do host o RIJO não executa agentes turnkey — nada é simulado.',
+        `Install "${bin}". Confirm that "${bin} --version" works on PATH.`,
+        'RIJO cannot run compatibility agents without the host CLI. RIJO does not simulate the host.',
       ],
     };
   }
-  emit(`[rijo host] ${opts.provider} disponível (${availability.version ?? 'versão desconhecida'})`);
+  emit(`[rijo host] ${opts.provider} available (${availability.version ?? 'unknown version'})`);
 
   const onSpawn = (pid: number | null): void =>
-    emit(`[rijo host] ${opts.provider}: tentativa iniciada (pid ${pid ?? 'desconhecido'})`);
+    emit(`[rijo host] ${opts.provider}: attempt started (pid ${pid ?? 'unknown'})`);
 
   const controller =
     opts.provider === 'claude'
@@ -95,7 +95,7 @@ export function resolveHostProvider(
 ): HostProvider | { error: string } {
   if (flag !== undefined) {
     if (flag === 'claude' || flag === 'codex' || flag === 'none') return flag;
-    return { error: `--host inválido "${flag}". Use claude, codex ou none.` };
+    return { error: `Invalid --host value "${flag}". Use claude, codex, or none.` };
   }
   return config.host.provider;
 }

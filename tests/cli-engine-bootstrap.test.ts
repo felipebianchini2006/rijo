@@ -23,12 +23,12 @@ function fakeLedger(): EngineSupervisorLedger & { close(): Promise<void> } {
 
 describe('CLI engine bootstrap', () => {
   it('supervises only autonomous run entrypoints and never recursively supervises the child', () => {
-    expect(requiresEngineSupervisor(['new', '@PLANO.md', '--host', 'codex', '--run'], {})).toBe(true);
+    expect(requiresEngineSupervisor(['new', '@PLAN.md', '--host', 'codex', '--run'], {})).toBe(true);
     expect(requiresEngineSupervisor(['run', '--host=claude'], {})).toBe(true);
     expect(requiresEngineSupervisor(['run', 'all', '--host=claude'], {})).toBe(true);
     expect(requiresEngineSupervisor(['run', 'next', '--host=claude'], {})).toBe(false);
     expect(requiresEngineSupervisor(['run', '01', '--host=claude'], {})).toBe(false);
-    expect(requiresEngineSupervisor(['new', '@PLANO.md'], {})).toBe(false);
+    expect(requiresEngineSupervisor(['new', '@PLAN.md'], {})).toBe(false);
     expect(requiresEngineSupervisor(['check', '--production'], {})).toBe(false);
     expect(
       requiresEngineSupervisor(['run'], { RIJO_ENGINE_CHILD: '1' }),
@@ -54,7 +54,7 @@ describe('CLI engine bootstrap', () => {
 
     try {
       const code = await runCliEntrypoint(
-        ['new', '@PLANO.md', '--host', 'codex', '--run'],
+        ['new', '@PLAN.md', '--host', 'codex', '--run'],
         root,
         { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
         deps,
@@ -65,7 +65,7 @@ describe('CLI engine bootstrap', () => {
       expect(supervise).toHaveBeenCalledOnce();
       expect(supervise.mock.calls[0]![0]).toMatchObject({
         projectRoot: root,
-        args: ['new', '@PLANO.md', '--host', 'codex', '--run'],
+        args: ['new', '@PLAN.md', '--host', 'codex', '--run'],
         ledger,
       });
       expect(supervise.mock.calls[0]![0].env).toMatchObject({

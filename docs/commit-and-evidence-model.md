@@ -1,15 +1,15 @@
 # Commit and evidence model
 
-RIJO commits verified work with **no self-referencing hash**: a commit never
+RIJO commits verified work with **no self-referencing hash**. A commit never
 records its own SHA inside itself (impossible without amending, which RIJO
 never does), and it never contains a hash it invented rather than one Git
-actually produced. The pattern used by `rijo run` (phase completion),
-`rijo check --production` (readiness certification), and `rijo fix` (quick
+actually produced. The pattern used by `start` (phase completion),
+`test` (readiness evidence), and `fix` (quick
 repair) is a small family of two- and three-commit sequences that all follow
 the same rule: **code and evidence are separate commits, and the range
 between them is checked to contain nothing else.**
 
-## The C1 → C2 → seal pattern (`rijo run`, `workflows/run.ts`)
+## The C1 → C2 → seal pattern (`start`, `workflows/run.ts`)
 
 ```
  baseline (dirtyAtStart recorded)
@@ -61,7 +61,7 @@ between them is checked to contain nothing else.**
         uncommitted), or BLOCKED
 ```
 
-`rijo check --production` (`productionCheck` in `workflows/check.ts`) follows
+The exact-commit production gate (`productionCheck` in `workflows/check.ts`) follows
 the identical three-step shape: the gate's `tested_commit` is HEAD as it
 already existed (the gate never commits code — it only certifies), the
 `evidence` commit adds `production-readiness.md` + the `qa/` evidence
@@ -69,7 +69,7 @@ directory (traces, screenshots, server log) and is range-checked against the
 tested commit, and the `seal` commit records the evidence commit's own hash
 back into the readiness report.
 
-`rijo fix` (`workflows/fix.ts`) uses a **two-step** variant: C1 (the code
+The `fix` workflow (`workflows/fix.ts`) uses a **two-step** variant: C1 (the code
 change + the fix record, `tested_commit: null`) then C2 (the fix record
 rewritten with `tested_commit = C1`, committed alone, range-checked against
 C1). There is no third seal step — the fix record has only one field to
@@ -84,7 +84,7 @@ fields to reconcile.
 
 1. **`tested_commit` is always the commit that was actually tested, never
    invented.** For `run`, it is the C1 hash `git.commitPaths` returned. For
-   `check --production`, it is the HEAD the gate checked out and ran against
+   the production gate, it is the HEAD the gate checked out and ran against
    — captured *before* any evidence commit exists. A hash is written to a
    report only after `git` has produced it; nothing is guessed or
    pre-computed.
@@ -100,7 +100,7 @@ fields to reconcile.
    hash, not its own. This is why three steps exist for `run`/`check` instead
    of one: a single "code + evidence" commit would necessarily either omit
    `tested_commit` (leaving nothing pointing at the tested state) or contain
-   its own not-yet-existing hash (impossible without amending).
+   its own hash before Git creates it.
 4. **The tree is clean at the end.** After the final commit of a `run` phase,
    `git status` is re-checked; any dirty file that RIJO touched (including
    any `.rijo/**` path) blocks the outcome. A clean end state is a hard
@@ -129,8 +129,8 @@ Both reuse `ctx.git.commitPaths` (explicit path lists, never `-A`) and
 
 | Workflow | C1 ("code") | C2 ("evidence") | seal |
 |---|---|---|---|
-| `run` | task-scoped source + SPEC/PLAN/SUMMARY/REVIEW/VERIFICATION/ROADMAP/REQUIREMENTS/STATE/manifest | VERIFICATION.md, ROADMAP.md, STATE.md, manifest.json, MILESTONES.md index | VERIFICATION.md, manifest.json |
-| `check --production` | (not created by check — the already-existing tested commit) | production-readiness.md + `qa/` evidence dir | production-readiness.md |
+| `start` | task-scoped source + SPEC/PLAN/SUMMARY/REVIEW/VERIFICATION/ROADMAP/REQUIREMENTS/STATE/manifest | VERIFICATION.md, ROADMAP.md, STATE.md, manifest.json, MILESTONES.md index | VERIFICATION.md, manifest.json |
+| exact-commit gate | the existing tested commit | production-readiness.md + `qa/` evidence directory | production-readiness.md |
 | `fix` | fixed files + the fix record | the fix record alone | — (two-step only) |
 
 ## Proven by

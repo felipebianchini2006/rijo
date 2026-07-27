@@ -143,7 +143,7 @@ describe('generateAdapters', () => {
     const agentsMd = fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8');
     expect(agentsMd).toContain(BEGIN);
     expect(agentsMd).toContain('[RIJO M002 F03/05] EXECUTE T02/04');
-    expect(agentsMd).toContain('marcadores curtos de transição');
+    expect(agentsMd).toContain('Publish one short transition message');
   });
 
   it('with no detection generates only the generic AGENTS.md block', () => {

@@ -5,9 +5,9 @@ describe('renderTemplate', () => {
   it('substitutes provided variables', () => {
     const out = renderTemplate('Hello {{name}}, welcome to {{project.name}}!', {
       name: 'Rijo',
-      'project.name': 'Loja',
+      'project.name': 'Store',
     });
-    expect(out).toBe('Hello Rijo, welcome to Loja!');
+    expect(out).toBe('Hello Rijo, welcome to Store!');
   });
 
   it('substitutes repeated placeholders everywhere they appear', () => {

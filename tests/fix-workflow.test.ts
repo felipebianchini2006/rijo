@@ -22,8 +22,8 @@ describe('rijo fix', () => {
           payload: {
             reproduced: true,
             reproduction_steps: 'abrir /checkout com carrinho vazio',
-            hypothesis: 'validação ausente',
-            root_cause: 'checkout não valida carrinho vazio',
+            hypothesis: 'missing validation',
+            root_cause: 'checkout does not validate an empty cart',
             escalate: false,
             escalate_reason: '',
           },
@@ -35,12 +35,12 @@ describe('rijo fix', () => {
         ok(t, {
           payload: {
             fixed: true,
-            root_cause: 'checkout não valida carrinho vazio',
+            root_cause: 'checkout does not validate an empty cart',
             change_summary: 'guarda de carrinho vazio no handler',
             regression_test: 'tests/checkout-empty.test.ts',
             regression_test_impossible_reason: null,
             verification_commands: ['echo run-regression'],
-            residual_risk: 'nenhum identificado',
+            residual_risk: 'No residual risk was identified.',
           },
         }),
     );
@@ -48,7 +48,7 @@ describe('rijo fix', () => {
 
   it('reproduces, fixes, adds regression and records context without creating a phase', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     wireHappyFix(d);
     const phaseCountBefore = countPhaseDirs(root);
     const outcome = await fixWorkflow(root, { description: 'checkout quebra com carrinho vazio' }, d);
@@ -70,7 +70,7 @@ describe('rijo fix', () => {
 
   it('escalates when the problem cannot be reproduced after 2 attempts', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     d.runner.on(
       (t) => t.id.startsWith('fix-diagnose'),
       (t) => ok(t, { payload: { reproduced: false, reproduction_steps: 'tentado', hypothesis: '', root_cause: null, escalate: false, escalate_reason: '' } }),
@@ -86,7 +86,7 @@ describe('rijo fix', () => {
 
   it('escalates on architectural scope instead of fixing', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     d.runner.on(
       (t) => t.id.startsWith('fix-diagnose'),
       (t) => ok(t, { payload: { reproduced: true, reproduction_steps: 'x', hypothesis: 'y', root_cause: 'z', escalate: true, escalate_reason: 'requires schema migration' } }),
@@ -100,7 +100,7 @@ describe('rijo fix', () => {
 
   it('bounded repair: escalates after fix_attempts failed verifications', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     d.runner.on(
       (t) => t.id.startsWith('fix-diagnose'),
       (t) => ok(t, { payload: { reproduced: true, reproduction_steps: 'x', hypothesis: 'y', root_cause: 'z', escalate: false, escalate_reason: '' } }),

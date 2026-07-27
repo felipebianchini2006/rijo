@@ -94,7 +94,7 @@ describe('rijo map workflow', () => {
     const before = fs.readFileSync(path.join(root, 'src', 'auth', 'service.ts'), 'utf8');
     const d = deps(root);
     const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
-    expect(outcome.ok).toBe(true);
+    expect(outcome.ok, `${outcome.message}\n${outcome.details?.join('\n')}`).toBe(true);
 
     const paths = new RijoPaths(root);
     for (const artifact of ARTIFACTS) {
@@ -300,8 +300,8 @@ describe('rijo map workflow', () => {
     const wired = { ...d, git: new SystemGit() };
     expect((await mapWorkflow(root, {}, wired)).ok).toBe(true);
 
-    fs.writeFileSync(path.join(root, 'PLANO.md'), '# Future work\n\nAdd a counter command in a later phase.\n');
-    git(root, ['add', 'PLANO.md']);
+    fs.writeFileSync(path.join(root, 'PLAN.md'), '# Future work\n\nAdd a counter command in a later phase.\n');
+    git(root, ['add', 'PLAN.md']);
     git(root, ['commit', '-m', 'docs: add future implementation plan']);
     d.runner.on(
       (task) => task.id.startsWith('map-shard-'),
@@ -423,7 +423,7 @@ describe('rijo map workflow', () => {
     expect(billingClaim).toBeTruthy();
 
     const outcome = await mapWorkflow(root, { paths: ['src/auth'] }, wired);
-    expect(outcome.ok).toBe(true);
+    expect(outcome.ok, `${outcome.message}\n${outcome.details?.join('\n')}`).toBe(true);
     const after = JSON.parse(fs.readFileSync(claimsPath, 'utf8'));
     expect(after.claims).toContainEqual(billingClaim);
     expect(JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8')).last_operation).toBe('paths');
@@ -713,19 +713,21 @@ describe('Git history and brownfield baseline evidence', () => {
 describe('rijo new brownfield map integration', () => {
   let root: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     root = tmpProject('rijo-new-auto-map-');
     seedBrownfield(root);
     writePlanFile(root);
-    git(root, ['add', 'PLANO.md']);
+    git(root, ['add', 'PLAN.md']);
     git(root, ['commit', '-m', 'docs: add closed scope plan']);
+    const mapped = await mapWorkflow(root, {}, { ...deps(root), git: new SystemGit() });
+    expect(mapped.ok, JSON.stringify(mapped)).toBe(true);
   });
 
   afterEach(() => cleanup(root));
 
-  it('auto-maps under the existing new lock and gives the planner real paths and symbols', async () => {
+  it('uses the explicit map and gives the planner real paths and symbols', async () => {
     const d = deps(root);
-    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() });
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, git: new SystemGit() });
     expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
     expect(fs.existsSync(new RijoPaths(root).codebaseMapState)).toBe(true);
     const extract = d.runner.executed.find((t) => t.id === 'new-extract')!;
@@ -736,23 +738,25 @@ describe('rijo new brownfield map integration', () => {
 
   it('new --next refreshes a stale brownfield map before classifying the next milestone', async () => {
     const first = deps(root);
-    const firstOutcome = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...first, git: new SystemGit() });
+    const firstOutcome = await newWorkflow(root, { planFile: '@PLAN.md' }, { ...first, git: new SystemGit() });
     expect(firstOutcome.ok, JSON.stringify(firstOutcome)).toBe(true);
     fs.appendFileSync(
       path.join(root, 'src', 'auth', 'service.ts'),
       '\nexport function rotateSession() { return true; }\n',
     );
-    fs.writeFileSync(path.join(root, 'PLANO2.md'), '# Próximo milestone\n\nAlterar rotação de sessão existente.\n');
-    git(root, ['add', 'src/auth/service.ts', 'PLANO2.md']);
+    fs.writeFileSync(path.join(root, 'PLAN-2.md'), '# Next milestone\n\nChange the existing session rotation.\n');
+    git(root, ['add', 'src/auth/service.ts', 'PLAN-2.md']);
     git(root, ['commit', '-m', 'feat(auth): prepare session rotation milestone']);
 
     const second = deps(root);
+    const refreshed = await mapWorkflow(root, {}, { ...second, git: new SystemGit() });
+    expect(refreshed.ok, refreshed.message).toBe(true);
     const outcome = await newWorkflow(
       root,
-      { planFile: '@PLANO2.md', next: true },
+      { planFile: '@PLAN-2.md', next: true },
       { ...second, git: new SystemGit() },
     );
-    expect(outcome.ok).toBe(true);
+    expect(outcome.ok, `${outcome.message}\n${outcome.details?.join('\n')}`).toBe(true);
     const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
     expect(state.last_operation).toBe('incremental');
     expect(state.changed_paths_since_map).toContain('src/auth/service.ts');
@@ -763,7 +767,7 @@ describe('rijo new brownfield map integration', () => {
 
   it('marks only verified phase source paths stale for the next incremental map', async () => {
     const d = deps(root);
-    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() });
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, git: new SystemGit() });
     expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
     const run = await runWorkflow(root, {}, { ...d, git: new SystemGit() });
     expect(run.ok).toBe(true);
@@ -778,7 +782,7 @@ describe('rijo new brownfield map integration', () => {
 
   it('run --all incrementally remaps phase impact before planning the next phase', async () => {
     const d = deps(root);
-    const created = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, git: new SystemGit() });
+    const created = await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, git: new SystemGit() });
     expect(created.ok, created.message).toBe(true);
     const outcome = await runWorkflow(root, { target: 'all' }, { ...d, git: new SystemGit() });
     expect(outcome.ok, outcome.message).toBe(true);
@@ -831,7 +835,7 @@ describe('rijo new brownfield map integration', () => {
         return { task_id: task.id, ok: true, summary: 'implemented after replan', files_written: written, payload: { done: true }, scope_requests: [] };
       },
     );
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, wired)).ok).toBe(true);
     expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
     const firstPlanCalls = d.runner.executed.filter(
       (task) => task.id.startsWith('plan-01') && !task.id.startsWith('plan-review'),
@@ -874,7 +878,7 @@ describe('rijo new brownfield map integration', () => {
       },
     );
     const wired = { ...d, git: new SystemGit() };
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, wired)).ok).toBe(true);
     expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
     fs.appendFileSync(path.join(root, 'src', 'auth', 'service.ts'), '\nexport const crashRevision = 3;\n');
     git(root, ['add', 'src/auth/service.ts']);
@@ -924,7 +928,7 @@ describe('rijo new brownfield map integration', () => {
         scope_requests: [],
       }),
     );
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, wired)).ok).toBe(true);
     expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
     fs.appendFileSync(path.join(root, 'src', 'a.ts'), '// external overlap\n');
     const before = fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8');
@@ -956,7 +960,7 @@ describe('rijo new brownfield map integration', () => {
         scope_requests: [],
       }),
     );
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, wired)).ok).toBe(true);
     expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
     const planCalls = d.runner.executed.filter(
       (task) => task.id.startsWith('plan-01') && !task.id.startsWith('plan-review'),

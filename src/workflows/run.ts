@@ -40,6 +40,7 @@ import {
   commitDecisionProposals,
   discardDecisionProposals,
   durableCheckpoint,
+  isNativeResultRequired,
   isWorkflowCancellation,
   type ReplaceableAttempt,
   type WorkflowContext,
@@ -50,6 +51,7 @@ import {
 import { checkCore } from './check.js';
 import { inferSecurityTag, inferHighRisk } from './routing.js';
 import { stageFinalization } from './finalize.js';
+import { syncActiveProjectProjections } from './projections.js';
 import {
   buildContextPacket,
   gapsAffectingScope,
@@ -80,6 +82,23 @@ const ReviewPayloadSchema = z.object({
     .default([]),
 });
 type ReviewPayload = z.infer<typeof ReviewPayloadSchema>;
+
+const PhaseResearchPayloadSchema = z.object({
+  summary: z.string().min(1),
+  volatile_facts: looseBool(true),
+  sources: z
+    .array(
+      z.object({
+        claim: z.string().min(1),
+        source: z.string().min(1),
+        url: z.string().url(),
+        checked_at: z.string().datetime(),
+        version: z.string().min(1),
+        tier: z.literal('official'),
+      }),
+    )
+    .default([]),
+});
 
 const PhaseRecoveryBaselineSchema = z.object({
   snapshot: z.array(z.tuple([z.string(), z.string()])),
@@ -216,6 +235,14 @@ export async function runWorkflow(
   });
 }
 
+/** Native public implementation route. Full product QA remains a separate step. */
+export async function startWorkflow(
+  projectRoot: string,
+  deps: WorkflowDeps = {},
+): Promise<WorkflowOutcome> {
+  return runWorkflow(projectRoot, { target: 'all', finalCheck: false }, deps);
+}
+
 /**
  * Run the phase state machine using an EXISTING context and lock. This is what
  * `rijo new --run` composes with, so the run does not try to re-acquire a lock
@@ -226,7 +253,11 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
   const autonomous = Boolean(ctx.durable) && (opts.finalCheck ?? (opts.target === undefined || opts.target === 'all'));
   {
     // ---- LOAD
-    bus.emit('run.load', { status: 'running', stage: 'LOAD', message: 'validando manifest, drift e checkpoint' });
+    bus.emit('run.phase_load', {
+      status: 'running',
+      stage: 'PHASE_LOAD',
+      message: '[RIJO] PHASE_LOAD',
+    });
     const schemaGuard = guardSchema(ctx);
     if (schemaGuard) return schemaGuard;
     // Orphan-workspace discard and crash recovery already ran in withLock (which
@@ -259,7 +290,7 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
       ctx.config.context_budget_bytes,
     );
     if (!budget.withinBudget) {
-      bus.emit('run.budget_warning', { message: `contexto automático ${budget.bytes}B excede orçamento ${budget.budget}B` });
+      bus.emit('run.budget_warning', { message: `Automatic context ${budget.bytes}B exceeds budget ${budget.budget}B.` });
     }
 
     const roadmap = readRoadmap(milestone.paths.roadmap);
@@ -267,6 +298,15 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
     if (targets.length === 0) {
       const allDone = roadmap.phases.every((p) => p.status === 'DONE');
       if (allDone && autonomous) return runAutonomousFinalCheck(ctx);
+      if (allDone) {
+        syncActiveProjectProjections(paths);
+        bus.emit('run.implementation_complete', {
+          status: 'completed',
+          stage: 'IMPLEMENTATION_COMPLETE',
+          milestone: { id: milestone.id, name: milestone.slug },
+          message: `[RIJO ${milestone.id}] IMPLEMENTATION_COMPLETE`,
+        });
+      }
       return completed(
         ctx,
         allDone ? `All ${roadmap.phases.length} phases of ${milestone.id} are DONE.` : 'No ready phase (check dependencies/blockers).',
@@ -279,9 +319,16 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
       await durableCheckpoint(ctx, `phase:${phase.id}:completed`, {
         commit: ctx.git.headCommit(ctx.projectRoot),
       });
+      syncActiveProjectProjections(paths);
       if (!autonomous && opts.target !== 'all') return outcome;
     }
     if (autonomous) return runAutonomousFinalCheck(ctx);
+    bus.emit('run.implementation_complete', {
+      status: 'completed',
+      stage: 'IMPLEMENTATION_COMPLETE',
+      milestone: { id: milestone.id, name: milestone.slug },
+      message: `[RIJO ${milestone.id}] IMPLEMENTATION_COMPLETE`,
+    });
     return completed(ctx, `Completed ${targets.length} phase(s) of ${milestone.id}.`);
   }
 }
@@ -290,13 +337,38 @@ async function runAutonomousFinalCheck(ctx: WorkflowContext): Promise<WorkflowOu
   ctx.bus.emit('run.final_check', {
     status: 'running',
     stage: 'CHECKS',
-    message: 'todas as fases concluídas; executando check de produção com correção limitada',
+    message: 'All phases are complete. Run the bounded production check.',
   });
   await durableCheckpoint(ctx, 'run:before-final-check', {
     commit: ctx.git.headCommit(ctx.projectRoot),
   });
   const check = ctx.finalCheck ?? checkCore;
   return check(ctx, { production: true, fix: true });
+}
+
+function nativePhaseStage(
+  stage: import('../core/schemas/index.js').Stage,
+): import('../core/schemas/index.js').Stage {
+  switch (stage) {
+    case 'LOAD':
+      return 'PHASE_LOAD';
+    case 'RESEARCH_DELTA':
+    case 'SPEC_READY':
+      return 'PHASE_RESEARCH';
+    case 'PLAN':
+    case 'PLAN_LINT':
+      return 'PHASE_PLAN';
+    case 'CODE_REVIEW':
+      return 'ENGINEERING_REVIEW';
+    case 'UI_SMOKE':
+      return 'VERIFY';
+    case 'PERSIST':
+    case 'COMMIT':
+    case 'DONE':
+      return 'PHASE_DONE';
+    default:
+      return stage;
+  }
 }
 
 function resolveTargets(ctx: WorkflowContext, roadmap: RoadmapDoc, target?: string): RoadmapPhase[] {
@@ -346,8 +418,20 @@ async function executePhase(
   const pp = phasePaths(phaseDir);
   const phaseInfo = { id: phase.id, index: phaseIndex, total: roadmap.phases.length, name: phase.name };
   const milestoneInfo = { id: milestone.id, name: milestone.slug };
-  const stage = (s: import('../core/schemas/index.js').Stage, message: string, extra: Record<string, unknown> = {}) =>
-    bus.emit(`run.${s.toLowerCase()}`, { status: 'running', stage: s, milestone: milestoneInfo, phase: phaseInfo, message }, extra);
+  const stage = (s: import('../core/schemas/index.js').Stage, message: string, extra: Record<string, unknown> = {}) => {
+    const publicStage = nativePhaseStage(s);
+    return bus.emit(
+      `run.${publicStage.toLowerCase()}`,
+      {
+        status: 'running',
+        stage: publicStage,
+        milestone: milestoneInfo,
+        phase: phaseInfo,
+        message: `[RIJO ${milestone.id} F${phase.id}/${String(roadmap.phases.length).padStart(2, '0')}] ${publicStage}`,
+      },
+      { ...extra, detail: message },
+    );
+  };
 
   const markPhase = (status: RoadmapPhase['status'], commit?: string | null) => {
     const doc = readRoadmap(milestone.paths.roadmap);
@@ -359,7 +443,7 @@ async function executePhase(
 
   /** Append-only transition event FIRST, then the plan projection, then manifest hashes. */
   const transition = (taskId: string, to: TaskStatus, reason = '') => {
-    bus.emit('task.transition', { message: `tarefa ${taskId} → ${to}${reason ? ` (${reason})` : ''}` }, { task: taskId, to, reason });
+    bus.emit('task.transition', { message: `Task ${taskId} → ${to}${reason ? ` (${reason})` : ''}` }, { task: taskId, to, reason });
     setTaskStatus(pp.plan, taskId, to);
     touchManifest(paths, () => {}, now);
   };
@@ -367,7 +451,7 @@ async function executePhase(
   let forceReplan = false;
   let appliedPlanAtEntry = false;
   if (readMapState(paths)) {
-    stage('LOAD', 'verificando freshness do mapa e do plano antes de entrar na fase');
+    stage('LOAD', 'Check map and plan freshness before the phase starts.');
     const rawPlanData = exists(pp.plan)
       ? parseFrontmatter<Record<string, unknown>>(readText(pp.plan)).data
       : null;
@@ -407,7 +491,7 @@ async function executePhase(
       if (externalDelta.changed.length > 0) {
         bus.emit(
           'run.external_change_non_overlapping',
-          { message: `mudança externa não relacionada registrada para a fase ${phase.id}` },
+          { message: `Recorded an unrelated external change for phase ${phase.id}.` },
           { phase: phase.id, paths: externalDelta.changed },
         );
       }
@@ -509,7 +593,7 @@ async function executePhase(
             } else {
               bus.emit(
                 'run.plan_freshness_reconciled',
-                { message: `plano aplicado da fase ${phase.id} reconciliado com mudança externa não sobreposta` },
+                { message: `Reconciled the applied phase ${phase.id} plan with a non-overlapping external change.` },
                 { reasons: freshnessReasons },
               );
             }
@@ -519,7 +603,7 @@ async function executePhase(
     }
     bus.emit(
       'run.map_context_fresh',
-      { message: `fase ${phase.id} usará mapa ${ensured.state.mapped_commit}` },
+      { message: `Phase ${phase.id} will use map ${ensured.state.mapped_commit}.` },
       {
         phase: phase.id,
         mapped_commit: ensured.state.mapped_commit,
@@ -537,13 +621,98 @@ async function executePhase(
   const initialDirtyAtStart = new Set(gitStatusAtStart.dirtyFiles);
 
   markPhase('IN_PROGRESS');
+  touchManifest(paths, () => {}, now);
 
-  // ---- RESEARCH_DELTA (deterministic: only flag; agents re-research on demand elsewhere)
-  stage('RESEARCH_DELTA', 'reutilizando pesquisa armazenada');
+  // ---- PHASE_RESEARCH (bounded, read-only, persisted by the deterministic core)
+  stage('RESEARCH_DELTA', 'Research the current phase delta.');
+  if (!exists(pp.research)) {
+    const reqDoc = readRequirements(milestone.paths.requirements);
+    const phaseReqs = reqDoc.requirements.filter((requirement) => requirement.phase === phase.id);
+    let researchPayload: z.infer<typeof PhaseResearchPayloadSchema> | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const researchTask: AgentTaskDraft = {
+        id: `new-research-phase-${phase.id}-r${attempt}`,
+        role: 'researcher',
+        objective:
+          `Research only the implementation delta for phase ${phase.id} (${phase.name}). ` +
+          'Use official primary documentation for volatile facts. Do not modify the checkout.',
+        canonical_files: [
+          paths.rules,
+          milestone.paths.scope,
+          milestone.paths.requirements,
+          milestone.paths.research,
+        ].filter(exists),
+        code_files: [],
+        write_scope: [],
+        acceptance_criteria: [
+          'Limit research to the active phase.',
+          'Provide an official source for every volatile fact.',
+          'Record each source claim, URL, checked date, and version.',
+        ],
+        verification_commands: [],
+        return_format:
+          'JSON payload: {summary, volatile_facts, sources:[{claim,source,url,checked_at,version,tier:"official"}]}. ' +
+          'Set volatile_facts=false only when the phase has no version-sensitive fact.',
+        notes: phaseReqs
+          .map((requirement) => `${requirement.id}: ${requirement.description}\nAcceptance: ${requirement.acceptance}`)
+          .join('\n\n'),
+        workspace: null,
+        canonical_baseline: null,
+      };
+      const { result, violation } = await dispatchReadOnly(ctx, researchTask, {
+        stage: 'RESEARCH_DELTA',
+      });
+      if (violation.length > 0) {
+        return blocked(ctx, `Phase ${phase.id}: researcher modified the checkout.`, violation);
+      }
+      const parsed = PhaseResearchPayloadSchema.safeParse(result.payload);
+      if (
+        result.ok &&
+        parsed.success &&
+        (!parsed.data.volatile_facts || parsed.data.sources.length > 0)
+      ) {
+        researchPayload = parsed.data;
+        commitDecisionProposals(ctx, result);
+        break;
+      }
+      discardDecisionProposals(ctx, result);
+    }
+    if (!researchPayload) {
+      return blocked(ctx, `Phase ${phase.id}: phase research failed after 2 attempts.`, [
+        'Volatile facts require an official source with a claim, URL, checked date, and version.',
+      ]);
+    }
+    writeFileAtomic(
+      pp.research,
+      serializeFrontmatter(
+        {
+          phase: phase.id,
+          researched_at: now().toISOString(),
+          volatile_facts: researchPayload.volatile_facts,
+          sources: researchPayload.sources,
+        },
+        [
+          `# Phase research — ${phase.id}`,
+          '',
+          researchPayload.summary,
+          '',
+          '## Official sources',
+          ...(researchPayload.sources.length
+            ? researchPayload.sources.map(
+                (source) =>
+                  `- ${source.claim} — ${source.source} ${source.version} (${source.url}, checked ${source.checked_at})`,
+              )
+            : ['- No volatile facts apply to this phase.']),
+          '',
+        ].join('\n'),
+      ),
+    );
+    touchManifest(paths, () => {}, now);
+  }
 
   // ---- SPEC_READY
   if (!exists(pp.spec)) {
-    stage('SPEC_READY', 'gerando especificação da fase');
+    stage('SPEC_READY', 'Generate the phase specification.');
     const reqDoc = readRequirements(milestone.paths.requirements);
     const phaseReqs = reqDoc.requirements.filter((r) => r.phase === phase.id);
     const specMapContext = buildContextPacket(
@@ -556,7 +725,13 @@ async function executePhase(
       id: `spec-${phase.id}`,
       role: 'planner',
       objective: `Write the SPEC.md for phase ${phase.id} (${phase.name}). It must be actionable, testable, tied to real code surfaces, complete and coherent, with observable acceptance scenarios for each requirement.`,
-      canonical_files: [paths.rules, milestone.paths.scope, milestone.paths.requirements, milestone.paths.research].filter(exists),
+      canonical_files: [
+        paths.rules,
+        milestone.paths.scope,
+        milestone.paths.requirements,
+        milestone.paths.research,
+        pp.research,
+      ].filter(exists),
       code_files: [],
       write_scope: [specRel],
       acceptance_criteria: phaseReqs.map((r) => `${r.id}: ${r.acceptance}`),
@@ -586,7 +761,7 @@ async function executePhase(
       spec.attempt.workspace.discard();
     }
   } else {
-    stage('SPEC_READY', 'especificação existente validada');
+    stage('SPEC_READY', 'Validated the existing specification.');
   }
 
   // ---- PLAN + PLAN_LINT + PLAN_REVIEW (bounded loop)
@@ -610,12 +785,17 @@ async function executePhase(
   let planReviewEnvelope: ValidatedAgentEnvelope | null = null;
   while (true) {
     if (!plan) {
-      stage('PLAN', `planejando tarefas (revisão ${revisions})`);
+      stage('PLAN', `Plan tasks (revision ${revisions}).`);
       const planTask: AgentTaskDraft = {
         id: `plan-${phase.id}-r${revisions}`,
         role: 'planner',
         objective: `Produce the execution plan for phase ${phase.id}: between 2 and 4 tasks, exact files or code regions, dependencies, per-worker write scope, executable test commands and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Each tests[] entry must be an executable verification command such as "npm test", never a prose scenario or expected result. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
-        canonical_files: [paths.rules, pp.spec, milestone.paths.requirements].filter(exists),
+        canonical_files: [
+          paths.rules,
+          pp.research,
+          pp.spec,
+          milestone.paths.requirements,
+        ].filter(exists),
         code_files: [],
         write_scope: [],
         acceptance_criteria: ['2-4 tasks', 'every task writes at least one concrete file (non-empty files[] and write_scope[])', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
@@ -701,7 +881,7 @@ async function executePhase(
       touchManifest(paths, () => {}, now);
     }
 
-    stage('PLAN_LINT', 'validação determinística do plano');
+    stage('PLAN_LINT', 'Validate the plan deterministically.');
     const phaseRequirements = reqDoc.requirements.filter((r) => r.phase === phase.id).map((r) => r.id);
     const lintIssues = lintPlan(plan, { knownRequirements: knownReqs, phaseRequirements });
     const mapReferenceIssues = (readMapState(paths) ? validatePlanMapReferences(ctx.projectRoot, plan) : [])
@@ -732,7 +912,7 @@ async function executePhase(
       continue;
     }
 
-    stage('PLAN_REVIEW', 'revisão independente do plano');
+    stage('PLAN_REVIEW', 'Run an independent plan review.');
     const reviewTask: AgentTaskDraft = {
       id: `plan-review-${phase.id}-r${revisions}`,
       role: 'reviewer',
@@ -801,7 +981,7 @@ async function executePhase(
   }
   if (planEnvelope) commitDecisionProposals(ctx, planEnvelope);
   if (planReviewEnvelope) commitDecisionProposals(ctx, planReviewEnvelope);
-  bus.emit('run.plan_approved', { message: 'plano aprovado' });
+  bus.emit('run.plan_approved', { message: 'Plan approved.' });
 
   // Baseline snapshot of the working tree (excluding .rijo internals) taken
   // before any worker patch is applied — the reviewer's diff and the phase
@@ -920,7 +1100,7 @@ async function executePhase(
     }
 
     const taskIdx = plan.tasks.findIndex((t) => t.id === pending[0]!.id) + 1;
-    stage('EXECUTE', `executando ${pending.map((t) => t.id).join('+')}`, {});
+    stage('EXECUTE', `Execute ${pending.map((t) => t.id).join('+')}.`, {});
     bus.emit('run.task_start', {
       stage: 'EXECUTE',
       task: { id: pending[0]!.id, index: taskIdx, total: totalTasks, name: pending[0]!.name },
@@ -939,6 +1119,7 @@ async function executePhase(
         (_task, i) => attempts[i]!.prepareReplacement,
       );
     } catch (err) {
+      if (isNativeResultRequired(err)) throw err;
       discardAll();
       pending.forEach((t) => transition(t.id, 'FAILED', 'dispatch error'));
       return blocked(ctx, `Phase ${phase.id}: worker dispatch failed.`, [String((err as Error).message)]);
@@ -1009,7 +1190,7 @@ async function executePhase(
       bus.emit('run.task_done', {
         completedUnits: readPlan(pp.plan).tasks.filter((x) => x.status !== 'PENDING' && x.status !== 'RUNNING').length,
         totalUnits: totalTasks,
-        message: `tarefa ${t.id} implementada (não verificada)`,
+        message: `Task ${t.id} is implemented but not verified.`,
       });
     }
     for (const result of results) commitDecisionProposals(ctx, result);
@@ -1039,7 +1220,7 @@ async function executePhase(
   let reviewLoops = 0;
   let evidences: CommandEvidence[] = [];
   while (true) {
-    stage('VERIFY', 'executando build, lint e testes direcionados');
+    stage('VERIFY', 'Run build, lint, and focused tests.');
     for (const t of readPlan(pp.plan).tasks) {
       if (t.status === 'IMPLEMENTED' || t.status === 'VERIFIED') transition(t.id, 'VERIFYING');
     }
@@ -1095,7 +1276,7 @@ async function executePhase(
       }
     }
 
-    stage('CODE_REVIEW', 'revisão independente do código');
+    stage('CODE_REVIEW', 'Run an independent code review.');
     const diffSummary = changedFilesReport(ctx, phaseBaseline);
     const crTask: AgentTaskDraft = {
       id: `code-review-${phase.id}-l${reviewLoops}`,
@@ -1204,9 +1385,9 @@ async function executePhase(
   if (phase.ui_surface) {
     if (!ctx.runner.capabilities.browser) {
       uiSmokeNote = 'SKIPPED: browser capability unavailable in this runtime (recorded, not simulated)';
-      bus.emit('run.ui_smoke', { stage: 'UI_SMOKE', message: 'browser indisponível; smoke registrado como não executado' });
+      bus.emit('run.ui_smoke', { stage: 'UI_SMOKE', message: 'The browser is unavailable. Record the smoke test as not executed.' });
     } else {
-      stage('UI_SMOKE', 'smoke visual da superfície alterada');
+      stage('UI_SMOKE', 'Run a visual smoke test on the changed surface.');
       const screenshotScope = path.relative(ctx.projectRoot, path.join(milestone.paths.qaDir, 'screenshots')).split(path.sep).join('/') + '/**';
       const smokeTask: AgentTaskDraft = {
         id: `ui-smoke-${phase.id}`,
@@ -1251,7 +1432,7 @@ async function executePhase(
   // as a clean pre-finalization state (retryable) or a fully DONE-and-committed
   // phase — never a DONE phase without its commits. See workflows/finalize.ts;
   // an interrupted finalization is resumed under the lock by reconcileFinalization.
-  stage('PERSIST', 'persistindo resumo, evidências e estado');
+  stage('PERSIST', 'Persist the summary, evidence, and state.');
   const finalization = await stageFinalization(ctx, {
     milestone,
     phase,
@@ -1293,6 +1474,7 @@ async function runRepairAttempt(
     canonical_baseline: null,
   };
   const handle = replaceableAttempt(ctx, repairTask, {}, { stage: 'EXECUTE' });
+  let preserveNativeWorkspace = false;
   try {
     const res = await dispatch(ctx, handle.attempt.task, { stage: 'EXECUTE' }, { prepareReplacement: handle.prepareReplacement });
     if (!res.ok) {
@@ -1302,6 +1484,10 @@ async function runRepairAttempt(
     commitDecisionProposals(ctx, res);
     return null;
   } catch (err) {
+    if (isNativeResultRequired(err)) {
+      preserveNativeWorkspace = true;
+      throw err;
+    }
     if (
       err instanceof WorkspaceScopeError ||
       err instanceof CanonicalWriteError ||
@@ -1312,7 +1498,7 @@ async function runRepairAttempt(
     }
     throw err;
   } finally {
-    handle.attempt.workspace.discard();
+    if (!preserveNativeWorkspace) handle.attempt.workspace.discard();
   }
 }
 

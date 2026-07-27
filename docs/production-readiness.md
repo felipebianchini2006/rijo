@@ -1,33 +1,29 @@
 # Production readiness
 
-`rijo check` never deploys. It produces one of three statuses —
+`$rijo test` never deploys. It produces one of three statuses:
 `READY`, `NOT_READY`, or `BLOCKED` — written to
 `.rijo/milestones/<id>/qa/production-readiness.md`, and it is READY only when
 **every** gate passes; there is no partial credit and no inference. This
-document describes what each mode of `rijo check` actually requires, the
-difference between `NOT_READY` and `BLOCKED`, how waivers work, and the
-current limits of what the gate can certify.
+document describes the required evidence. It also explains the result states,
+waivers, and current limits.
 
-## Two modes
+## Native product Quality Assurance
 
-- **`rijo check`** (local, default) — runs the project's own deterministic
-  scripts and drives journeys through the configured `AgentRunner`'s browser
-  capability. Useful for iteration; does not certify an exact commit unless
-  the tree happens to be clean.
-- **`rijo check --production`** (`qa/gate.ts`) — the executable gate. Checks
-  out `tested_commit` cleanly with `git worktree`, installs dependencies
-  reproducibly, and drives **real Playwright** across every configured
-  browser × viewport against a **real, running server**. This is the mode
-  that produces a certification meant to be trusted.
+The native `test` workflow runs deterministic project checks and real user
+journeys. It uses the browser, computer-use, simulator, or emulator tools that
+the active host provides.
 
-Both modes share the same readiness decision shape (`READY`/`NOT_READY`/
-`BLOCKED`) and the same report format (`production-readiness.md`), but
-`--production` is materially stronger evidence because nothing in its result
-can be explained by "the agent said so."
+The workflow records screenshots, traces, logs, network failures, console
+errors, accessibility defects, and visual defects. It fixes bounded defects and
+runs affected journeys again.
+
+The deterministic production gate in `src/qa/gate.ts` can certify one exact
+commit with Playwright. Secondary automation can invoke that gate through the
+legacy Command-Line Interface.
 
 ## What `READY` requires
 
-### `rijo check --production` (the gate)
+### Exact-commit production gate
 
 Every one of the following must hold, in order — the first failure that
 cannot be satisfied determines the status:
@@ -64,13 +60,12 @@ cannot be satisfied determines the status:
 12. **Every active requirement** (status not `CANCELLED`/`CARRIED`) is
     covered by at least one journey **and** is `DONE` or `DEBT`.
 
-### `rijo check` (local mode)
+### Native journey mode
 
-The same shape via `decideReadiness` (`qa/readiness.ts`), but built from
+The native workflow uses `decideReadiness` (`qa/readiness.ts`). It combines
 locally-run deterministic checks (`format:check`, `lint`, `typecheck`,
-`build`, `test`, `test:integration`, `test:e2e`, and `playwright test` when
-the project declares Playwright and a config exists) plus agent-driven
-journeys instead of the executable gate. `READY` requires: no missing
+`build`, `test`, `test:integration`, and `test:e2e`) with real user journeys.
+It can also run Playwright when the project declares it. `READY` requires no missing
 capability, a pinned commit, every check green (a missing production build
 script or a failing one always blocks), every requirement covered by a
 journey and `DONE`/`DEBT`, and every journey either passed cleanly (no
@@ -122,16 +117,16 @@ still be `DONE`/`DEBT` — a waiver excuses "this journey didn't pass," never
 fail-closed volatile research decisions — see `docs/security-model.md`; it
 has no bearing on production readiness.)
 
-## `--fix`
+## Bounded repair
 
-Both modes support a bounded `--fix` loop (`config.limits.qa_fix_loops`
+The workflow supports a bounded repair loop (`config.limits.qa_fix_loops`
 rounds). Each round dispatches a worker in an isolated workspace to fix
 failures grouped by root cause, applies the verified patch, commits it, and
 then **re-runs the entire matrix** — not just the previously failing subset
 — against the new commit. This is deliberate: a fix for one journey can
 regress another, so a partial re-run could certify `READY` against evidence
-that no longer describes the current commit. For local `rijo check`, if
-`--fix` leaves the working tree dirty (uncommitted), the result is forced to
+that no longer describes the current commit. If a repair
+leaves the working tree dirty, the result is forced to
 `NOT_READY` even if every gate would otherwise pass — a readiness report may
 only certify a committed, reproducible state.
 
@@ -153,11 +148,9 @@ only certify a committed, reproducible state.
   including the gate and commit-model tests, runs against a
   `FakeAgentRunner`/in-memory bridge; there is no CI job that exercises a real
   Claude/Codex provider end to end.
-- **The local `rijo check` mode's journey execution depends on the
-  configured runtime's browser capability** (`ctx.runner.capabilities.browser`)
-  being honestly reported — RIJO does not attempt to detect or simulate a
-  browser capability the runtime does not declare; a missing capability is
-  always `BLOCKED`, never approximated.
+- **Native journey execution depends on the tools that the active host
+  provides.** RIJO does not simulate a browser, simulator, or emulator
+  capability. A missing required capability returns `BLOCKED`.
 
 ## Proven by
 

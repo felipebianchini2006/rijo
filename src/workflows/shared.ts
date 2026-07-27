@@ -279,7 +279,7 @@ export async function withLock<T>(
     if (handle.reclaimedAttempts.length > 0) {
       ctx.bus.emit(
         'lock.reclaimed',
-        { message: `lock reciclado; ${handle.reclaimedAttempts.length} attempt(s) órfão(s) para recovery` },
+        { message: `Reclaimed the lock. Recover ${handle.reclaimedAttempts.length} orphaned attempt(s).` },
         { attempts: handle.reclaimedAttempts },
       );
     }
@@ -292,14 +292,14 @@ export async function withLock<T>(
     //       copy can re-introduce a discarded attempt's edits.
     const rec = reconcileTransactions(ctx.paths);
     for (const id of rec.rolledBack) {
-      ctx.bus.emit('txn.rolled_back', { message: `transação incompleta descartada: ${id}` }, { txn: id });
+      ctx.bus.emit('txn.rolled_back', { message: `Discarded the incomplete transaction: ${id}.` }, { txn: id });
     }
     for (const id of rec.rolledForward) {
-      ctx.bus.emit('txn.rolled_forward', { message: `transação confirmada reaplicada: ${id}` }, { txn: id });
+      ctx.bus.emit('txn.rolled_forward', { message: `Reapplied the committed transaction: ${id}.` }, { txn: id });
     }
     for (const key of reconcileDecisionCommits(ctx.paths, ctx.config.decisions, ctx.now)) {
       ctx.bus.emit('decision.reconciled', {
-        message: `decisão transacional recuperada: ${key.slice(0, 12)}`,
+        message: `Recovered transactional decision: ${key.slice(0, 12)}.`,
       });
     }
 
@@ -309,13 +309,13 @@ export async function withLock<T>(
     for (const e of recovery.entries) {
       ctx.bus.emit(
         'supervised.recovered',
-        { message: `tarefa supervisionada recuperada: ${e.logical_task_id} (${e.from} → ${e.action})` },
+        { message: `Recovered supervised task: ${e.logical_task_id} (${e.from} → ${e.action}).` },
         { ...e },
       );
     }
 
     for (const ws of discardOrphanWorkspaces(ctx.paths.runtimeDir)) {
-      ctx.bus.emit('workspace.orphan_discarded', { message: `workspace órfão descartado: ${ws}` }, { workspace: ws });
+      ctx.bus.emit('workspace.orphan_discarded', { message: `Discarded the orphaned workspace: ${ws}.` }, { workspace: ws });
     }
 
     // (d) resume an interrupted phase finalization: complete the commit/seal
@@ -333,6 +333,7 @@ export async function withLock<T>(
     ) {
       await persistDurableTerminal(ctx, result);
     }
+    commitPortableDurableArtifacts(ctx, 'workflow event journal');
     return result;
   } finally {
     clearInterval(renewTimer);
@@ -396,11 +397,13 @@ export async function durableCheckpoint(
 
 export function commitPortableDurableArtifacts(ctx: WorkflowContext, reason: string): void {
   if (!ctx.config.git.commit) return;
+  if (!ctx.git) return;
   const status = ctx.git.status(ctx.projectRoot);
   if (!status.isRepo) return;
   const portable = status.dirtyFiles.filter(
     (file) =>
       file === '.rijo/.gitignore' ||
+      file === '.rijo/events.jsonl' ||
       file.startsWith('.rijo/ledger/') ||
       file.startsWith('.rijo/state/migrations/'),
   );
@@ -425,6 +428,11 @@ export interface WorkflowOutcome {
   details?: string[];
 }
 
+/** Identify the native bridge pause that waits for a host subagent result. */
+export function isNativeResultRequired(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('NATIVE_RESULT_REQUIRED:');
+}
+
 /**
  * Route a draft through the deterministic model-tier + expert-profile router,
  * then supervise it. NO draft reaches the executor without routing: the tier
@@ -446,6 +454,11 @@ export async function dispatch(
     role: full.role,
     ...(options.prepareReplacement ? { prepareReplacement: options.prepareReplacement } : {}),
   });
+  if (result.summary.includes('native result bundle has no result for task')) {
+    throw new Error(
+      `NATIVE_RESULT_REQUIRED: ${result.summary} Read the exported native request and run the helper again.`,
+    );
+  }
   return validateAgentDecisions(ctx, result);
 }
 
@@ -468,6 +481,14 @@ export async function dispatchBatch(
     return { task: full, role: full.role, ...(prep ? { prepareReplacement: prep } : {}) };
   });
   const results = await ctx.executor.runBatch(reqs, max ?? ctx.config.limits.max_parallel_agents);
+  const pendingNativeResult = results.find((result) =>
+    result.summary.includes('native result bundle has no result for task'),
+  );
+  if (pendingNativeResult) {
+    throw new Error(
+      `NATIVE_RESULT_REQUIRED: ${pendingNativeResult.summary} Read the exported native request and run the helper again.`,
+    );
+  }
   return results.map((result) => validateAgentDecisions(ctx, result));
 }
 
@@ -561,7 +582,7 @@ export function commitDecisionProposals(ctx: WorkflowContext, envelope: Validate
       ctx.decisionHooks,
     );
     ctx.bus.emit('decision.approved', {
-      message: `decisão ${pending.proposal.id} aprovada`,
+      message: `Decision ${pending.proposal.id} approved.`,
     }, {
       proposal: pending.proposal,
       attempt_id: pending.attempt_id,

@@ -14,7 +14,7 @@ const ACTIONS: JourneyAction[] = [
   { action: 'goto', path: '/' },
   { action: 'fill', selector: '#name', value: 'Maria' },
   { action: 'click', selector: '#submit' },
-  { action: 'expect_text', selector: '#result', text: 'Olá, Maria', requirement_id: 'M001-REQ-001' },
+  { action: 'expect_text', selector: '#result', text: 'Hello, Maria', requirement_id: 'M001-REQ-001' },
 ];
 
 describe('playwright spec generation (structured actions only)', () => {
@@ -26,8 +26,8 @@ describe('playwright spec generation (structured actions only)', () => {
 
   it('generates a real, traceable spec from structured actions; no actions → no spec', () => {
     const reqs = [
-      RequirementSchema.parse({ id: 'M001-REQ-001', description: 'Catálogo', acceptance: 'lista visível', phase: '01' }),
-      RequirementSchema.parse({ id: 'M001-REQ-002', description: 'Checkout', acceptance: 'compra concluída', phase: '02' }),
+      RequirementSchema.parse({ id: 'M001-REQ-001', description: 'Catalog', acceptance: 'list is visible', phase: '01' }),
+      RequirementSchema.parse({ id: 'M001-REQ-002', description: 'Checkout', acceptance: 'purchase is complete', phase: '02' }),
     ];
     const journeys = deriveJourneys(reqs);
     // only the first journey has actions — the second must NOT get a placeholder
@@ -42,7 +42,7 @@ describe('playwright spec generation (structured actions only)', () => {
     // real UI actions, not body-visible placeholders
     expect(spec).toContain('page.locator("#name").fill("Maria")');
     expect(spec).toContain('page.locator("#submit").click()');
-    expect(spec).toContain('toContainText("Olá, Maria")');
+    expect(spec).toContain('toContainText("Hello, Maria")');
     // the generated spec passes its own anti-placeholder lint
     expect(lintPlaywrightSpec(spec, journeys[0]!)).toEqual([]);
   });
@@ -60,7 +60,7 @@ describe('playwright spec generation (structured actions only)', () => {
   it('rijo check writes specs into qa/journeys/ only for journeys with actions', async () => {
     writePlanFile(root);
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const paths = new RijoPaths(root);
     const manifest = readManifest(paths)!;
     const m = manifest.milestones[0]!;

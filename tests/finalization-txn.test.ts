@@ -56,7 +56,7 @@ function expectPhase01Complete(root: string): void {
   expect(p01.status).toBe('DONE');
   expect(p01.commit).toBeTruthy();
 
-  const verification = fs.readFileSync(path.join(mdir, 'phases', '01-catalogo', 'VERIFICATION.md'), 'utf8');
+  const verification = fs.readFileSync(path.join(mdir, 'phases', '01-catalog', 'VERIFICATION.md'), 'utf8');
   const fm = parseFrontmatter<Record<string, unknown>>(verification).data;
   expect(fm['tested_commit'], 'tested_commit unset').toBe(p01.commit);
   expect(fm['evidence_commit'], 'evidence_commit unset').toBeTruthy();
@@ -65,7 +65,7 @@ function expectPhase01Complete(root: string): void {
   const c1 = p01.commit as string;
   const c1Files = git(root, ['show', '--name-only', '--pretty=format:', c1]).split('\n').filter(Boolean);
   expect(c1Files).toContain('src/a.ts');
-  const verAtC1 = git(root, ['show', `${c1}:.rijo/milestones/M001-loja-simples/phases/01-catalogo/VERIFICATION.md`]);
+  const verAtC1 = git(root, ['show', `${c1}:.rijo/milestones/M001-simple-store/phases/01-catalog/VERIFICATION.md`]);
   expect(verAtC1).toContain('tested_commit: null');
 
   // requirement DONE with evidence
@@ -104,7 +104,7 @@ describe('phase finalization crash safety (real git, fault injection at every co
 
   it('happy path: a full phase finalizes and leaves no marker', async () => {
     const d = { ...deps(root), git: new SystemGit() };
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, { target: '01' }, d);
     expect(outcome.ok, outcome.message).toBe(true);
     expectPhase01Complete(root);
@@ -116,7 +116,7 @@ describe('phase finalization crash safety (real git, fault injection at every co
 
       // 1) Drive phase 01 up to (and into) finalization, then crash.
       const dCrash = { ...deps(root), git: new SystemGit(), finalizeHooks: crashAt(step) };
-      await newWorkflow(root, { planFile: '@PLANO.md' }, dCrash);
+      await newWorkflow(root, { planFile: '@PLAN.md' }, dCrash);
       await expect(runWorkflow(root, { target: '01' }, dCrash)).rejects.toThrow(/INJECTED-FINALIZE-CRASH/);
 
       // the crash happened DURING finalization: the marker is present and the
@@ -138,12 +138,15 @@ describe('phase finalization crash safety (real git, fault injection at every co
 
       expectPhase01Complete(root);
 
-      // 3) Idempotency: resuming again is a clean no-op with identical HEAD.
+      // 3) Idempotency: resuming again changes only the canonical event journal.
       const headAfterResume = git(root, ['rev-parse', 'HEAD']);
       const dAgain = { ...deps(root), git: new SystemGit() };
       const again = await runWorkflow(root, { target: '01' }, dAgain);
       expect(again.ok, again.message).toBe(true);
-      expect(git(root, ['rev-parse', 'HEAD'])).toBe(headAfterResume);
+      const headAfterNoop = git(root, ['rev-parse', 'HEAD']);
+      expect(git(root, ['diff', '--name-only', headAfterResume, headAfterNoop])).toBe(
+        '.rijo/events.jsonl',
+      );
       expectPhase01Complete(root);
     });
   }
@@ -153,7 +156,7 @@ describe('phase finalization crash safety (real git, fault injection at every co
     // the marker must prevent the phase being treated as done until it commits.
     const paths = new RijoPaths(root);
     const dCrash = { ...deps(root), git: new SystemGit(), finalizeHooks: crashAt('roadmap') };
-    await newWorkflow(root, { planFile: '@PLANO.md' }, dCrash);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, dCrash);
     await expect(runWorkflow(root, { target: '01' }, dCrash)).rejects.toThrow(/INJECTED-FINALIZE-CRASH/);
 
     // On disk the roadmap already says DONE, but there is NO phase commit yet…
@@ -185,7 +188,7 @@ describe('phase finalization crash safety (no VCS)', () => {
     dCrash.git.repo = false;
     dCrash.git.init = () => false;
     (dCrash as { finalizeHooks?: unknown }).finalizeHooks = crashAt('state');
-    await newWorkflow(root, { planFile: '@PLANO.md' }, dCrash);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, dCrash);
     await expect(runWorkflow(root, { target: '01' }, dCrash)).rejects.toThrow(/INJECTED-FINALIZE-CRASH/);
     expect(fs.existsSync(paths.finalize)).toBe(true);
 
@@ -201,7 +204,7 @@ describe('phase finalization crash safety (no VCS)', () => {
 
     const mdir = milestoneDir(root);
     expect(readRoadmap(path.join(mdir, 'ROADMAP.md')).phases.find((p) => p.id === '01')!.status).toBe('DONE');
-    const verification = fs.readFileSync(path.join(mdir, 'phases', '01-catalogo', 'VERIFICATION.md'), 'utf8');
+    const verification = fs.readFileSync(path.join(mdir, 'phases', '01-catalog', 'VERIFICATION.md'), 'utf8');
     const fm = parseFrontmatter<Record<string, unknown>>(verification).data;
     expect(fm['vcs']).toBe('disabled');
     expect(fm['tested_commit']).toBeNull();

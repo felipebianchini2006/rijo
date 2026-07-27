@@ -16,11 +16,23 @@ export class RijoPaths {
   get project(): string {
     return path.join(this.root, 'PROJECT.md');
   }
+  get requirements(): string {
+    return path.join(this.root, 'REQUIREMENTS.md');
+  }
+  get roadmap(): string {
+    return path.join(this.root, 'ROADMAP.md');
+  }
   get rules(): string {
     return path.join(this.root, 'RULES.md');
   }
   get stack(): string {
     return path.join(this.root, 'STACK.md');
+  }
+  get architecture(): string {
+    return path.join(this.root, 'ARCHITECTURE.md');
+  }
+  get integrations(): string {
+    return path.join(this.root, 'INTEGRATIONS.md');
   }
   get milestonesIndex(): string {
     return path.join(this.root, 'MILESTONES.md');
@@ -52,6 +64,15 @@ export class RijoPaths {
   }
   get milestonesDir(): string {
     return path.join(this.root, 'milestones');
+  }
+  get phasesDir(): string {
+    return path.join(this.root, 'phases');
+  }
+  get uiDir(): string {
+    return path.join(this.root, 'ui');
+  }
+  get qaDir(): string {
+    return path.join(this.root, 'qa');
   }
   get fixesDir(): string {
     return path.join(this.root, 'fixes');
@@ -157,6 +178,7 @@ export function milestonePaths(dir: string): MilestonePaths {
 
 export interface PhasePaths {
   dir: string;
+  research: string;
   spec: string;
   plan: string;
   summary: string;
@@ -167,6 +189,7 @@ export interface PhasePaths {
 export function phasePaths(dir: string): PhasePaths {
   return {
     dir,
+    research: path.join(dir, 'RESEARCH.md'),
     spec: path.join(dir, 'SPEC.md'),
     plan: path.join(dir, 'PLAN.md'),
     summary: path.join(dir, 'SUMMARY.md'),

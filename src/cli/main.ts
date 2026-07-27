@@ -1,23 +1,36 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { parseArgs } from 'node:util';
 import { RijoPaths } from '../core/paths.js';
+import { appendLine, ensureDir } from '../core/fsx.js';
 import { TaskRecordSchema, type TaskRecord } from '../core/schemas/index.js';
 import { readStatus, renderStatusLine, stderrSink } from '../core/progress.js';
 import { readState } from '../core/state.js';
 import { loadConfig } from '../core/config.js';
 import { buildHostExecutor, resolveHostProvider } from './host.js';
 import { readManifest, RIJO_VERSION } from '../core/manifest.js';
+import { lintPlan, readPlan } from '../core/plan.js';
 import { newWorkflow } from '../workflows/new.js';
 import { runWorkflow } from '../workflows/run.js';
+import { recoverNativeState, resumeWorkflow } from '../workflows/resume.js';
+import { startWorkflow } from '../workflows/run.js';
 import { uiWorkflow } from '../workflows/ui.js';
 import { fixWorkflow } from '../workflows/fix.js';
 import { checkWorkflow } from '../workflows/check.js';
+import { testWorkflow } from '../workflows/check.js';
+import { finishWorkflow } from '../workflows/finish.js';
+import { nextWorkflow } from '../workflows/next.js';
 import { mapWorkflow, queryCodebaseMap, readCodebaseMapStatus } from '../workflows/map.js';
 import { serve } from './serve.js';
 import { generateAdapters, type AdapterName } from '../adapters/index.js';
 import { openDurableWorkflowEngine } from '../durable/index.js';
 import type { WorkflowDeps, WorkflowOutcome } from '../workflows/shared.js';
+import { installRijo, type InstallHost } from '../install/index.js';
+import { NativeResultRunner } from '../agents/native-results.js';
+import { activeMilestone } from '../core/milestones.js';
+import { readRequirements, readRoadmap } from '../core/roadmap.js';
+import { SystemShellRunner } from '../core/commands.js';
 
 /**
  * Workflow commands: new, run, ui, fix, check.
@@ -32,6 +45,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
   }
 
   switch (command) {
+    case 'map-codebase':
     case 'map': {
       const { values } = parseArgs({
         args: rest,
@@ -54,9 +68,14 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         return 0;
       }
       const scopes = values.paths?.split(',').map((value) => value.trim()).filter(Boolean);
-      return withHost(cwd, values.host, deps, (d) =>
-        mapWorkflow(cwd, { full: Boolean(values.full), paths: scopes }, d),
-      );
+      if (command === 'map-codebase' && values.host) {
+        return usage('`--host` is available only on the deprecated `map` compatibility route.');
+      }
+      const body = (d: WorkflowDeps) =>
+        mapWorkflow(cwd, { full: Boolean(values.full), paths: scopes }, d);
+      return command === 'map-codebase'
+        ? withNative(cwd, deps, body)
+        : withHost(cwd, values.host, deps, body);
     }
     case 'new': {
       const { positionals, values } = parseArgs({
@@ -71,16 +90,25 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         },
       });
       const plan = positionals[0];
-      if (!plan) return usage('rijo new @PLANO.md [--next] [--ui @design.zip] [--run] [--host claude|codex]');
-      return withHost(cwd, values.host, deps, (d) =>
-        newWorkflow(
-          cwd,
-          { planFile: plan, next: Boolean(values.next || values.milestone), run: Boolean(values.run), ui: values.ui },
-          d,
-        ),
-      );
+      if (!plan) return usage('rijo new @PLAN.md');
+      const legacy = Boolean(values.host || values.run || values.next || values.milestone);
+      const body = (d: WorkflowDeps) =>
+        newWorkflow(cwd, {
+          planFile: plan,
+          next: Boolean(values.next || values.milestone),
+          run: legacy && Boolean(values.run),
+          ui: values.ui,
+        }, d);
+      return legacy
+        ? withHost(cwd, values.host, deps, body)
+        : withNative(cwd, deps, body);
+    }
+    case 'start': {
+      if (rest.length > 0) return usage('rijo start');
+      return withNative(cwd, deps, (d) => startWorkflow(cwd, d));
     }
     case 'run': {
+      console.error('rijo: `run` is deprecated. Use `start`.');
       const { positionals, values } = parseArgs({
         args: rest,
         allowPositionals: true,
@@ -92,31 +120,192 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       }
       const effectiveTarget =
         target ?? (process.env['RIJO_ENGINE_CHILD'] === '1' ? 'all' : undefined);
-      return withHost(cwd, values.host, deps, (d) =>
-        runWorkflow(cwd, { target: effectiveTarget }, d),
-      );
+      const body = (d: WorkflowDeps) => runWorkflow(cwd, { target: effectiveTarget }, d);
+      return values.host
+        ? withHost(cwd, values.host, deps, body)
+        : withNative(cwd, deps, body);
     }
     case 'ui': {
       const { host, rest: uiRest } = extractHostFlag(rest);
       const input = uiRest[0];
       if (!input) return usage('rijo ui @design.zip | @index.html | @design-directory/ [--host claude|codex]');
-      return withHost(cwd, host, deps, (d) => uiWorkflow(cwd, { input }, d));
+      return host
+        ? withHost(cwd, host, deps, (d) => uiWorkflow(cwd, { input }, d))
+        : withNative(cwd, deps, (d) => uiWorkflow(cwd, { input }, d));
     }
     case 'fix': {
       const { host, rest: fixRest } = extractHostFlag(rest);
       const description = fixRest.filter((a) => !a.startsWith('@')).join(' ');
       const evidence = fixRest.filter((a) => a.startsWith('@')).map((a) => a.slice(1));
       if (!description) return usage('rijo fix "problem description" [@evidence.png] [@log.txt] [--host claude|codex]');
-      return withHost(cwd, host, deps, (d) => fixWorkflow(cwd, { description, evidenceFiles: evidence }, d));
+      return host
+        ? withHost(cwd, host, deps, (d) => fixWorkflow(cwd, { description, evidenceFiles: evidence }, d))
+        : withNative(cwd, deps, (d) => fixWorkflow(cwd, { description, evidenceFiles: evidence }, d));
+    }
+    case 'test': {
+      const { values } = parseArgs({
+        args: rest,
+        options: { fix: { type: 'boolean' } },
+      });
+      return withNative(cwd, deps, (d) => testWorkflow(cwd, { fix: values.fix }, d));
     }
     case 'check': {
+      console.error('rijo: `check` is deprecated. Use `test`.');
       const { values } = parseArgs({
         args: rest,
         options: { fix: { type: 'boolean' }, production: { type: 'boolean' }, host: { type: 'string' } },
       });
-      return withHost(cwd, values.host, deps, (d) =>
-        checkWorkflow(cwd, { fix: values.fix, production: values.production }, d),
+      const body = (d: WorkflowDeps) =>
+        checkWorkflow(cwd, { fix: values.fix, production: values.production }, d);
+      return values.host
+        ? withHost(cwd, values.host, deps, body)
+        : withNative(cwd, deps, body);
+    }
+    case 'finish': {
+      if (rest.length > 0) return usage('rijo finish');
+      return withNative(cwd, deps, (d) => finishWorkflow(cwd, d));
+    }
+    case 'next': {
+      const plan = rest[0];
+      if (!plan || rest.length > 1) return usage('rijo next @NEXT-PLAN.md');
+      return withNative(cwd, deps, (d) => nextWorkflow(cwd, plan, d));
+    }
+    case 'status':
+      return statusCli(rest, cwd);
+    case 'resume': {
+      if (rest.length > 0) return usage('rijo resume');
+      return withNative(cwd, deps, (d) => resumeWorkflow(cwd, d));
+    }
+    case 'internal': {
+      const { resultFile, args: internalArgs } = extractNativeResultsFlag(rest);
+      const [helper, ...helperArgs] = internalArgs;
+      if (helper === 'status') return statusCli(helperArgs, cwd);
+      if (helper === 'lifecycle') {
+        const event = helperArgs[0];
+        if (!event || helperArgs.length > 1 || !/^[A-Za-z][A-Za-z0-9_-]*$/.test(event)) {
+          return usage('rijo internal lifecycle EVENT');
+        }
+        const paths = new RijoPaths(cwd);
+        ensureDir(paths.runtimeDir);
+        appendLine(
+          path.join(paths.runtimeDir, 'native-hooks.jsonl'),
+          JSON.stringify({ event, at: new Date().toISOString() }),
+        );
+        return 0;
+      }
+      if (helper === 'safe-command') {
+        const commandArgs = helperArgs[0] === '--' ? helperArgs.slice(1) : helperArgs;
+        if (commandArgs.length === 0) return usage('rijo internal safe-command -- COMMAND');
+        const commandLine = commandArgs.join(' ');
+        const paths = new RijoPaths(cwd);
+        const evidence = new SystemShellRunner(loadConfig(paths).execution).run(commandLine, { cwd });
+        appendLine(
+          paths.events,
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            run_id: 'native-safe-command',
+            type: 'internal.safe_command',
+            data: evidence,
+          }),
+        );
+        console.log(JSON.stringify(evidence));
+        return evidence.exit_code === 0 ? 0 : evidence.blocked ? 3 : 1;
+      }
+      if (helper === 'map-codebase') {
+        if (!resultFile) return usage('rijo internal map-codebase --results @.rijo/runtime/native-results.json');
+        if (helperArgs.length > 0) return usage('rijo internal map-codebase --results @.rijo/runtime/native-results.json');
+        return withNativeResults(cwd, resultFile, deps, (d) => mapWorkflow(cwd, {}, d));
+      }
+      if (helper === 'project-init') {
+        const plan = helperArgs[0];
+        if (!plan || helperArgs.length > 1) {
+          return usage('rijo internal project-init @PLAN.md');
+        }
+        if (!resultFile) {
+          return usage('rijo internal project-init @PLAN.md --results @.rijo/runtime/native-results.json');
+        }
+        return withNativeResults(cwd, resultFile, deps, (d) => newWorkflow(cwd, { planFile: plan }, d));
+      }
+      if (helper === 'phase-open') {
+        const phase = helperArgs[0];
+        if (helperArgs.length > 1 || (phase && !/^\d{2}$/.test(phase))) {
+          return usage('rijo internal phase-open [NN]');
+        }
+        if (!resultFile) {
+          return usage('rijo internal phase-open [NN] --results @.rijo/runtime/native-results.json');
+        }
+        return withNativeResults(cwd, resultFile, deps, (d) =>
+          runWorkflow(cwd, { target: phase, finalCheck: false }, d),
+        );
+      }
+      if (helper === 'plan-validate') {
+        const planFile = helperArgs[0]?.replace(/^@/, '');
+        if (!planFile || helperArgs.length > 1) {
+          return usage('rijo internal plan-validate @path/to/PLAN.md');
+        }
+        try {
+          const plan = readPlan(path.resolve(cwd, planFile));
+          const milestone = activeMilestone(new RijoPaths(cwd));
+          const requirements = milestone ? readRequirements(milestone.paths.requirements) : null;
+          const roadmap = milestone ? readRoadmap(milestone.paths.roadmap) : null;
+          const phase = roadmap?.phases.find((candidate) => candidate.id === plan.phase);
+          const issues = lintPlan(plan, {
+            knownRequirements: new Set(requirements?.requirements.map((item) => item.id) ?? []),
+            phaseRequirements: phase?.requirements,
+          });
+          console.log(JSON.stringify({
+            valid: issues.length === 0,
+            phase: plan.phase,
+            tasks: plan.tasks.length,
+            issues,
+          }));
+          return issues.length === 0 ? 0 : 1;
+        } catch (error) {
+          console.error(`rijo: invalid plan: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
+      if (helper === 'qa-record') {
+        if (helperArgs.length > 0) return usage('rijo internal qa-record');
+        if (!resultFile) return usage('rijo internal qa-record --results @.rijo/runtime/native-results.json');
+        return withNativeResults(cwd, resultFile, deps, (d) => testWorkflow(cwd, {}, d));
+      }
+      if (helper === 'milestone-finish') {
+        if (helperArgs.length > 0) return usage('rijo internal milestone-finish');
+        return withNative(cwd, deps, (d) => finishWorkflow(cwd, d));
+      }
+      if (helper === 'recovery') {
+        if (helperArgs.length > 0) return usage('rijo internal recovery');
+        return withNative(cwd, deps, (d) => recoverNativeState(cwd, d));
+      }
+      return usage(
+        'rijo internal status|lifecycle|safe-command|map-codebase|project-init|phase-open|plan-validate|qa-record|milestone-finish|recovery',
       );
+    }
+    case 'install': {
+      const { values } = parseArgs({
+        args: rest,
+        options: {
+          codex: { type: 'boolean' },
+          claude: { type: 'boolean' },
+          project: { type: 'boolean' },
+          user: { type: 'boolean' },
+        },
+      });
+      if (values.project && values.user) return usage('choose one scope: --project or --user');
+      const hosts = [
+        ...(values.codex ? ['codex' as const] : []),
+        ...(values.claude ? ['claude' as const] : []),
+      ] satisfies InstallHost[];
+      const scope = values.user ? 'user' : 'project';
+      const result = installRijo({
+        root: scope === 'user' ? os.homedir() : cwd,
+        scope,
+        ...(hosts.length > 0 ? { hosts } : {}),
+      });
+      console.log(`Installed RIJO for: ${result.hosts.join(', ') || 'no detected host'}.`);
+      for (const generated of result.generated) console.log(`  ${generated}`);
+      return result.hosts.length > 0 ? 0 : 1;
     }
     case 'serve': {
       // Host↔core JSON-RPC bridge over stdio (the default and only mode).
@@ -133,7 +322,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       return 0;
     }
     default:
-      return usage(`unknown command "${command}". Workflows: map, new, run, ui, fix, check.`);
+      return usage(`unknown command "${command}". Run \`rijo --help\` for supported commands.`);
   }
 }
 
@@ -147,6 +336,48 @@ function report(outcome: WorkflowOutcome): number {
   console.log(`[rijo ${prefix}] ${outcome.message}`);
   for (const d of outcome.details ?? []) console.log(`  ${d}`);
   return outcome.ok ? 0 : outcome.status === 'blocked' ? 3 : 1;
+}
+
+/** Run a deterministic native route without resolving or starting a host process. */
+async function withNative(
+  cwd: string,
+  deps: WorkflowDeps,
+  body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
+): Promise<number> {
+  if (!deps.runner && !deps.executor) {
+    return report({
+      ok: false,
+      status: 'blocked',
+      message: 'Use `$rijo` in Codex or `/rijo` in Claude Code. The native host must orchestrate this command.',
+    });
+  }
+  const durableBinding = await attachProductionDurableEngine(cwd, deps);
+  try {
+    return report(await body({ ...durableBinding.deps, hostProvider: 'none' }));
+  } finally {
+    await closeOwnedDurable(durableBinding);
+  }
+}
+
+async function withNativeResults(
+  cwd: string,
+  resultFile: string,
+  deps: WorkflowDeps,
+  body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
+): Promise<number> {
+  const file = path.resolve(cwd, resultFile.replace(/^@/, ''));
+  if (!fs.existsSync(file)) return usage(`native result bundle not found: ${resultFile}`);
+  return withNative(cwd, { ...deps, runner: new NativeResultRunner(file) }, body);
+}
+
+function extractNativeResultsFlag(args: string[]): { resultFile: string | null; args: string[] } {
+  const index = args.indexOf('--results');
+  if (index < 0) return { resultFile: null, args };
+  const resultFile = args[index + 1] ?? null;
+  return {
+    resultFile,
+    args: args.filter((_, candidate) => candidate !== index && candidate !== index + 1),
+  };
 }
 
 /**
@@ -281,7 +512,7 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   const paths = new RijoPaths(cwd);
 
   if (values.watch) {
-    console.log('rijo --watch: acompanhando .rijo/runtime/status.json (Ctrl+C para sair)');
+    console.log('rijo --watch: monitoring .rijo/runtime/status.json (Ctrl+C to stop)');
     let last = '';
     const tick = () => {
       const s = readStatus(paths);
@@ -307,6 +538,16 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   const state = readState(paths);
   const supervised = readSupervisedTasks(paths);
   const codebase = readCodebaseMapStatus(cwd);
+  const currentMilestone = activeMilestone(paths);
+  const activePhase = currentMilestone && state?.phase
+    ? readRoadmap(currentMilestone.paths.roadmap).phases.find((phase) => phase.id === state.phase)
+    : null;
+  const activePhaseDir = currentMilestone && activePhase
+    ? path.relative(
+        cwd,
+        path.join(currentMilestone.paths.phasesDir, `${activePhase.id}-${activePhase.slug}`),
+      ).split(path.sep).join('/')
+    : null;
 
   if (values.json) {
     console.log(
@@ -318,6 +559,7 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
           rijo_version: RIJO_VERSION,
           initialized: manifest !== null,
           active_milestone: manifest?.active_milestone ?? null,
+          active_phase_dir: activePhaseDir,
           milestones: manifest?.milestones ?? [],
           runtime: status,
           checkpoint: state,
@@ -346,17 +588,17 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   }
 
   if (!manifest) {
-    console.log('[RIJO] não inicializado. Comece com: rijo new @PLANO.md');
+    console.log('[RIJO] Not initialized. Start with: $rijo new @PLAN.md');
     return 0;
   }
-  console.log(`RIJO ${RIJO_VERSION} — milestone ativo: ${manifest.active_milestone ?? 'nenhum'}`);
+  console.log(`RIJO ${RIJO_VERSION} — active milestone: ${manifest.active_milestone ?? 'none'}`);
   for (const m of manifest.milestones) console.log(`  ${m.id}  ${m.slug}  ${m.status}`);
   if (status) console.log(`runtime: ${renderStatusLine(status)} (${status.status})`);
   if (state) {
     console.log(
-      `checkpoint: milestone=${state.milestone ?? '—'} fase=${state.phase ?? '—'} stage=${state.stage ?? '—'}${state.blocked ? ` BLOQUEADO: ${state.blocked_reason}` : ''}`,
+      `checkpoint: milestone=${state.milestone ?? '—'} phase=${state.phase ?? '—'} stage=${state.stage ?? '—'}${state.blocked ? ` BLOCKED: ${state.blocked_reason}` : ''}`,
     );
-    if (state.next_step) console.log(`próximo passo: ${state.next_step}`);
+    if (state.next_step) console.log(`next step: ${state.next_step}`);
   }
   // supervisor panel: one block per non-terminal supervised attempt
   const active = readSupervisedTasks(paths).filter(
@@ -394,19 +636,25 @@ function readSupervisedTasks(paths: RijoPaths): TaskRecord[] {
   return out;
 }
 
-const HELP = `rijo — context and autonomous execution framework
+const HELP = `RIJO — native software delivery workflow
 
-workflows:
-  rijo map [--full] [--paths src/a,src/b] [--query "term"] [--status] [--host claude|codex]
-  rijo new @PLANO.md [--next] [--ui @design.zip] [--run]
-  rijo run [next|all|NN]
+Use \`$rijo\` in Codex or \`/rijo\` in Claude Code.
+
+Commands:
+  rijo map-codebase [--full] [--paths src/a,src/b] [--query "term"] [--status]
+  rijo new @PLAN.md
   rijo ui @design.zip | @index.html | @dir/
-  rijo fix "descrição" [@evidence]
-  rijo check [--fix] [--production]
+  rijo start
+  rijo test [--fix]
+  rijo fix "problem description" [@evidence]
+  rijo finish
+  rijo next @NEXT-PLAN.md
+  rijo status [--json]
+  rijo resume
+  rijo install [--codex] [--claude] [--project|--user]
 
-read-only:
-  rijo                painel resumido
-  rijo --status       snapshot legível
-  rijo --status --json snapshot para automação
-  rijo --watch        acompanha o status sem iniciar trabalho
+Advanced compatibility:
+  rijo map|run|check --host claude|codex
+  rijo serve --stdio
+  Host drivers can use codex exec adapters, claude -p adapters, or injected runners.
 `;

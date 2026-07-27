@@ -6,9 +6,20 @@ import type { ModelRole } from '../core/schemas/index.js';
 import { claudeTierForRole, resolveClaudeTier } from '../agents/roles.js';
 import { EXPERT_PROFILES } from '../experts/catalog.js';
 import { renderProfileBrief } from '../experts/embed.js';
-import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
+import {
+  installCanonicalSkill,
+  loadSkillSource,
+  rijoInstructionBlock,
+  assertProviderDestinationsSafe,
+  upsertMarkerFile,
+  type AdapterReport,
+} from './shared.js';
 
-const SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
+const LEGACY_SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
+
+export interface ClaudeAdapterOptions {
+  scope?: 'project' | 'user';
+}
 
 /**
  * Specialized Claude Code agents. Each carries the RIJO `role` it fills so the
@@ -16,30 +27,108 @@ const SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo
  * tier resolved from `.rijo/config.yml` — routing is operational, not just
  * declarative (the same tier the orchestrator puts on each AgentTask).
  */
-const AGENT_DEFS: Array<{ name: string; role: ModelRole; description: string; body: string }> = [
+interface NativeClaudeAgent {
+  name: string;
+  role: ModelRole;
+  description: string;
+  body: string;
+  effort: 'low' | 'medium' | 'high';
+  maxTurns: number;
+  tools: string[];
+  readOnly?: boolean;
+  isolation?: 'worktree';
+}
+
+const AGENT_DEFS: NativeClaudeAgent[] = [
+  {
+    name: 'rijo-project-researcher',
+    role: 'researcher',
+    description: 'Research stable project decisions from official sources before RIJO creates a roadmap.',
+    body: 'Research only the assigned project questions. Use official sources for volatile facts. Separate facts, inferences, and recommendations. Return each claim with its source URL, checked date, version, and confidence. Do not change files.',
+    effort: 'medium',
+    maxTurns: 18,
+    tools: ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
+    readOnly: true,
+  },
+  {
+    name: 'rijo-phase-planner',
+    role: 'researcher',
+    description: 'Research one active phase and produce a bounded RIJO phase plan.',
+    body: 'Read only the active phase context. Research only the phase delta. Produce two to four bounded tasks. Define requirement identifiers, files, write scopes, dependencies, acceptance criteria, tests, evidence, Test-Driven Development requirements, and parallel safety. Return the plan to the lead. Do not change files.',
+    effort: 'high',
+    maxTurns: 20,
+    tools: ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
+    readOnly: true,
+  },
+  {
+    name: 'rijo-plan-reviewer',
+    role: 'reviewer',
+    description: 'Review one RIJO phase plan independently before implementation.',
+    body: 'Review the phase goal, research, plan, codebase context, and rules. Do not use planner reasoning. Find missing scope, unsafe dependencies, weak evidence, and non-testable acceptance criteria. Return an approve or revise verdict with actionable findings. Do not change files.',
+    effort: 'high',
+    maxTurns: 12,
+    tools: ['Read', 'Glob', 'Grep'],
+    readOnly: true,
+  },
   {
     name: 'rijo-worker',
     role: 'worker',
-    description: 'Economical implementation worker for one RIJO task with a strict write scope.',
-    body: 'Implement exactly one RIJO task. Read only the files listed in your brief. Never write outside your declared write scope; if you need to, stop and request a new allocation. Follow TDD when the task says so (RED, GREEN, REFACTOR). Return a one-line summary plus the JSON payload the brief demands — never your private reasoning.',
+    description: 'Implement one bounded RIJO task in an isolated worktree.',
+    body: 'Implement exactly one RIJO task. Stay inside the declared write scope. Use Test-Driven Development for testable behavior. Run the listed verification commands. Return changed paths, command evidence, and blockers. Do not include private reasoning.',
+    effort: 'medium',
+    maxTurns: 30,
+    tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit'],
+    isolation: 'worktree',
   },
   {
-    name: 'rijo-reviewer',
+    name: 'rijo-code-reviewer',
     role: 'reviewer',
-    description: 'Independent reviewer: receives spec, diff and evidence, never the author reasoning.',
-    body: 'Review the artifact against the spec and rules. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject. Evidence beats claims: an agent summary is not evidence. Return the JSON verdict payload only.',
+    description: 'Review verified RIJO changes independently for engineering quality.',
+    body: 'Review the specification, plan, diff, and command evidence. Check correctness, simplicity, cohesion, coupling, duplication, error handling, security, data integrity, performance, test quality, code smells, unnecessary abstractions, and scope drift. Return a verdict and evidence. Do not change files.',
+    effort: 'high',
+    maxTurns: 16,
+    tools: ['Read', 'Glob', 'Grep'],
+    readOnly: true,
   },
   {
-    name: 'rijo-researcher',
-    role: 'researcher',
-    description: 'Economical researcher: official sources only, claim+url+date for every volatile fact.',
-    body: 'Research the given topic using official documentation, release/LTS pages, changelogs, advisories and registries. Never assume newest is best. Separate fact, inference and recommendation. Return the JSON payload with summary and sources (claim, source, url, checked_at, version, confidence).',
-  },
-  {
-    name: 'rijo-qa',
+    name: 'rijo-test-engineer',
     role: 'qa',
-    description: 'Browser QA agent: executes one journey as a real user and reports structured results.',
-    body: 'Execute the journey end-to-end as a real user. Observe console, network, error states, keyboard navigation. Capture screenshots into your write scope on failure. Return the JSON journey result payload only.',
+    description: 'Review deterministic verification evidence for one RIJO phase.',
+    body: 'Inspect the recorded build, lint, type check, unit, integration, and contract evidence. Do not run direct shell commands. Do not accept agent statements as evidence. Return gaps and a verdict. Do not change project files.',
+    effort: 'medium',
+    maxTurns: 18,
+    tools: ['Read', 'Glob', 'Grep'],
+    readOnly: true,
+  },
+  {
+    name: 'rijo-security-reviewer',
+    role: 'reviewer',
+    description: 'Review one RIJO change for security and data integrity risks.',
+    body: 'Inspect the assigned change and its trust boundaries. Check authorization, validation, secrets, injection, dependency, file, archive, process, and data-loss risks. Return only evidence-backed findings. Do not change files.',
+    effort: 'high',
+    maxTurns: 14,
+    tools: ['Read', 'Glob', 'Grep'],
+    readOnly: true,
+  },
+  {
+    name: 'rijo-browser-qa',
+    role: 'qa',
+    description: 'Run one requirement-derived web journey with available browser tools.',
+    body: 'Run the assigned journey as a real user. Use real controls. Check persistence, authorization, console errors, network errors, keyboard access, responsive layouts, and all main interface states. Return READY, NOT_READY, or BLOCKED with evidence.',
+    effort: 'medium',
+    maxTurns: 24,
+    tools: ['Read', 'Glob', 'Grep'],
+    readOnly: true,
+  },
+  {
+    name: 'rijo-mobile-qa',
+    role: 'qa',
+    description: 'Run one requirement-derived mobile journey with an available simulator or emulator.',
+    body: 'Build and install the application. Run the assigned journey on a real simulator or emulator. Capture screenshots and logs for each defect. Return READY, NOT_READY, or BLOCKED with evidence.',
+    effort: 'medium',
+    maxTurns: 24,
+    tools: ['Read', 'Glob', 'Grep'],
+    readOnly: true,
   },
 ];
 
@@ -47,17 +136,31 @@ const AGENT_DEFS: Array<{ name: string; role: ModelRole; description: string; bo
  * Claude Code adapter: project skills, specialized agents, idempotent
  * CLAUDE.md block, statusline script. Never destroys an existing statusline.
  */
-export function generateClaudeAdapter(projectRoot: string): AdapterReport {
+export function generateClaudeAdapter(projectRoot: string, options: ClaudeAdapterOptions = {}): AdapterReport {
   const report: AdapterReport = { generated: [], skipped: [], notes: [] };
+  const scope = options.scope ?? 'project';
+  const skillsRoot = path.join(projectRoot, '.claude', 'skills');
+  const instructionFile =
+    scope === 'user' ? path.join(projectRoot, '.claude', 'CLAUDE.md') : path.join(projectRoot, 'CLAUDE.md');
+  assertProviderDestinationsSafe(projectRoot, [
+    path.join(projectRoot, '.claude'),
+    path.join(projectRoot, '.claude', 'skills'),
+    path.join(projectRoot, '.claude', 'agents'),
+    instructionFile,
+  ]);
 
-  // skills
-  for (const skill of SKILLS) {
+  for (const file of installCanonicalSkill(path.join(skillsRoot, 'rijo'))) {
+    report.generated.push(relativeReportPath(projectRoot, file));
+  }
+
+  // Install one-release compatibility aliases. Each alias redirects to `rijo`.
+  for (const skill of LEGACY_SKILLS) {
     const source = loadSkillSource(skill);
     if (!source) {
       report.skipped.push(`skill ${skill} (source missing in package)`);
       continue;
     }
-    const dir = path.join(projectRoot, '.claude', 'skills', skill);
+    const dir = path.join(skillsRoot, skill);
     ensureDir(dir);
     writeFileAtomic(path.join(dir, 'SKILL.md'), source);
     report.generated.push(`.claude/skills/${skill}/SKILL.md`);
@@ -69,17 +172,9 @@ export function generateClaudeAdapter(projectRoot: string): AdapterReport {
   for (const agent of AGENT_DEFS) {
     const dir = path.join(projectRoot, '.claude', 'agents');
     ensureDir(dir);
-    // `model` MUST be a concrete Claude model Claude Code accepts (alias
-    // opus/sonnet/haiku/fable or a claude-* id) — never the abstract RIJO tier
-    // string. Resolved from providers.claude for the role's tier; `tier` keeps
-    // the routing traceable to the same value the orchestrator sets on each
-    // AgentTask for role `${agent.role}`.
     const tier = config.models[agent.role];
     const resolved = claudeTierForRole(config, agent.role);
-    writeFileAtomic(
-      path.join(dir, `${agent.name}.md`),
-      `---\nname: ${agent.name}\ndescription: ${agent.description}\nrole: ${agent.role}\ntier: ${tier}\nmodel: ${resolved.model}\n---\n\n${agent.body}\n`,
-    );
+    writeFileAtomic(path.join(dir, `${agent.name}.md`), renderNativeClaudeAgent(agent, tier, resolved.model));
     report.generated.push(`.claude/agents/${agent.name}.md`);
   }
 
@@ -120,10 +215,11 @@ export function generateClaudeAdapter(projectRoot: string): AdapterReport {
   }
 
   // CLAUDE.md idempotent block
-  upsertMarkerFile(path.join(projectRoot, 'CLAUDE.md'), rijoInstructionBlock());
-  report.generated.push('CLAUDE.md (RIJO block)');
+  upsertMarkerFile(instructionFile, rijoInstructionBlock());
+  report.generated.push(`${relativeReportPath(projectRoot, instructionFile)} (RIJO block)`);
 
   // statusline script (reads runtime/status.json; zero model calls)
+  if (scope === 'user') return report;
   const adapterDir = path.join(projectRoot, '.rijo', 'adapters', 'claude');
   ensureDir(adapterDir);
   const scriptPath = path.join(adapterDir, 'statusline.cjs');
@@ -172,6 +268,47 @@ export function generateClaudeAdapter(projectRoot: string): AdapterReport {
 export function detectClaude(projectRoot: string): boolean {
   // filesystem-based only: deterministic across environments
   return exists(path.join(projectRoot, '.claude')) || readTextIfExists(path.join(projectRoot, 'CLAUDE.md')) !== null;
+}
+
+function renderNativeClaudeAgent(agent: NativeClaudeAgent, tier: string, model: string): string {
+  const frontmatter = [
+    '---',
+    `name: ${agent.name}`,
+    `description: ${JSON.stringify(agent.description)}`,
+    `role: ${agent.role}`,
+    `tier: ${tier}`,
+    `model: ${model}`,
+    `effort: ${agent.effort}`,
+    `maxTurns: ${agent.maxTurns}`,
+    'skills: [rijo]',
+    `tools: [${agent.tools.join(', ')}]`,
+    `permissionMode: ${agent.readOnly ? 'plan' : 'acceptEdits'}`,
+  ];
+  if (agent.readOnly) frontmatter.push('disallowedTools: [Write, Edit, NotebookEdit, Bash]');
+  if (agent.isolation) frontmatter.push(`isolation: ${agent.isolation}`);
+  frontmatter.push(
+    'hooks:',
+    ...renderLifecycleHook('SubagentStart'),
+    ...renderLifecycleHook('Stop'),
+    ...renderLifecycleHook('StopFailure'),
+    ...renderLifecycleHook('WorktreeRemove'),
+    '---',
+    '',
+  );
+  return `${frontmatter.join('\n')}${agent.body}\n`;
+}
+
+function renderLifecycleHook(event: string): string[] {
+  return [
+    `  ${event}:`,
+    '    - hooks:',
+    '        - type: command',
+    `          command: ${JSON.stringify(`rijo internal lifecycle ${event}`)}`,
+  ];
+}
+
+function relativeReportPath(root: string, file: string): string {
+  return path.relative(root, file).split(path.sep).join('/');
 }
 
 const STATUSLINE_SCRIPT = `#!/usr/bin/env node

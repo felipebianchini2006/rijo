@@ -26,7 +26,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
 
   it('new: planner extraction gets product-manager/system-architect; researcher gets exactly discovery-analyst', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
 
     const extract = lastExecuted(d.runner, 'new-extract');
     expect(extract.expert_profiles).toContain('product-manager');
@@ -40,7 +40,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
 
   it('run: planner (PLAN), backend worker (senior-software-engineer), reviewer never repeats the author lens', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok, outcome.message).toBe(true);
 
@@ -77,7 +77,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
         ],
       }),
     });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, {}, d);
 
     const secWorker = lastExecuted(d.runner, 'exec-01-T01');
@@ -86,7 +86,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
 
   it('ui: the conversion worker receives the ux-product-designer lens', async () => {
     const d = deps(root, { capabilities: { browser: true } });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     wireUi(d, root);
     // a minimal single-page design directory
     const designDir = `${root}/design`;
@@ -103,7 +103,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
 
   it('fix: diagnose and repair receive the debugger lens', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     d.runner
       .on(
         (t) => t.id.startsWith('fix-diagnose'),
@@ -122,7 +122,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
 
   it('check: qa journeys receive the test-architect lens', async () => {
     const d = deps(root, { capabilities: { browser: true } });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     d.runner.on(
       (t) => t.id.startsWith('journey-'),
       (t) => ok(t, { payload: { journey_id: t.id.replace('journey-', ''), passed: true, steps: [], console_errors: [], network_errors: [], findings: [], screenshots: [] } }),

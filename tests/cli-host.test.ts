@@ -43,7 +43,7 @@ describe('resolveHostProvider (flag > config > none)', () => {
 
   it('reports an invalid flag as a usage error', () => {
     const r = resolveHostProvider('bogus', ConfigSchema.parse({}));
-    expect(r).toEqual({ error: expect.stringContaining('--host inválido') });
+    expect(r).toEqual({ error: expect.stringContaining('Invalid --host') });
   });
 });
 
@@ -69,7 +69,7 @@ describe('buildHostExecutor', () => {
     expect(boot.host).toBe('claude');
     expect(boot.version).toBe('2.1.0 (Claude Code)');
     expect(boot.executor.capabilities).toEqual(HOST_CAPABILITIES);
-    expect(progress.some((l) => l.includes('claude disponível'))).toBe(true);
+    expect(progress.some((l) => l.includes('claude available'))).toBe(true);
     await boot.executor.dispose();
   });
 
@@ -98,7 +98,7 @@ describe('buildHostExecutor', () => {
     });
     expect(boot.ok).toBe(false);
     if (boot.ok) return;
-    expect(boot.message).toContain('indisponível');
+    expect(boot.message).toContain('unavailable');
     expect(boot.details.join(' ')).toContain('PATH');
   });
 });
@@ -132,13 +132,13 @@ describe('runCli --host wiring', () => {
     process.env.PATH = tmpProject('rijo-emptypath-');
     const code = await runCli(['run', 'all', '--host', 'claude'], {}, root);
     expect(code).toBe(3);
-    expect(logged()).toContain('indisponível');
+    expect(logged()).toContain('unavailable');
   });
 
   it('an invalid --host value is a usage error (exit 2)', async () => {
     const code = await runCli(['run', 'all', '--host', 'bogus'], {}, root);
     expect(code).toBe(2);
-    expect(error.mock.calls.join('\n')).toContain('--host inválido');
+    expect(error.mock.calls.join('\n')).toContain('Invalid --host');
   });
 
   it('no --host and provider none runs the workflow unchanged (no host coupling)', async () => {
@@ -147,7 +147,7 @@ describe('runCli --host wiring', () => {
     const code = await runCli(['run', 'all'], {}, root);
     expect([0, 1, 3]).toContain(code);
     // never a host-availability message when no host was requested
-    expect(logged()).not.toContain('indisponível');
+    expect(logged()).not.toContain('unavailable');
   });
 });
 

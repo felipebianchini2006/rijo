@@ -17,8 +17,15 @@ import {
   removeFinalizeMarker,
   type FinalizeMarker,
 } from '../core/finalize.js';
-import { blocked, completed, type WorkflowContext, type WorkflowOutcome } from './shared.js';
+import {
+  blocked,
+  commitPortableDurableArtifacts,
+  completed,
+  type WorkflowContext,
+  type WorkflowOutcome,
+} from './shared.js';
 import { markCodebasePathsStale } from '../codebase/state.js';
+import { syncActiveProjectProjections } from './projections.js';
 
 /**
  * Transactional, resumable phase finalization (P0.7).
@@ -160,7 +167,7 @@ export async function stageFinalization(ctx: WorkflowContext, input: StageInput)
   // record before the marker (and makes the candidate SUMMARY honest).
   for (const t of readPlan(pp.plan).tasks) {
     if (t.status === 'VERIFIED') {
-      ctx.bus.emit('task.transition', { message: `tarefa ${t.id} → DONE` }, { task: t.id, to: 'DONE' });
+      ctx.bus.emit('task.transition', { message: `Task ${t.id} → DONE` }, { task: t.id, to: 'DONE' });
       setTaskStatus(pp.plan, t.id, 'DONE');
     }
   }
@@ -185,17 +192,31 @@ export async function stageFinalization(ctx: WorkflowContext, input: StageInput)
   }
 
   const rijoArtifacts = [
-    pp.spec, pp.plan, pp.summary, pp.review, pp.verification,
+    pp.research, pp.spec, pp.plan, pp.summary, pp.review, pp.verification,
     milestone.paths.requirements, milestone.paths.roadmap,
+    paths.requirements, paths.roadmap, paths.events,
     paths.state, paths.manifest, paths.milestonesIndex, paths.stack, paths.decisions,
   ]
     .filter(exists)
     .map((p) => rel(projectRoot, p));
   const commitPaths = [...new Set([...authorizedSource, ...rijoArtifacts])];
-  const allowedEvidencePaths = [pp.verification, milestone.paths.roadmap, paths.state, paths.manifest, paths.milestonesIndex]
+  const allowedEvidencePaths = [
+    pp.verification,
+    milestone.paths.roadmap,
+    paths.requirements,
+    paths.roadmap,
+    paths.events,
+    paths.state,
+    paths.manifest,
+    paths.milestonesIndex,
+  ]
     .filter(exists)
     .map((p) => rel(projectRoot, p));
-  const sealPaths = [rel(projectRoot, pp.verification), rel(projectRoot, paths.manifest)];
+  const sealPaths = [
+    rel(projectRoot, pp.verification),
+    rel(projectRoot, paths.events),
+    rel(projectRoot, paths.manifest),
+  ];
 
   const marker = buildMarker({
     milestone: milestone.id,
@@ -286,12 +307,13 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
   // is only made PERMANENT by the marker's removal at the very end.
   for (const t of readPlan(pp.plan).tasks) {
     if (t.status === 'VERIFIED') {
-      bus.emit('task.transition', { message: `tarefa ${t.id} → DONE` }, { task: t.id, to: 'DONE' });
+      bus.emit('task.transition', { message: `Task ${t.id} → DONE` }, { task: t.id, to: 'DONE' });
       setTaskStatus(pp.plan, t.id, 'DONE');
     }
   }
   applyRequirementCompletion(milestone, pp, phase, readPlan(pp.plan));
   markPhase('DONE', marker.tested_commit);
+  syncActiveProjectProjections(paths);
   hooks.afterStep?.('roadmap');
   checkpoint(`Phase ${phase.id} (${phase.name}) verified.`, {
     task: null,
@@ -308,7 +330,7 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
     return finishOutcome(ctx, phase, null);
   }
 
-  emitStage('COMMIT', 'commit dos arquivos autorizados da fase verificada');
+  emitStage('COMMIT', 'Commit the authorized files for the verified phase.');
 
   // ---- C1: code + phase state, no self-reference.
   let c1 = marker.tested_commit;
@@ -329,6 +351,7 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
   // ---- Evidence metadata: point VERIFICATION/roadmap/state at C1.
   writeVerificationCommit(pp, c1, null);
   markPhase('DONE', c1);
+  syncActiveProjectProjections(paths);
   checkpoint(`Phase ${phase.id} (${phase.name}) verified and committed.`, {
     task: null,
     last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
@@ -395,9 +418,11 @@ function finishOutcome(ctx: WorkflowContext, phase: RoadmapPhase, commitHash: st
     status: 'running',
     stage: 'DONE',
     lastCheckpoint: commitHash ?? `phase-${phase.id}`,
-    message: `fase ${phase.id} concluída${commitHash ? ` (commit ${commitHash.slice(0, 8)})` : ''}`,
+    message: `Phase ${phase.id} completed${commitHash ? ` (commit ${commitHash.slice(0, 8)})` : ''}.`,
   });
-  return completed(ctx, `Phase ${phase.id} (${phase.name}) done${commitHash ? `, commit ${commitHash}` : ''}.`);
+  const outcome = completed(ctx, `Phase ${phase.id} (${phase.name}) done${commitHash ? `, commit ${commitHash}` : ''}.`);
+  commitPortableDurableArtifacts(ctx, `phase ${phase.id} completed`);
+  return outcome;
 }
 
 /**
@@ -412,7 +437,7 @@ export async function reconcileFinalization(ctx: WorkflowContext): Promise<void>
   if (!marker) return;
   ctx.bus.emit(
     'finalization.resumed',
-    { message: `retomando finalização da fase ${marker.phase} (step ${marker.step})` },
+    { message: `Resume finalization for phase ${marker.phase} at step ${marker.step}.` },
     { phase: marker.phase, milestone: marker.milestone, step: marker.step },
   );
   const outcome = await runFinalization(ctx, marker);

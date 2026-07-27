@@ -54,15 +54,15 @@ import {
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
-import { runCore } from './run.js';
-import { uiCore } from './ui.js';
-import { ensureCodebaseMap } from './map.js';
 import { buildContextPacket, gapsAffectingScope } from '../codebase/context.js';
+import { readMapState } from '../codebase/state.js';
 
 export interface NewOptions {
   planFile: string;
   next?: boolean;
+  /** @deprecated Run `rijo ui` after setup. */
   ui?: string;
+  /** @deprecated `new` is setup-only. Run `rijo start` separately. */
   run?: boolean;
 }
 
@@ -103,10 +103,9 @@ export function validatePlanExtractionFidelity(plan: string, extraction: PlanExt
   const errors: string[] = [];
   const numberWords: Record<string, number> = {
     one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
-    uma: 1, duas: 2, tres: 3, quatro: 4, cinco: 5, seis: 6, sete: 7, oito: 8, nove: 9, dez: 10,
   };
   const normalizedPlan = plan.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
-  const countMatch = normalizedPlan.match(/\b(?:exactly|exatamente)\s+(\d+|[a-z]+)\s+(?:sequential\s+|sequenciais?\s+)?(?:phases|fases)\b/);
+  const countMatch = normalizedPlan.match(/\bexactly\s+(\d+|[a-z]+)\s+(?:sequential\s+)?phases\b/);
   if (countMatch) {
     const token = countMatch[1]!;
     const expected = /^\d+$/.test(token) ? Number(token) : numberWords[token];
@@ -114,7 +113,7 @@ export function validatePlanExtractionFidelity(plan: string, extraction: PlanExt
       errors.push(`phases: plan explicitly requires ${expected}, but extraction returned ${extraction.phases.length}`);
     }
   }
-  const dependencyPattern = /\b(?:phase|fase)\s+0?(\d+)\s+(?:depends\s+on|depende\s+d[ae])\s+(?:phase|fase)\s+0?(\d+)\b/g;
+  const dependencyPattern = /\bphase\s+0?(\d+)\s+depends\s+on\s+phase\s+0?(\d+)\b/g;
   for (const match of normalizedPlan.matchAll(dependencyPattern)) {
     const phaseIndex = Number(match[1]) - 1;
     const dependencyIndex = Number(match[2]) - 1;
@@ -174,20 +173,17 @@ export async function newWorkflow(
       );
     }
     if (hasRijo && !opts.next) {
-      if (opts.run && ctx.durableRun?.disposition === 'resumed') {
-        bus.emit('run.resumed', {
-          status: 'running',
-          message: `retomando run ${ctx.durableRun.runId} para o mesmo plan_hash`,
-        });
-        return runCore(ctx, { target: 'all' });
-      }
       return blockedReadOnly(
         ctx,
         'A RIJO project already exists here. Re-initialization is refused (non-destructive).',
         [`To start the next milestone run: rijo new @${path.basename(planPath)} --next`],
       );
     }
-    bus.emit('new.start', { status: 'running', stage: 'ANALYZE', message: 'validando repositório e entrada' });
+    bus.emit('new.project_research', {
+      status: 'running',
+      stage: 'PROJECT_RESEARCH',
+      message: `[RIJO] PROJECT_RESEARCH`,
+    });
 
     // ---- git
     let gitStatus = ctx.git.status(projectRoot);
@@ -223,9 +219,10 @@ export async function newWorkflow(
           ]);
         }
       }
-      if (gitStatus.isRepo && gitStatus.dirtyFiles.length > 0) {
+      const userDirty = gitStatus.dirtyFiles.filter((file) => file !== '.rijo/events.jsonl');
+      if (gitStatus.isRepo && userDirty.length > 0) {
         return blocked(ctx, 'Unknown local changes present; they will never be discarded or stashed automatically.', [
-          `Dirty files: ${gitStatus.dirtyFiles.slice(0, 20).join(', ')}`,
+          `Dirty files: ${userDirty.slice(0, 20).join(', ')}`,
           'Commit or intentionally revert them, then re-run.',
         ]);
       }
@@ -233,23 +230,27 @@ export async function newWorkflow(
 
     // ---- brownfield detection
     const brown = detectBrownfield(ctx);
+    const hasCodebaseMap = exists(paths.codebaseMapState);
     if (brown.isBrownfield) {
-      bus.emit('new.brownfield', { message: 'projeto brownfield detectado; garantindo mapa da codebase' }, { notes: brown.stackNotes });
+      bus.emit('new.brownfield', { message: 'Brownfield project detected.' }, { notes: brown.stackNotes });
+      if (!hasCodebaseMap && !opts.next) {
+        return blockedReadOnly(
+          ctx,
+          'Run `$rijo map-codebase`, then run `$rijo new @PLAN.md` again.',
+        );
+      }
     }
 
     // ---- read the plan and extract structure via planner agent
-    bus.emit('new.analyze', { stage: 'ANALYZE', message: 'extraindo escopo e requisitos do plano' });
+    bus.emit('new.analyze', { stage: 'ANALYZE', message: 'Extract scope and requirements from the plan.' });
     let codebaseContext = '';
-    if (brown.isBrownfield) {
-      const ensured = await ensureCodebaseMap(ctx, {
-        allowedDirtyPaths: [path.relative(projectRoot, planPath).split(path.sep).join('/')],
-      });
-      if (!ensured.outcome.ok) return ensured.outcome;
-      if (!ensured.state || ensured.state.status === 'BLOCKED') {
+    if (brown.isBrownfield && hasCodebaseMap) {
+      const mapState = readMapState(paths);
+      if (!mapState || mapState.status === 'BLOCKED') {
         return blocked(ctx, 'Brownfield codebase map is blocked for planning.', [
-          `Map status: ${ensured.state?.status ?? 'missing'}.`,
-          `Relevant stale paths: ${ensured.state?.changed_paths_since_map.join(', ') || 'unknown'}.`,
-          ...(ensured.state?.gaps ?? []),
+          `Map status: ${mapState?.status ?? 'missing'}.`,
+          `Relevant stale paths: ${mapState?.changed_paths_since_map.join(', ') || 'unknown'}.`,
+          ...(mapState?.gaps ?? []),
         ]);
       }
       const packet = buildContextPacket(
@@ -257,14 +258,14 @@ export async function newWorkflow(
         planContent,
         Math.min(config.context_budget_bytes, Math.max(4096, Math.floor(config.context_budget_bytes * 0.6))),
       );
-      const affectingGaps = gapsAffectingScope(ensured.state.gaps, planContent);
-      if (ensured.state.status === 'PARTIAL' && affectingGaps.length > 0) {
+      const affectingGaps = gapsAffectingScope(mapState.gaps, planContent);
+      if (mapState.status === 'PARTIAL' && affectingGaps.length > 0) {
         return blocked(ctx, 'Brownfield codebase map has gaps in the requested planning scope.', affectingGaps);
       }
       codebaseContext = packet.text;
       bus.emit(
         'new.map_context',
-        { message: `contexto direcionado do mapa: ${packet.selected_modules.length} módulos, ${packet.bytes} bytes` },
+        { message: `Focused map context: ${packet.selected_modules.length} modules, ${packet.bytes} bytes.` },
         { modules: packet.selected_modules, bytes: packet.bytes, freshness: packet.freshness },
       );
     }
@@ -333,6 +334,10 @@ export async function newWorkflow(
         lastExtractErrors = ['payload: required PlanExtraction object was null or absent'];
       }
       discardDecisionProposals(ctx, extractResult);
+      // Native mode is a two-step exchange. The host must answer the exported
+      // request before RIJO can validate or revise the payload. Do not create
+      // artificial correction tasks for a result that does not exist yet.
+      if (extractResult.summary.includes('native result bundle has no result for task')) break;
       // The workflow is being torn down (deadline/host disconnect): stop retrying
       // so the unwind is not blocked by a fresh dispatch to a dead host.
       if (isWorkflowCancellation(extractResult)) break;
@@ -357,6 +362,9 @@ export async function newWorkflow(
       ensureDir(paths.runtimeDir);
       ensureDir(paths.fixesDir);
       ensureDir(paths.importsDir);
+      ensureDir(paths.phasesDir);
+      ensureDir(paths.uiDir);
+      ensureDir(paths.qaDir);
       ensureDir(paths.archiveDir);
       ensureDir(paths.researchDir);
       // volatile internals never enter version control
@@ -440,7 +448,7 @@ export async function newWorkflow(
     const milestone: MilestoneRef = { id: newId, slug: newSlug, dir: newDir, paths: mp };
 
     // ---- research (parallel on first milestone, delta afterwards)
-    bus.emit('new.research', { stage: 'RESEARCH', message: 'pesquisa técnica (delta quando possível)' });
+    bus.emit('new.research', { stage: 'RESEARCH', message: 'Run focused technical research.' });
     const store = new ResearchStore(paths, now);
     const topics = extraction.research_topics.slice(0, 4);
     const toResearch = topics.filter((t) => !store.lookup(t.key));
@@ -536,12 +544,12 @@ export async function newWorkflow(
       // long-project hygiene: keep sources.json bounded, archive the oldest
       const compacted = store.compactSources(config.research.max_sources);
       if (compacted.archived > 0) {
-        bus.emit('research.compacted', { message: `${compacted.archived} fontes arquivadas em ${path.basename(compacted.archiveFile!)}` });
+        bus.emit('research.compacted', { message: `Archived ${compacted.archived} sources in ${path.basename(compacted.archiveFile!)}.` });
       }
     }
 
     // ---- build EVERY canonical artifact of the transition in memory
-    bus.emit('new.persist', { stage: 'ROADMAP', message: 'gravando contexto canônico e roadmap' });
+    bus.emit('new.persist', { stage: 'ROADMAP', message: 'Write canonical context and the roadmap.' });
     const scopeContent = serializeFrontmatter(
       { milestone: milestone.id, source_plan: path.basename(planPath), created_at: now().toISOString() },
       [
@@ -568,13 +576,20 @@ export async function newWorkflow(
         ...initialState(now),
         milestone: milestone.id,
         next_step: opts.ui
-          ? `rijo ui @${opts.ui.replace(/^@/, '')} (import scheduled) then rijo run`
-          : 'rijo run',
+          ? `$rijo ui @${opts.ui.replace(/^@/, '')}`
+          : '$rijo start',
         updated_at: now().toISOString(),
       },
       `Milestone ${milestone.id} created from ${path.basename(planPath)}. ${requirements.length} requirements across ${phases.length} phases.`,
     );
-    const globals = buildGlobalArtifacts(ctx, extraction, brown, decisions);
+    const globals = buildGlobalArtifacts(
+      ctx,
+      extraction,
+      brown,
+      decisions,
+      requirementsContent,
+      roadmapContent,
+    );
 
     const relRoot = (p: string) => path.relative(projectRoot, p).split(path.sep).join('/');
     const relRijo = (p: string) => path.relative(paths.root, p).split(path.sep).join('/');
@@ -585,6 +600,7 @@ export async function newWorkflow(
       // .rijo/runtime changes before commitPoint(); after it, apply is
       // deterministic and idempotent (startup reconciliation rolls forward).
       const allDone = carryoverItems.length === 0;
+      const alreadySealed = exists(activePrev.paths.closeout);
       const sealInput = {
         status: (allDone ? 'COMPLETE' : 'PARTIAL') as 'COMPLETE' | 'PARTIAL',
         baselineCommit: ctx.git.headCommit(projectRoot),
@@ -596,17 +612,24 @@ export async function newWorkflow(
         productionState: 'see qa/production-readiness.md if present',
       };
       const prevReqDoc = exists(activePrev.paths.requirements) ? readRequirements(activePrev.paths.requirements) : null;
-      try {
-        validateSeal(activePrev, sealInput, prevReqDoc);
-      } catch (err) {
-        return failed(ctx, `Milestone ${activePrev.id} cannot be sealed.`, [(err as Error).message]);
+      if (!alreadySealed) {
+        try {
+          validateSeal(activePrev, sealInput, prevReqDoc);
+        } catch (err) {
+          return failed(ctx, `Milestone ${activePrev.id} cannot be sealed.`, [(err as Error).message]);
+        }
       }
-      const sealedReqDoc = prevReqDoc ? applySealDispositions(prevReqDoc, carryoverItems) : null;
-      const closeoutContent = renderCloseout(activePrev, sealInput, sealedReqDoc, now);
+      const sealedReqDoc =
+        prevReqDoc && !alreadySealed
+          ? applySealDispositions(prevReqDoc, carryoverItems)
+          : prevReqDoc;
+      const closeoutContent = alreadySealed
+        ? readText(activePrev.paths.closeout)
+        : renderCloseout(activePrev, sealInput, sealedReqDoc, now);
 
       const manifest = readManifest(paths)!;
       const prevEntry = manifest.milestones.find((m) => m.id === activePrev.id);
-      if (prevEntry) prevEntry.status = sealInput.status;
+      if (prevEntry && !alreadySealed) prevEntry.status = sealInput.status;
       manifest.milestones.push({ id: newId, slug: newSlug, status: 'ACTIVE' });
       manifest.active_milestone = newId;
       manifest.updated_at = now().toISOString();
@@ -622,7 +645,9 @@ export async function newWorkflow(
         ['MILESTONES.md', indexContent],
         ['manifest.json', JSON.stringify(manifest)],
       ]);
-      if (sealedReqDoc) overlay.set(relRijo(activePrev.paths.requirements), renderRequirements(sealedReqDoc));
+      if (sealedReqDoc && !alreadySealed) {
+        overlay.set(relRijo(activePrev.paths.requirements), renderRequirements(sealedReqDoc));
+      }
       for (const g of globals) overlay.set(relRijo(g.path), g.content);
       manifest.hashes = computeHashes(paths, overlay);
       const manifestContent = JSON.stringify(ManifestSchema.parse(manifest), null, 2) + '\n';
@@ -632,8 +657,12 @@ export async function newWorkflow(
       tx.stageDir(relRoot(path.join(mp.qaDir, 'journeys')));
       tx.stageDir(relRoot(path.join(mp.qaDir, 'screenshots')));
       tx.stageDir(relRoot(path.join(mp.qaDir, 'traces')));
-      tx.stage(relRoot(activePrev.paths.closeout), closeoutContent);
-      if (sealedReqDoc) tx.stage(relRoot(activePrev.paths.requirements), renderRequirements(sealedReqDoc));
+      if (!alreadySealed) {
+        tx.stage(relRoot(activePrev.paths.closeout), closeoutContent);
+        if (sealedReqDoc) {
+          tx.stage(relRoot(activePrev.paths.requirements), renderRequirements(sealedReqDoc));
+        }
+      }
       tx.stage(relRoot(mp.scope), scopeContent);
       tx.stage(relRoot(mp.requirements), requirementsContent);
       tx.stage(relRoot(mp.roadmap), roadmapContent);
@@ -646,10 +675,16 @@ export async function newWorkflow(
       tx.apply();
       tx.finish();
 
-      if (config.git.tag_milestones && gitStatus.isRepo) {
+      if (!alreadySealed && config.git.tag_milestones && gitStatus.isRepo) {
         ctx.git.tag(projectRoot, `rijo/${activePrev.id}`, `RIJO milestone ${activePrev.id} sealed`);
       }
-      bus.emit('milestone.sealed', { message: `milestone ${activePrev.id} selado (${allDone ? 'COMPLETE' : 'PARTIAL'})` }, { milestone: activePrev.id });
+      if (!alreadySealed) {
+        bus.emit(
+          'milestone.sealed',
+          { message: `Milestone ${activePrev.id} sealed (${allDone ? 'COMPLETE' : 'PARTIAL'}).` },
+          { milestone: activePrev.id },
+        );
+      }
     } else {
       // ---- first milestone: direct creation (there is no previous state a
       // crash could corrupt; a partial init is recreated by re-running new).
@@ -669,7 +704,9 @@ export async function newWorkflow(
 
     // ---- adapters
     const adapterReport = generateAdapters(projectRoot);
-    bus.emit('new.adapters', { message: `adapters gerados: ${adapterReport.generated.join(', ') || 'nenhum'}` });
+    bus.emit('new.adapters', {
+      message: `Generated adapters: ${adapterReport.generated.join(', ') || 'none'}.`,
+    });
 
     // ---- baseline commit: the canonical context and generated adapters are
     // committed so the milestone starts from a clean, known tree. Only paths
@@ -700,25 +737,17 @@ export async function newWorkflow(
       'new.done',
       {
         status: 'completed',
+        stage: 'ROADMAP_READY',
         milestone: { id: milestone.id, name: extraction.project_name },
-        message: `milestone ${milestone.id} pronto: ${requirements.length} requisitos, ${phases.length} fases`,
+        message: `[RIJO ${milestone.id}] ROADMAP_READY`,
       },
       { requirements: requirements.length, phases: phases.length },
     );
 
-    // ---- composition new → ui → run, all under this single lock/context.
-    if (opts.ui) {
-      bus.emit('new.ui', { stage: 'IMPORT', message: `importando design ${opts.ui}` });
-      const uiOutcome = await uiCore(ctx, { input: opts.ui });
-      if (!uiOutcome.ok) return uiOutcome;
-    }
-    if (opts.run) {
-      return runCore(ctx, { target: 'all' });
-    }
     return completed(ctx, `Milestone ${milestone.id} created (${requirements.length} requirements, ${phases.length} phases).`);
   }, {
     run: { plan: planContent, planHash, next: Boolean(opts.next), host: ctx.hostProvider },
-    terminal: Boolean(opts.run),
+    terminal: false,
   });
 }
 
@@ -766,6 +795,8 @@ function buildGlobalArtifacts(
   extraction: PlanExtraction,
   brown: BrownfieldInfo,
   decisions: string[],
+  requirementsContent: string,
+  roadmapContent: string,
 ): Array<{ path: string; content: string }> {
   const { paths, now } = ctx;
   const ts = now().toISOString();
@@ -809,6 +840,38 @@ function buildGlobalArtifacts(
         ...(brown.baselineCommands.length
           ? ['', '## Detected commands (execution evidence is in .rijo/codebase/BASELINE.md)', ...brown.baselineCommands.map((c) => `- \`${c}\``)]
           : []),
+        '',
+      ].join('\n'),
+    ),
+  });
+  out.push({ path: paths.requirements, content: requirementsContent });
+  out.push({ path: paths.roadmap, content: roadmapContent });
+  out.push({
+    path: paths.architecture,
+    content: serializeFrontmatter(
+      { updated_at: ts },
+      [
+        '# Architecture',
+        '',
+        extraction.stack_summary || 'The active phase research will define the implementation boundaries.',
+        '',
+        brown.isBrownfield
+          ? 'Use the evidence-backed codebase map in `.rijo/codebase/`.'
+          : 'Use the roadmap phases as reversible vertical slices.',
+        '',
+      ].join('\n'),
+    ),
+  });
+  out.push({
+    path: paths.integrations,
+    content: serializeFrontmatter(
+      { updated_at: ts },
+      [
+        '# Integrations',
+        '',
+        'Record external systems, credentials, permissions, and failure behavior here.',
+        '',
+        'No external integration is approved by inference.',
         '',
       ].join('\n'),
     ),

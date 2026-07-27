@@ -6,6 +6,7 @@ import YAML from 'yaml';
 import { newWorkflow } from '../src/workflows/new.js';
 import { runWorkflow } from '../src/workflows/run.js';
 import { checkWorkflow } from '../src/workflows/check.js';
+import { mapWorkflow } from '../src/workflows/map.js';
 import { SystemGit } from '../src/core/git.js';
 import { SystemShellRunner } from '../src/core/commands.js';
 import { nativeSandboxAvailable } from '../src/security/execpolicy.js';
@@ -26,9 +27,9 @@ const SERVER_JS = `'use strict';
 const http = require('http');
 const PORT = process.env.PORT || ${PORT};
 const page = [
-  '<!doctype html><html><head><meta charset="utf-8"><title>Loja Fixture</title></head><body>',
-  '<h1 id="title">Loja Fixture</h1>',
-  '<form id="form"><input id="name" name="name"><button id="submit" type="button">Enviar</button></form>',
+  '<!doctype html><html><head><meta charset="utf-8"><title>Store Fixture</title></head><body>',
+  '<h1 id="title">Store Fixture</h1>',
+  '<form id="form"><input id="name" name="name"><button id="submit" type="button">Submit</button></form>',
   '<div id="result"></div>',
   '<script>',
   "document.getElementById('submit').addEventListener('click', async () => {",
@@ -44,7 +45,7 @@ http.createServer((req, res) => {
   if (u.pathname === '/health') { res.writeHead(200); res.end('ok'); return; }
   if (u.pathname === '/api/greet') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ greeting: 'Olá, ' + (u.searchParams.get('name') || '') }));
+    res.end(JSON.stringify({ greeting: 'Hello, ' + (u.searchParams.get('name') || '') }));
     return;
   }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -53,16 +54,16 @@ http.createServer((req, res) => {
 `;
 
 const FIXTURE_EXTRACTION = {
-  project_name: 'Loja Fixture',
-  project_summary: 'Formulário de saudação com backend real.',
-  stack_summary: 'Node http server, sem dependências de runtime.',
+  project_name: 'Store Fixture',
+  project_summary: 'Greeting form with a real backend.',
+  stack_summary: 'Node HTTP server with no runtime dependencies.',
   rules: [],
   out_of_scope: [],
-  acceptance: ['Usuário envia o nome e vê a saudação'],
+  acceptance: ['User submits a name and sees the greeting'],
   requirements: [
-    { description: 'Saudação personalizada via formulário', acceptance: 'Usuário digita o nome, envia e vê "Olá, <nome>"', non_functional: false, classification: 'NEW' as const },
+    { description: 'Personalized greeting through a form', acceptance: 'User enters a name, submits the form, and sees "Hello, <name>"', non_functional: false, classification: 'NEW' as const },
   ],
-  phases: [{ name: 'Saudação', requirement_indexes: [0], depends_on_indexes: [], ui_surface: false }],
+  phases: [{ name: 'Greeting', requirement_indexes: [0], depends_on_indexes: [], ui_surface: false }],
   research_topics: [],
 };
 
@@ -80,8 +81,8 @@ function fixturePlan(root: string) {
     return {
       phase: phaseId,
       tasks: [
-        { id: 'T01', name: 'Implementar saudação', requirement_ids: reqIds, technical_justification: null, files: ['a.js'], mapped_references: [mappedNewReferenceFor(root, 'a.js')], write_scope: ['a.js'], depends_on: [], parallel: false, tdd: false, tests: ['node test.js'], evidence_expected: 'teste passa', done: false },
-        { id: 'T02', name: 'Integração', requirement_ids: [], technical_justification: 'integração', files: ['b.js'], mapped_references: [mappedNewReferenceFor(root, 'b.js')], write_scope: ['b.js'], depends_on: ['T01'], parallel: false, tdd: false, tests: [], evidence_expected: 'build passa', done: false },
+        { id: 'T01', name: 'Implement greeting', requirement_ids: reqIds, technical_justification: null, files: ['a.js'], mapped_references: [mappedNewReferenceFor(root, 'a.js')], write_scope: ['a.js'], depends_on: [], parallel: false, tdd: false, tests: ['node test.js'], evidence_expected: 'test passes', done: false },
+        { id: 'T02', name: 'Integration', requirement_ids: [], technical_justification: 'integration', files: ['b.js'], mapped_references: [mappedNewReferenceFor(root, 'b.js')], write_scope: ['b.js'], depends_on: ['T01'], parallel: false, tdd: false, tests: [], evidence_expected: 'build passes', done: false },
       ],
     };
   };
@@ -109,7 +110,7 @@ describe.runIf(canRun)('production gate E2E (real app, real server, real Playwri
       path.join(root, 'package.json'),
       JSON.stringify(
         {
-          name: 'loja-fixture',
+          name: 'store-fixture',
           version: '1.0.0',
           private: true,
           scripts: { start: 'node server.js', build: 'node build.js', test: 'node test.js' },
@@ -132,7 +133,9 @@ describe.runIf(canRun)('production gate E2E (real app, real server, real Playwri
 
     // ---- RIJO project: plan agents faked, git/shell REAL
     const d = { ...deps(root, { extraction: FIXTURE_EXTRACTION, planPayload: fixturePlan(root) }), git: new SystemGit(), shell: new SystemShellRunner() };
-    const created = await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const mapped = await mapWorkflow(root, {}, d);
+    expect(mapped.ok, mapped.message).toBe(true);
+    const created = await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     expect(created.ok, created.message).toBe(true);
     const ran = await runWorkflow(root, { target: 'all' }, d);
     expect(ran.ok, JSON.stringify(ran)).toBe(true);
@@ -152,7 +155,7 @@ describe.runIf(canRun)('production gate E2E (real app, real server, real Playwri
           { action: 'expect_visible', selector: '#title', requirement_id: 'M001-REQ-001' },
           { action: 'fill', selector: '#name', value: 'Maria' },
           { action: 'click', selector: '#submit' },
-          { action: 'expect_text', selector: '#result', text: 'Olá, Maria', requirement_id: 'M001-REQ-001' },
+          { action: 'expect_text', selector: '#result', text: 'Hello, Maria', requirement_id: 'M001-REQ-001' },
         ],
       }),
     );
@@ -217,7 +220,7 @@ describe.runIf(canRun)('production gate E2E (real app, real server, real Playwri
 
   it('NOT_READY with failure evidence: Playwright fails when the real flow is broken', async () => {
     // sabotage the API so the journey assertion fails
-    const broken = fs.readFileSync(path.join(root, 'server.js'), 'utf8').replace("'Olá, '", "'Tchau, '");
+    const broken = fs.readFileSync(path.join(root, 'server.js'), 'utf8').replace("'Hello, '", "'Goodbye, '");
     fs.writeFileSync(path.join(root, 'server.js'), broken);
     git(root, ['add', 'server.js']);
     git(root, ['commit', '-m', 'introduce regression']);
@@ -249,7 +252,7 @@ describe.runIf(canRun)('production gate E2E (real app, real server, real Playwri
       (t) => t.id.startsWith('check-fix-'),
       (t) => {
         const base = t.workspace!.root;
-        const src = fs.readFileSync(path.join(base, 'server.js'), 'utf8').replace("'Tchau, '", "'Olá, '");
+        const src = fs.readFileSync(path.join(base, 'server.js'), 'utf8').replace("'Goodbye, '", "'Hello, '");
         fs.writeFileSync(path.join(base, 'server.js'), src);
         return {
           task_id: t.id, ok: true, summary: 'greeting restored', files_written: ['server.js'],

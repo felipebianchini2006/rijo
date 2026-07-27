@@ -1,100 +1,100 @@
-# RIJO Codebase Map
+# RIJO codebase map
 
-`rijo map` cria uma base brownfield consultável, vinculada ao commit e ao hash
-determinístico da árvore relevante. O comando não possui perguntas nem menus:
+Use `map-codebase` only for a codebase that existed before RIJO. The command
+creates an evidence-backed map in `.rijo/codebase/`. It does not create a
+project milestone.
 
-- sem mapa ou com commit-base inacessível: full;
-- mapa no mesmo conteúdo: no-op;
-- drift Git ou paths marcados por uma fase/fix verificado: incremental;
-- `--full`: full explícito;
-- `--paths a,b`: somente módulos owners desses paths, mais a síntese
-  transversal;
-- `--query termo`: consulta `inventory`, `symbols`, `surfaces`, dependências e
-  claims localmente, com `model_calls: 0`;
-- `--status`: commit, freshness, cobertura, baseline, módulos e gaps.
+Use the native command:
 
-## Pipeline e limites
-
-1. `MAP_PREFLIGHT` resolve a raiz real e exige checkout limpo, exceto estado
-   volátil autorizado do RIJO.
-2. `MAP_INVENTORY` classifica cada arquivo relevante e registra exclusões.
-   Sensitive paths, `.env`, credenciais locais, vendor, generated, binários,
-   arquivos grandes e symlinks externos são fail-closed e não são enviados aos
-   agentes.
-3. `MAP_HISTORY` calcula renames, churn, co-change, commits arquiteturais,
-   migrations e hotspots sem enviar o log inteiro ao modelo.
-4. `MAP_SHARDS` agrupa módulos reais com owner único e limites de arquivos e
-   bytes, subdividindo módulos grandes sem perder ownership. Cada tentativa
-   passa pelo `TaskExecutor` e `Supervisor`, recebe apenas seu shard e não possui
-   write scope. Shards somente documentais/visuais continuam inventariados, mas
-   a ausência esperada de código neles não vira gap.
-5. `MAP_SYNTHESIS` preserva claims não afetadas e mescla fragments Zod.
-6. `MAP_REVIEW` revalida path, sha256, linhas e símbolos em shards limitados,
-   cobre todas as claims e persiste recibos estruturais e semânticos. Se a
-   camada enriquecida for reprovada, ela é descartada integralmente e o
-   candidato determinístico é submetido a uma nova revisão independente.
-7. `MAP_BASELINE` executa comandos detectados em `AttemptWorkspace`, pela
-   política segura. Detecção sozinha é `DETECTED_NOT_RUN`, nunca “verified”.
-8. `MAP_COMMIT` promove o candidato por transação recuperável. Um crash antes
-   do commit point descarta staging; depois dele, o recovery faz roll-forward.
-
-Mappers nunca escrevem no código da aplicação. O core captura a árvore antes e
-depois de cada batch read-only e bloqueia qualquer delta.
-
-## Artefatos
-
-`.rijo/codebase/` contém os documentos de planejamento (`SUMMARY`, `STACK`,
-`ARCHITECTURE`, `STRUCTURE`, `MODULES`, `CONVENTIONS`, `TESTING`, `APIS`,
-`DATA`, `INTEGRATIONS`, `OPERATIONS`, `HISTORY`, `CONCERNS`, `BASELINE`) e os
-índices JSON (`inventory`, `symbols`, `dependency-graph`, `surfaces`, `claims`,
-`baseline`, `review-receipts`, `map-state`). `map-state.json` registra
-schema/mapper, status derivado (`COMPLETE`, `PARTIAL` ou `BLOCKED`), commit,
-tree hash, branch, cobertura multidimensional real, exclusões, hashes dos
-artefatos, baseline, drift e operação. A revisão nunca é truncada por quantidade
-de claims. Observações livres do mapper só afetam o status quando a revisão
-independente as certifica como lacuna material; caso contrário, permanecem
-rastreáveis em `CONCERNS.md` e `review-receipts.json` como não bloqueantes.
-
-`SUMMARY.md` é o único documento carregado por padrão. O packet dirigido usa o
-texto do plano para selecionar módulos, arquivos, símbolos, contratos e riscos
-dentro de `context_budget_bytes`. Paths, hashes ou símbolos existentes
-inventados pelo planner reprovam `PLAN_LINT`.
-
-## Integração com `new`
-
-Greenfield segue sem mapa. Em brownfield, `new` chama `ensureCodebaseMap` dentro
-do lock que já possui: cria full quando ausente, reutiliza quando fresh e
-atualiza incrementalmente quando stale. `new --next` faz essa garantia antes da
-classificação de requisitos. Um mapa `BLOCKED` nunca é consumido. Um mapa
-`PARTIAL` só bloqueia quando seus gaps factuais atingem paths ou módulos do
-escopo planejado; gaps não relacionados permanecem visíveis sem impedir trabalho
-seguro.
-
-## Decisões
-
-O schema v3 adiciona `decisions` à configuração:
-
-```yaml
-decisions:
-  mode: autonomous
-  ask_user: blockers_only
-  preserve_existing_architecture: true
-  prefer_reversible: true
-  record_material_decisions: true
-  confidence_threshold: 0.70
-  scale_horizon: current_scope_plus_next_milestone
+```text
+$rijo map-codebase
 ```
 
-O core resolve gray areas pela ordem: escopo explícito; comportamento
-observável/testes/dados; mapa e padrão dominante; segurança e compatibilidade;
-documentação oficial; alternativa simples e reversível; escala do escopo atual
-e próximo milestone. Só aceita blockers externos enumerados pelo schema. Uma
-decisão material sem evidência real é inválida; uma dúvida técnica reversível
-abaixo do threshold preserva comportamento ou escolhe a alternativa simples e
-registra condição objetiva de revisão.
+If `new` detects an existing codebase without a map, it stops. It shows the
+exact native command above. The `new` command does not run a full map
+automatically.
 
-Toda resposta de agente pode propor decisões pelo contrato
-`decision_proposals`. O core valida evidência, blocker, confiança,
-reversibilidade, consequências e condição de revisão antes de aceitar a
-resposta; propostas materiais válidas são promovidas a `DecisionRecord` somente
-no terminal durável do workflow.
+## Map modes
+
+The deterministic core selects one mode:
+
+- `full`: No usable map exists.
+- `no-op`: The map matches the relevant tree.
+- `incremental`: Git drift or verified changes affect mapped paths.
+
+The core can also query the local inventory, symbols, surfaces, dependencies,
+and claims. Local queries do not use a model.
+
+## Pipeline
+
+1. `MAP_PREFLIGHT` resolves the repository root. It requires a clean checkout,
+   except for authorized volatile RIJO state.
+2. `MAP_INVENTORY` classifies relevant files and records exclusions.
+3. `MAP_HISTORY` calculates renames, churn, co-change, migrations, and
+   hotspots.
+4. `MAP_SHARDS` groups real modules under one owner. Each read-only attempt
+   receives one bounded shard.
+5. `MAP_SYNTHESIS` preserves unaffected claims and merges validated fragments.
+6. `MAP_REVIEW` validates paths, hashes, lines, and symbols.
+7. `MAP_BASELINE` runs detected commands when the execution policy permits
+   them.
+8. `MAP_COMMIT` promotes the candidate through a recoverable transaction.
+
+Sensitive paths are closed by default. RIJO excludes environment files, local
+credentials, vendor files, generated files, binaries, large files, and
+external symbolic links from agent input.
+
+Mapping agents do not write application code. The core compares the tree before
+and after each read-only batch. It blocks any unexpected change.
+
+## Artifacts
+
+The `.rijo/codebase/` directory contains these planning documents:
+
+- `SUMMARY.md`
+- `ARCHITECTURE.md`
+- `STRUCTURE.md`
+- `MODULES.md`
+- `CONVENTIONS.md`
+- `TESTING.md`
+- `APIS.md`
+- `DATA.md`
+- `INTEGRATIONS.md`
+- `OPERATIONS.md`
+- `HISTORY.md`
+- `CONCERNS.md`
+
+The directory also contains stable JSON indexes:
+
+- `inventory.json`
+- `symbols.json`
+- `dependency-graph.json`
+- `surfaces.json`
+- `map-state.json`
+
+`SUMMARY.md` is the default entry point. RIJO loads detailed map files only
+when a task needs them. This keeps the automatic context small.
+
+## Incremental refresh
+
+RIJO can refresh the map between phases. It preserves unaffected claims. It
+revalidates changed paths and their dependent modules.
+
+A `BLOCKED` map cannot provide planning context. A `PARTIAL` map blocks work
+only when a factual gap affects the requested scope.
+
+## Secondary Command-Line Interface
+
+Continuous integration and external automation can use the secondary
+Command-Line Interface:
+
+```bash
+rijo map --full
+rijo map --paths src/auth,packages/api
+rijo map --query "validateSession"
+rijo map --status
+```
+
+These commands expose deterministic map operations. The native
+`$rijo map-codebase` or `/rijo map-codebase` command remains the normal user
+path.

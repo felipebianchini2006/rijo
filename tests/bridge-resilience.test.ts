@@ -315,8 +315,8 @@ describe('bridge resilience — serve workflow deadline', () => {
 
     // Two queued workflows; both hang on their first agent task and rely on the
     // deadline to unblock the queue.
-    t.deliver({ type: 'request', method: 'workflow.new', id: 1, params: { planFile: '@PLANO.md' } });
-    t.deliver({ type: 'request', method: 'workflow.new', id: 2, params: { planFile: '@PLANO.md' } });
+    t.deliver({ type: 'request', method: 'workflow.new', id: 1, params: { planFile: '@PLAN.md' } });
+    t.deliver({ type: 'request', method: 'workflow.new', id: 2, params: { planFile: '@PLAN.md' } });
 
     // First workflow times out → error response, queue advances.
     const r1 = await responded(1);

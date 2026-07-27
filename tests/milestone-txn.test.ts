@@ -14,8 +14,8 @@ import { tmpProject, cleanup, writePlanFile, deps, EXTRACTION_PAYLOAD } from './
 
 const M2_EXTRACTION = {
   ...EXTRACTION_PAYLOAD,
-  project_name: 'Loja v2',
-  requirements: [{ description: 'Cupons de desconto', acceptance: 'Cupom aplica desconto', non_functional: false, classification: 'NEW' as const }],
+  project_name: 'Store v2',
+  requirements: [{ description: 'Discount coupons', acceptance: 'Coupon applies a discount', non_functional: false, classification: 'NEW' as const }],
   phases: [{ name: 'Cupons', requirement_indexes: [0], depends_on_indexes: [], ui_surface: false }],
   research_topics: [],
 };
@@ -43,9 +43,9 @@ describe('milestone transaction crash safety (fault injection after every durabl
     // golden fixture: M001 fully executed and sealed-ready
     golden = tmpProject('rijo-txn-golden-');
     writePlanFile(golden);
-    writePlanFile(golden, 'PLANO2.md', '# Plano M002\n\nCupons.\n');
+    writePlanFile(golden, 'PLAN-2.md', '# Plan M002\n\nCoupons.\n');
     const d = deps(golden);
-    await newWorkflow(golden, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(golden, { planFile: '@PLAN.md' }, d);
     const run = await runWorkflow(golden, { target: 'all' }, d);
     expect(run.ok, run.message).toBe(true);
     const mapped = await mapWorkflow(golden, {}, d);
@@ -55,7 +55,7 @@ describe('milestone transaction crash safety (fault injection after every durabl
     const probe = cloneFixture(golden);
     const recorded: string[] = [];
     const dp = deps(probe, { extraction: M2_EXTRACTION });
-    const outcome = await newWorkflow(probe, { planFile: '@PLANO2.md', next: true }, { ...dp, txnHooks: { afterWrite: (s) => recorded.push(s) } });
+    const outcome = await newWorkflow(probe, { planFile: '@PLAN-2.md', next: true }, { ...dp, txnHooks: { afterWrite: (s) => recorded.push(s) } });
     expect(outcome.ok, outcome.message).toBe(true);
     steps = recorded;
     expect(steps.length).toBeGreaterThan(10);
@@ -73,7 +73,7 @@ describe('milestone transaction crash safety (fault injection after every durabl
         const before = snapshotTree(root);
         const dp = deps(root, { extraction: M2_EXTRACTION });
         await expect(
-          newWorkflow(root, { planFile: '@PLANO2.md', next: true }, { ...dp, txnHooks: crashAt(step) }),
+          newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, { ...dp, txnHooks: crashAt(step) }),
         ).rejects.toThrow(/INJECTED-CRASH/);
 
         const preCommit = steps.indexOf(step) < steps.indexOf('commit');
@@ -92,7 +92,7 @@ describe('milestone transaction crash safety (fault injection after every durabl
           const m1dir = paths.milestoneDir('M001', manifest.milestones[0]!.slug);
           expect(fs.existsSync(path.join(m1dir, 'CLOSEOUT.md'))).toBe(false);
           // the transition is fully retryable afterwards
-          const retry = await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, deps(root, { extraction: M2_EXTRACTION }));
+          const retry = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, deps(root, { extraction: M2_EXTRACTION }));
           expect(retry.ok, `retry after ${step}: ${retry.message}`).toBe(true);
         } else {
           // at/after the commit point the transition COMPLETES deterministically
@@ -132,7 +132,7 @@ describe('milestone transaction crash safety (fault injection after every durabl
       const { touchManifest } = await import('../src/core/manifest.js');
       touchManifest(paths);
 
-      const outcome = await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, deps(root, { extraction: M2_EXTRACTION }));
+      const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, deps(root, { extraction: M2_EXTRACTION }));
       expect(outcome.ok, outcome.message).toBe(true);
       const m1After = readRequirements(path.join(m1dir, 'REQUIREMENTS.md'));
       // the sealed side says CARRIED — not DONE

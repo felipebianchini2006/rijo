@@ -25,17 +25,17 @@
 
 | Item | Delivery (commit) |
 |---|---|
-| P0.1 Supervisor em todo dispatch | `TaskExecutor`/`SupervisedExecutor`: TaskRecord durável antes do host, identidade attempt/generation/lease/idempotency, batch independente, EXHAUSTED→BLOCKED (`2e47bd7`) |
-| P0.2 Controllers reais | `buildClaudeLaunch`/`parseClaudeExit` + Codex equivalentes como fonte única; `ClaudeProcessController`/`CodexProcessController` donos do PID; `RpcHostController` (heartbeat/progress → liveness, cancel com ack limitado, force gated por capability) (`1a5a65a`) |
-| P0.3 Árvore inteira | `killProcessTree`: POSIX process group (`-pgid`, fallback ESRCH), Windows `taskkill /PID /T /F` argv estruturado; os 4 caminhos de kill; teste real pai→filho→neto (`1a5a65a`) |
-| P0.4 Fuga de escrita | sem `--add-dir` do projectRoot; cwd = workspace da tentativa; permission-mode por papel (writers `acceptEdits`, read-only `plan`); deny rules p/ `.env*`, chaves, `~/.ssh` etc.; teste live de escrita negada (`1a5a65a`) |
-| P0.5 Recovery no início | `withLock`: transações → tasks supervisionadas → workspaces órfãos, antes do body; reconcile idempotente (2ª passada = 0 eventos); QUEUED→CANCELLED→EXHAUSTED; CANCELLED/FAILED → REPLACING\|EXHAUSTED por budget, nunca por ORPHANED proibido; completed-pendente descartado com fencing; testes table-driven (`d05184e`) |
-| P0.6 Profiles em tasks reais | `prepareDispatchedTask` roteia TODO draft (role/stage/paths/tags/high-risk); reviewer nunca herda lente autoral; researcher = discovery-analyst; testes por workflow (`2e47bd7`) |
-| P0.7 Finalização transacional | marcador `FINALIZING` durável; ordem verificação→artefatos→checkpoint→C1→evidence→C2→seal→validações→DONE; retomada sem reexecutar implementação; fault injection nas 8 janelas com git real (`2c569d4`) |
-| P0.8 Deadline sem overlap | `raceWithUnwind` no serve: cancel → settle comprovado (lock liberado) → resposta; teto duro bloqueia a fila em vez de sobrepor; testes de ordenação (`7b194a0`) |
-| P0.9 Turnkey | `rijo new/run/check/ui/fix --host claude|codex` + config `host.provider`; detect→BLOCKED se ausente; skills invocam o comando turnkey; `serve --stdio` como API avançada (`8c95870`) |
-| Replacement com workspace novo | `replaceableAttempt`: gen N+1 = task re-roteada + workspace novo; gen substituída descartada (`20c8747`) |
-| 9 defeitos reais achados pelo host live | keep-alive do supervisor, permission de escritores canônicos, leak de workspace substituído, re-plan/re-review dentro do budget, objetivo do worker, retry de extração, lint de comandos de teste, looseBool (`7ee5272`) |
+| P0.1 Supervision for every dispatch | `TaskExecutor` and `SupervisedExecutor` create a durable `TaskRecord` before the host starts. They use attempt, generation, lease, and idempotency identities. Each batch item is independent. `EXHAUSTED` becomes `BLOCKED` (`2e47bd7`). |
+| P0.2 Real controllers | `buildClaudeLaunch`, `parseClaudeExit`, and the Codex equivalents are the single source of process behavior. `ClaudeProcessController` and `CodexProcessController` own the process identifier. `RpcHostController` converts heartbeat and progress into liveness. It uses bounded cancellation acknowledgement (`1a5a65a`). |
+| P0.3 Complete process tree | `killProcessTree` uses a POSIX process group with an `ESRCH` fallback. Windows uses structured `taskkill /PID /T /F` arguments. Tests cover all four termination paths and a real parent, child, and grandchild tree (`1a5a65a`). |
+| P0.4 Write escape | The driver does not pass the project root through `--add-dir`. The attempt workspace is the current directory. Writers use `acceptEdits`; read-only roles use `plan`. Deny rules protect environment files, keys, and local Secure Shell files. A live test verifies denied writes (`1a5a65a`). |
+| P0.5 Startup recovery | `withLock` reconciles transactions, supervised tasks, and orphan workspaces before workflow code runs. Reconciliation is idempotent. Recovery uses valid state transitions and fences stale completed results (`d05184e`). |
+| P0.6 Profiles on real tasks | `prepareDispatchedTask` routes every draft by role, stage, paths, tags, and risk. A reviewer does not inherit the author profile. Researchers use the discovery profile. Workflow tests verify routing (`2e47bd7`). |
+| P0.7 Transactional finalization | A durable `FINALIZING` marker protects the sequence from verification through the final `DONE` state. Resume does not repeat implementation. Fault injection covers eight windows with real Git operations (`2c569d4`). |
+| P0.8 Deadline without overlap | `raceWithUnwind` cancels and waits for proven settlement before it returns. A hard bound blocks the queue instead of overlapping work. Ordering tests verify this behavior (`7b194a0`). |
+| P0.9 Turnkey adapter | The legacy host mode supports `rijo new/run/check/ui/fix --host claude|codex` and `host.provider`. Missing hosts return `BLOCKED`. `serve --stdio` provides the advanced API (`8c95870`). |
+| Replacement with a new workspace | `replaceableAttempt` gives generation N+1 a new routed task and workspace. RIJO discards the replaced generation (`20c8747`). |
+| Nine defects found by the live host | Fixes cover supervisor keep-alive, canonical writer permissions, replacement workspace cleanup, bounded planning retries, worker objectives, extraction retries, test command lint, and `looseBool` (`7ee5272`). |
 
 ## 3. Clean-clone command matrix
 
@@ -54,7 +54,7 @@ Tarball SHA-256:
 
 **Scenario A — turnkey from the packed tarball: PASS.**
 `npm pack` → install in a clean fixture → `git init` →
-`rijo new @PLANO.md --host claude --run`. Asserted: exit 0; phase **DONE** in
+`rijo new @PLAN.md --host claude --run`. Asserted: exit 0; phase **DONE** in
 ROADMAP; **C1** ("…verified"), **C2** ("evidence for…") and **seal** commits
 plus the "milestone initialized" baseline in the fixture's real git; the
 task's source file committed; clean tracked tree; `rijo --status --json`
@@ -102,14 +102,15 @@ after any run, including the failed one.
 
 ## 7. Additional mandatory tests (all in the suite, clean clone)
 
-Supervisor integrado em new/run/ui/fix/check (workflow-supervision, -profiles);
-bridge heartbeat/progress/cancel-ack (rpc-controller, bridge-resilience);
-stale result pós-replacement; árvore pai/filho/neto morta (process-tree-kill);
-escrita canônica negada (live-claude-write-fence, gated); recovery de todos os
-estados + 2 passadas idempotentes (recovery-states); fault injection em toda a
-finalização Git (finalization-txn); deadline sem overlap (bridge-deadline);
-tarball importável/executável (pack.e2e + fixture); Node 22/24; Ubuntu/Windows
-no CI para lógica de processos; audit high = 0; SBOM; recibos sem secrets.
+The suite covers supervision in every legacy workflow and profile routing. It
+covers bridge heartbeat, progress, and cancellation acknowledgement. It
+rejects stale replacement results. It terminates a complete process tree. It
+denies canonical write escapes. It reconciles every recovery state twice to
+verify idempotency. It injects faults across Git finalization. It verifies
+deadline ordering and the packed archive. Continuous integration covers Node.js
+22 and 24 on Ubuntu and Windows. The high-severity audit found no
+vulnerabilities. The suite also validates the software bill of materials and
+secret-free receipts.
 
 ## 8. Real limitations
 
@@ -128,10 +129,10 @@ no CI para lógica de processos; audit high = 0; SBOM; recibos sem secrets.
 
 **`READY_CLAUDE_ONLY`** — the required chain was proven live end-to-end on
 Claude Code from a clean clone and the packed tarball:
-workflow real → dispatch supervisionado → tentativa real trava → árvore
-encerrada → fencing → replacement em workspace novo → resultado atual
-aplicado → testes executados → commits finalizados → recovery e status
-coerentes. Codex stays experimental until its live E2E passes; nothing was
+real workflow → supervised dispatch → stalled real attempt → terminated
+process tree → fencing → replacement in a new workspace → current result
+applied → tests run → commits finalized → coherent recovery and status.
+Codex stays experimental until its live E2E passes; nothing was
 published to npm and the version was not changed.
 
 ## Artifacts (`artifacts/go-live-v2/`)
@@ -155,7 +156,7 @@ change), both Codex live gates were executed fresh:
 | Gate | Result |
 |---|---|
 | Driver E2E (`RIJO_LIVE_E2E=1`, real `codex exec`, gpt-5.6) | **PASSED** — parsed AgentResult in 35.1s |
-| Full turnkey workflow (`RIJO_LIVE_CODEX_E2E=1`): tarball → clean fixture → `rijo new @PLANO.md --host codex --run` | **PASSED** in 384s — a real phase finalized end-to-end (not a quota skip) |
+| Full turnkey workflow (`RIJO_LIVE_CODEX_E2E=1`): tarball → clean fixture → `rijo new @PLAN.md --host codex --run` | **PASSED** in 384s — a real phase finalized end-to-end (not a quota skip) |
 
 With the same flow now proven live on BOTH hosts, the sole open criterion is
 closed and the verdict lifts from `READY_CLAUDE_ONLY` to **`READY`**. Codex is

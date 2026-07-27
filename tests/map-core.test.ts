@@ -462,7 +462,7 @@ describe('directed codebase context', () => {
   afterEach(() => cleanup(root));
 
   it('selects matching modules and symbols without loading the whole map and stays inside the byte budget', () => {
-    const packet = buildContextPacket(root, 'Alterar validação de sessão no AuthService', 900);
+    const packet = buildContextPacket(root, 'Change session validation in AuthService', 900);
     expect(packet.text).toContain('src/auth/service.ts');
     expect(packet.text).toContain('tests/auth.test.ts');
     expect(packet.text).toContain('AuthService.validateSession');
@@ -478,7 +478,7 @@ describe('directed codebase context', () => {
     state.gaps = ['checkout/session integration has not been semantically reviewed'];
     fs.writeFileSync(statePath, JSON.stringify(state));
 
-    const packet = buildContextPacket(root, 'Alterar validação de sessão no AuthService', 8_000);
+    const packet = buildContextPacket(root, 'Change session validation in AuthService', 8_000);
 
     expect(packet.text).toContain('Conventions');
     expect(packet.text).toContain('Baseline');

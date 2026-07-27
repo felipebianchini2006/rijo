@@ -48,7 +48,7 @@ describe('per-attempt isolation (workflow level)', () => {
         return ok(t, { files_written: ['src/a.ts'], payload: { done: true, notes: '' } });
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toMatch(/outside its individual write scope/);
@@ -68,7 +68,7 @@ describe('per-attempt isolation (workflow level)', () => {
         return { task_id: t.id, ok: false, summary: 'crashed after editing', files_written: [], payload: null, scope_requests: [] };
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(fs.existsSync(path.join(root, 'src', 'a.ts'))).toBe(false);
@@ -89,7 +89,7 @@ describe('per-attempt isolation (workflow level)', () => {
         return ok(t, { files_written: ['src/a.ts'], payload: { done: true, notes: '' } });
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const rulesBefore = fs.readFileSync(path.join(root, '.rijo', 'RULES.md'), 'utf8');
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
@@ -112,7 +112,7 @@ describe('per-attempt isolation (workflow level)', () => {
         return ok(t, { files_written: ['src/a.ts'], payload: { done: true, notes: '' } });
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toMatch(/changed concurrently|NOT applied/);
@@ -134,7 +134,7 @@ describe('per-attempt isolation (workflow level)', () => {
         return ok(t, { files_written: [scope], payload: { done: true, notes: '' } });
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok, outcome.message).toBe(true);
     expect(fs.existsSync(path.join(root, 'src', 'a.ts'))).toBe(true);
@@ -163,7 +163,7 @@ describe('per-attempt isolation (workflow level)', () => {
         return ok(t, { files_written: ['src/a.ts'], payload: { done: true, notes: '' } });
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const first = await runWorkflow(root, {}, d);
     expect(first.status).toBe('blocked');
     const second = await runWorkflow(root, {}, d);
@@ -176,7 +176,7 @@ describe('per-attempt isolation (workflow level)', () => {
     try {
       fs.writeFileSync(path.join(outside, 'victim.txt'), 'host secret\n');
       const d = deps(root);
-      await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+      await newWorkflow(root, { planFile: '@PLAN.md' }, d);
       // the operator (or a previous attempt) leaves a door out of the checkout
       fs.symlinkSync(path.join(outside, 'victim.txt'), path.join(root, 'leak.txt'));
       let dispatched = false;
@@ -209,7 +209,7 @@ describe('per-attempt isolation (workflow level)', () => {
         return ok(t, { payload: { approved: true, findings: [] } });
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toMatch(/read-only.*modified the checkout/);
@@ -232,10 +232,10 @@ describe('task lifecycle interruption at each transition', () => {
         throw new Error('host connection lost');
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
-    const planPath = path.join(milestoneDir(root), 'phases', '01-catalogo', 'PLAN.md');
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalog', 'PLAN.md');
     const plan = readPlan(planPath);
     expect(plan.tasks.find((t) => t.id === 'T01')!.status).toBe('FAILED');
     expect(plan.tasks.every((t) => !t.done)).toBe(true);
@@ -261,10 +261,10 @@ describe('task lifecycle interruption at each transition', () => {
       },
     };
     const d2 = { ...d, shell };
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d2);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d2);
     const first = await runWorkflow(root, {}, d2);
     expect(first.status).toBe('blocked');
-    const planPath = path.join(milestoneDir(root), 'phases', '01-catalogo', 'PLAN.md');
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalog', 'PLAN.md');
     const mid = readPlan(planPath);
     // implemented but NEVER promoted to done without verification
     expect(mid.tasks.every((t) => !t.done)).toBe(true);
@@ -279,7 +279,7 @@ describe('task lifecycle interruption at each transition', () => {
 
   it('every transition writes an append-only event BEFORE the plan projection', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, {}, d);
     const events = fs
       .readFileSync(path.join(root, '.rijo', 'events.jsonl'), 'utf8')
@@ -294,7 +294,7 @@ describe('task lifecycle interruption at each transition', () => {
 
   it('a requirement only becomes DONE with task, test, review and evidence linked', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, {}, d);
     const reqsRaw = fs.readFileSync(path.join(milestoneDir(root), 'REQUIREMENTS.md'), 'utf8');
     expect(reqsRaw).toContain('status: DONE');

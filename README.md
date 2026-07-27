@@ -1,236 +1,217 @@
 # RIJO
 
-Framework de contexto e execução autônoma para desenvolvedores freelancers.
-Converte um escopo fechado (um plano de desenvolvimento em Markdown) em
-contexto persistente, pesquisa técnica, fases executáveis, código verificado e
-evidências de prontidão.
+> A native agent workflow that turns an approved development plan into verified software.
 
-Prioridades, nesta ordem: confiabilidade verificável · poucos comandos ·
-automação sem perguntas desnecessárias · economia de tokens · recuperação
-segura após interrupções · independência de provedor · greenfield e brownfield.
+RIJO runs inside Codex or Claude Code. You invoke one `rijo` skill. The active
+host coordinates its native subagents. RIJO stores durable project memory in
+Markdown and JSON files under `.rijo/`.
 
-## Instalação
+RIJO keeps deterministic work in a TypeScript core. The core validates state,
+plans, write scopes, evidence, and recovery data. Agents make technical
+decisions and implement bounded tasks.
 
-Requisitos: Node.js ≥ 22 (Node 24 LTS recomendado) e Git.
+## Status
 
-> **Status: `0.1.0-alpha.1`.** Endurecido após auditoria de prontidão (ponte
-> host-core, política de comandos sem shell, escopo por diff real, evidência
-> obrigatória, milestones transacionais). Ainda alpha: use em projetos reais com
-> revisão humana dos commits. Veja `docs/readiness.md`.
+The current release is `0.1.0-alpha.1`.
+
+Use this alpha release with human review of generated commits. See
+[docs/readiness.md](docs/readiness.md) for the current readiness record.
+
+## Requirements
+
+- Node.js 22 or later. Node.js 24 Long-Term Support is recommended.
+- Git.
+- Codex or Claude Code with native subagent support.
+
+## Install
+
+Install RIJO as a local development dependency. This keeps the package version
+in your lockfile.
 
 ```bash
-# primeira execução sem instalação global
-npx rijo@0.1.0-alpha.1 new @PLANO.md
-
-# recomendado: dependência local fixada no lockfile
 npm install --save-dev rijo@alpha
-npx rijo run
-
-# conveniência pessoal (não define a versão canônica do projeto)
-npm install --global rijo@alpha
-rijo --status
 ```
 
-## Execução autônoma turnkey (`--host`)
-
-O RIJO não embarca um SDK de provedor, mas você não precisa programar um loop
-JSON-RPC. Passe `--host claude` ou `--host codex` (ou defina `host.provider` no
-`.rijo/config.yml`) e o RIJO detecta o CLI do host, monta o controlador de
-processo real, supervisiona cada tentativa (heartbeat, deadlines e orçamento de
-substituição da `config.supervisor`) e roda o workflow de ponta a ponta:
+Install the native skill:
 
 ```bash
-rijo map --host codex                    # mapeia brownfield antes do planejamento
-rijo run all --host claude              # executa todas as fases contra o Claude Code
-rijo new @PLANO.md --host codex --run    # cria o milestone e já executa, via Codex
-rijo check --host claude                 # decisão de prontidão turnkey
+npx rijo install
 ```
 
-- Precedência: a flag `--host` vence `host.provider`; sem nenhum dos dois o
-  provider é `none` (comportamento host-agnóstico anterior, inalterado).
-- Um CLI de host ausente **BLOQUEIA** com diagnóstico claro (exit code 3) —
-  nada é simulado. O progresso/heartbeat sai no **stderr**; o resultado final
-  `[rijo …]` sai no stdout, com exit codes coerentes (0 done, 3 blocked, 1 failed).
-- `--host` também está disponível em `rijo ui` e `rijo fix`.
+Select a host when you do not want automatic host detection:
 
-## Host bridge (API avançada para hosts externos)
+```bash
+npx rijo install --codex
+npx rijo install --claude
+```
 
-Um host que embute o RIJO diretamente pode falar a ponte JSON-RPC sobre stdio
-em vez de usar o modo turnkey:
+Select the installation scope:
+
+```bash
+npx rijo install --project
+npx rijo install --user
+```
+
+Project scope installs files in the current repository. User scope makes the
+skill available to your user account. You can combine one host flag with one
+scope flag.
+
+The Codex installer adds the `rijo` skill and its internal references. The
+Claude Code installer also adds its internal RIJO agents.
+
+## Quick start
+
+Use `$rijo` in Codex. Use `/rijo` in Claude Code.
+
+For a new project:
+
+```text
+$rijo new @PLAN.md
+$rijo start
+$rijo test
+$rijo finish
+```
+
+For an existing codebase that RIJO did not create:
+
+```text
+$rijo map-codebase
+$rijo new @PLAN.md
+$rijo start
+$rijo test
+$rijo finish
+```
+
+Use `map-codebase` before `new` only for an existing codebase. The `new`
+command does not run a full codebase map.
+
+## Native commands
+
+| Command | Result |
+|---|---|
+| `map-codebase` | Create or refresh the evidence-backed map for an existing codebase. |
+| `new @PLAN.md` | Create project context, requirements, architecture context, and the roadmap. |
+| `ui @input` | Import an approved design from an HTML file, a ZIP archive, or a directory. |
+| `start` | Plan, implement, verify, and review all incomplete roadmap phases. |
+| `test` | Run full product Quality Assurance with a browser or simulator. |
+| `fix "description"` | Reproduce and fix a later defect with a bounded workflow. |
+| `finish` | Verify and close the current milestone. |
+| `next @PLAN.md` | Start the next contract or milestone without losing history. |
+| `status` | Show the current project and workflow state. |
+| `resume` | Recover an interrupted workflow from durable state. |
+
+The `new` command creates context and a high-level roadmap. It does not
+implement source code. RIJO creates each detailed phase plan only when that
+phase starts.
+
+## Phase workflow
+
+The `start` command runs this sequence for each incomplete phase:
+
+```text
+PHASE_LOAD
+PHASE_RESEARCH
+PHASE_PLAN
+PLAN_REVIEW
+EXECUTE
+VERIFY
+ENGINEERING_REVIEW
+PHASE_DONE
+```
+
+Each phase uses a vertical slice. RIJO prefers existing project patterns and
+the simplest reversible design. RIJO records evidence before it marks a phase
+complete.
+
+## Project memory
+
+The `.rijo/` directory is the canonical project memory:
+
+```text
+.rijo/
+  PROJECT.md
+  REQUIREMENTS.md
+  ROADMAP.md
+  STATE.md
+  STACK.md
+  ARCHITECTURE.md
+  INTEGRATIONS.md
+  RULES.md
+  DECISIONS.md
+  config.yml
+  events.jsonl
+  codebase/
+  phases/
+  ui/
+  qa/
+  fixes/
+  milestones/
+  runtime/
+```
+
+Markdown and JSON artifacts are portable and reviewable. SQLite can provide an
+optional local ledger or cache. SQLite is not the only source of truth.
+
+## Autonomous decisions
+
+RIJO makes technical and reversible decisions without preference questions. It
+uses this order:
+
+1. Approved scope and acceptance criteria.
+2. Current behavior and tests.
+3. Codebase architecture and conventions.
+4. Security and data integrity.
+5. Official stack documentation.
+6. The simplest reversible option.
+7. Required scale for the current contract and the next likely milestone.
+
+RIJO asks one factual question only when a missing fact changes money,
+permissions, legal duties, production data, an external paid service, or an
+irreversible operation.
+
+## Quality and recovery
+
+RIJO enforces explicit write scopes and isolated attempt workspaces. It uses
+atomic writes, locks, leases, manifest hashes, and verified checkpoints.
+Interrupted work resumes from durable state.
+
+The `test` command runs real user journeys. Web projects use available browser
+tools. Mobile projects use an available simulator or emulator. The command
+records screenshots, traces, logs, defects, fixes, and reruns. It returns
+`READY`, `NOT_READY`, or `BLOCKED`.
+
+## Secondary automation adapters
+
+The native skill is the primary product interface. RIJO also keeps
+Command-Line Interface drivers for continuous integration and external
+automation. These drivers can start a headless Codex or Claude Code process.
+They are not the normal interactive workflow.
+
+RIJO also provides a line-delimited JavaScript Object Notation Remote Procedure
+Call bridge for external hosts:
 
 ```bash
 npx rijo serve --stdio
 ```
 
-O host dispara um workflow e responde cada tarefa do orquestrador:
+The bridge emits `AgentTask` requests and accepts validated `AgentResult`
+responses. See [docs/host-integrations.md](docs/host-integrations.md).
 
-```text
-host → core : {"type":"request","method":"workflow.run","id":1,"params":{"target":"all"}}
-core → host : {"type":"request","method":"agent.runTask","id":7,"params":<AgentTask>}
-host → core : {"type":"response","id":7,"result":<AgentResult>}
-core → host : {"type":"notification","method":"progress","params":{"line":"[RIJO M001 F01/02] EXECUTE ..."}}
-core → host : {"type":"response","id":1,"result":<WorkflowOutcome>}
-```
-
-Ou embarque programaticamente injetando um `AgentRunner`:
-
-```ts
-import { runWorkflow, type AgentRunner } from 'rijo';
-const outcome = await runWorkflow(process.cwd(), { target: 'all' }, { runner: myRunner });
-```
-
-Sem runtime vinculado, os workflows param com diagnóstico preciso — nunca
-simulam trabalho de agente.
-
-Antes da publicação no npm, instale por tag Git — mesmo CLI, mesmo layout:
-
-```bash
-npm install --save-dev git+https://github.com/<owner>/rijo.git#v0.1.0
-```
-
-## Os seis comandos
-
-```text
-rijo map                                # full, no-op ou incremental, decidido pelo core
-rijo map --full
-rijo map --paths src/auth,packages/api
-rijo map --query "validateSession"       # índice local; zero chamadas de modelo
-rijo map --status
-rijo new @PLANO.md                      # cria M001 a partir do plano
-rijo new @NOVO-PLANO.md --next          # sela o milestone atual e cria o próximo
-rijo new @PLANO.md --ui @design.zip --run
-rijo run                                # retoma do checkpoint (STATE.md)
-rijo run all | next | 03
-rijo ui @design.zip                     # importa design como referência visual
-rijo fix "descrição do problema" @log.txt
-rijo check [--fix] [--production]       # decisão READY/NOT_READY/BLOCKED
-
-# turnkey por host: adicione --host claude|codex a map/new/run/check/ui/fix
-rijo map --host codex
-rijo run all --host claude
-rijo new @PLANO.md --host codex --run
-```
-
-Invocações somente leitura (não planejam, não executam, não alteram contexto):
-
-```text
-rijo                 # painel resumido
-rijo --status        # snapshot legível
-rijo --status --json # snapshot para automação (schema estável)
-rijo --watch         # acompanha o status sem chamadas de modelo
-```
-
-## Como funciona
-
-- **Artefatos, não conversa.** A verdade vive em `.rijo/` — arquivos pequenos,
-  versionáveis e legíveis. `STATE.md` só avança em checkpoint verificado;
-  `runtime/status.json` é o estado volátil; `events.jsonl` é o log de auditoria.
-- **Código para determinismo, IA para julgamento.** Schemas, locks, escrita
-  atômica, cobertura requisito-fase-teste, extração segura de ZIP e detecção
-  de drift são código. Agentes fazem pesquisa, especificação, planejamento,
-  implementação e revisão — cada um com contexto fresco e brief explícito
-  (objetivo, arquivos, escopo de escrita, critérios, comandos, formato).
-- **Mapa brownfield dirigido por evidência.** `rijo map` inventaria sem ler
-  segredos, calcula histórico e dependências, divide módulos sem owner
-  duplicado, valida cada claim por path/hash/símbolo e promove os 20+ artefatos
-  de `.rijo/codebase/` por transação recuperável. `rijo new` cria ou atualiza
-  esse mapa sob o mesmo lock e envia ao planner somente o pacote de contexto
-  relacionado ao plano.
-- **Decisões autônomas formais.** A política `decisions` é injetada em
-  `map/new/run/ui/fix/check`: preserva arquitetura, prefere alternativas
-  simples e reversíveis e registra apenas decisões materiais em
-  `.rijo/DECISIONS.md`. Perguntas técnicas de preferência e menus de opções são
-  proibidos; somente fatos externos nas categorias de blocker permitidas podem
-  interromper o fluxo.
-- **Evidência antes de conclusão.** Nenhuma fase fecha sem comandos executados,
-  códigos de saída e commit registrados em `VERIFICATION.md`.
-- **Loops limitados.** 2 revisões de plano, 2 ciclos de review/reparo,
-  2 tentativas de QA-fix, 2 tentativas de fix rápido, 4 agentes paralelos,
-  2–4 tarefas por fase. Excedeu, bloqueia com diagnóstico.
-- **Milestones selados.** `rijo new --next` fecha o contrato atual
-  (COMPLETE/PARTIAL/SUPERSEDED/CANCELLED), gera `CLOSEOUT.md`, transfere
-  requisitos com `carried_from` e cria o próximo. Histórico imutável.
-
-## Máquina de estados do `rijo run`
-
-```text
-LOAD → RESEARCH_DELTA → SPEC_READY → PLAN → PLAN_LINT → PLAN_REVIEW
-     → EXECUTE → VERIFY → CODE_REVIEW → UI_SMOKE → PERSIST → COMMIT → DONE
-```
-
-Interrupções retomam do último checkpoint verificado sem repetir trabalho.
-
-## Agentes e modelos
-
-O core não conhece nomes de modelos. `.rijo/config.yml` mapeia papéis a tiers
-(veja `docs/models.md`):
-
-```yaml
-models:
-  lead: strongest
-  reviewer: strongest-independent
-  planner: balanced-reasoning
-  worker: economical-coding
-  researcher: economical-research
-  qa: economical-browser
-```
-
-O RIJO roda dentro de um runtime de agentes (Claude Code, Codex) através dos
-adapters instalados por `rijo new` — skills em `.claude/skills/` e
-`.agents/skills/`, blocos idempotentes em `CLAUDE.md`/`AGENTS.md` e uma status
-line que lê `.rijo/runtime/status.json`. Programaticamente, injete um
-`AgentRunner` próprio:
-
-```ts
-import { runWorkflow, type AgentRunner } from 'rijo';
-const outcome = await runWorkflow(process.cwd(), { target: 'all' }, { runner: myRunner });
-```
-
-Sem runtime vinculado, os workflows param com diagnóstico preciso — nunca
-simulam trabalho de agente.
-
-O mapa também está disponível na API pública (`mapWorkflow`,
-`ensureCodebaseMap`, `queryCodebaseMap`, schemas de mapa e decisão) e na ponte
-JSON-RPC como `workflow.map`. Veja [docs/codebase-map.md](docs/codebase-map.md).
-
-## Supervisão resiliente
-
-Cada tarefa despachada a um agente é supervisionada: liveness vem só de
-fatos de runtime (heartbeat/processo/conexão, nunca do texto do modelo),
-todo espera é limitada por deadline, e um host travado é cancelado por uma
-escada `requestCancel → forceTerminate → fencing` antes de ser substituído
-com identidade e workspace novos. Um orçamento esgotado termina em
-`BLOCKED` — nunca em loop infinito. Veja `docs/agent-supervisor.md`,
-`docs/agent-liveness.md`, `docs/host-cancellation.md`, `docs/recovery.md` e
-`docs/failure-injection.md`.
-
-## Expert profiles
-
-Um brief de agente pode receber uma lente técnica compacta e determinística
-— um **expert profile** — escolhida pelo roteador a partir de um catálogo
-de 10 perfis 100% originais do RIJO (nome, missão, checklist e
-anti-patterns próprios; nenhuma persona ou nome de terceiros). Veja
-`docs/expert-profiles.md`.
-
-## Exemplos
-
-- `examples/greenfield/` — plano completo que gera M001 com duas fases.
-- `examples/brownfield/` — como apontar o RIJO para um repositório existente.
-
-## Desenvolvimento
+## Development
 
 ```bash
 npm install
 npm run typecheck
-npm test          # unit + integração + golden + E2E com agent runner falso
-npm pack          # valida o tarball (prepack roda o build)
+npm test
+npm pack
 ```
 
-CI recomendado: testes → `npm pack` → instalar o tarball em fixture vazia →
-executar o CLI empacotado (o teste `tests/pack.e2e.test.ts` automatiza isso).
+The test suite uses deterministic fake runners by default. Gated live tests
+exercise the secondary host drivers.
 
-## Segurança e licenças
+## Security and license
 
-Veja `SECURITY.md` (política operacional: redaction, ZIP seguro, escopos de
-escrita, nunca deploy) e `THIRD_PARTY_NOTICES.md` (linhagem conceitual dos
-projetos de referência, todos MIT). RIJO é MIT.
+Read [SECURITY.md](SECURITY.md) for the operational security policy. Read
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for source attribution.
+
+RIJO uses the MIT License.

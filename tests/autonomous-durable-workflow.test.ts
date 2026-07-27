@@ -13,7 +13,7 @@ import {
   type WorkflowOutcome,
 } from '../src/workflows/shared.js';
 import { newWorkflow } from '../src/workflows/new.js';
-import { runWorkflow } from '../src/workflows/run.js';
+import { runWorkflow, startWorkflow } from '../src/workflows/run.js';
 import { checkWorkflow } from '../src/workflows/check.js';
 import { readManifest } from '../src/core/manifest.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
@@ -172,13 +172,13 @@ describe('durable workflow lifecycle', () => {
     expect(fs.existsSync(ctx.paths.lock)).toBe(false);
   });
 
-  it('resumes the same plan under --run without creating a duplicate milestone', async () => {
+  it('starts the existing milestone without creating a duplicate milestone', async () => {
     const root = tmpProject('rijo-durable-resume-');
     roots.push(root);
     writePlanFile(root);
     const engine = new RecordingDurableEngine();
     const d = deps(root);
-    const first = await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, durable: engine });
+    const first = await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, durable: engine });
     expect(first.ok, first.message).toBe(true);
     const before = readManifest(new RijoPaths(root))!;
 
@@ -187,18 +187,14 @@ describe('durable workflow lifecycle', () => {
       finalChecks++;
       return completed(ctx, 'Production readiness: READY.');
     };
-    const resumed = await newWorkflow(
-      root,
-      { planFile: '@PLANO.md', run: true },
-      { ...d, durable: engine, finalCheck },
-    );
+    const resumed = await startWorkflow(root, { ...d, durable: engine, finalCheck });
 
     expect(resumed.ok, resumed.message).toBe(true);
-    expect(finalChecks).toBe(1);
+    expect(finalChecks).toBe(0);
     const after = readManifest(new RijoPaths(root))!;
     expect(after.milestones).toHaveLength(before.milestones.length);
     expect(after.active_milestone).toBe(before.active_milestone);
-    expect(engine.terminals.at(-1)).toBe('READY');
+    expect(engine.terminals).not.toContain('READY');
   });
 
   it('requires --next when an existing active run has a different plan hash', async () => {
@@ -207,13 +203,13 @@ describe('durable workflow lifecycle', () => {
     writePlanFile(root);
     const engine = new RecordingDurableEngine();
     const d = deps(root);
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, durable: engine })).ok).toBe(true);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, durable: engine })).ok).toBe(true);
     const before = readManifest(new RijoPaths(root))!;
     const progressBeforeMismatch = engine.progress.length;
 
     const nextWhileSameRunActive = await newWorkflow(
       root,
-      { planFile: '@PLANO.md', next: true, run: true },
+      { planFile: '@PLAN.md', next: true, run: true },
       { ...d, durable: engine },
     );
     expect(nextWhileSameRunActive.status).toBe('blocked');
@@ -221,11 +217,11 @@ describe('durable workflow lifecycle', () => {
     expect(readManifest(new RijoPaths(root))!.milestones).toHaveLength(before.milestones.length);
     expect(engine.progress).toHaveLength(progressBeforeMismatch);
 
-    writePlanFile(root, 'NOVO-PLANO.md', '# Changed contract\n\nA genuinely new milestone.');
+    writePlanFile(root, 'NEW-PLAN.md', '# Changed contract\n\nA genuinely new milestone.');
 
     const outcome = await newWorkflow(
       root,
-      { planFile: '@NOVO-PLANO.md', run: true },
+      { planFile: '@NEW-PLAN.md', run: true },
       { ...d, durable: engine },
     );
 
@@ -237,7 +233,7 @@ describe('durable workflow lifecycle', () => {
 
     const nextWhileActive = await newWorkflow(
       root,
-      { planFile: '@NOVO-PLANO.md', next: true, run: true },
+      { planFile: '@NEW-PLAN.md', next: true, run: true },
       { ...d, durable: engine },
     );
     expect(nextWhileActive.status).toBe('blocked');
@@ -252,7 +248,7 @@ describe('durable workflow lifecycle', () => {
     writePlanFile(root);
     const engine = new RecordingDurableEngine();
     const d = deps(root);
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, durable: engine })).ok).toBe(true);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, durable: engine })).ok).toBe(true);
     const calls: Array<{ production?: boolean; fix?: boolean; lockPresent: boolean }> = [];
     const finalCheck = async (ctx: WorkflowContext, opts: { production?: boolean; fix?: boolean }): Promise<WorkflowOutcome> => {
       calls.push({ ...opts, lockPresent: fs.existsSync(ctx.paths.lock) });
@@ -279,7 +275,7 @@ describe('durable workflow lifecycle', () => {
     writePlanFile(root);
     const engine = new RecordingDurableEngine();
     const d = deps(root);
-    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, { ...d, durable: engine })).ok).toBe(true);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, durable: engine })).ok).toBe(true);
 
     await checkWorkflow(root, {}, { ...d, durable: engine });
 

@@ -15,6 +15,29 @@ export function exists(p: string): boolean {
   return fs.existsSync(p);
 }
 
+/**
+ * Reject a target that leaves an authorized root or traverses an existing
+ * symbolic-link segment. Use this check before provider installation writes.
+ */
+export function assertContainedWithoutSymlinks(root: string, target: string): void {
+  const authorizedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  const relative = path.relative(authorizedRoot, resolvedTarget);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Destination is outside the authorized root: ${resolvedTarget}`);
+  }
+
+  const segments = relative === '' ? [] : relative.split(path.sep);
+  let current = authorizedRoot;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if (!fs.existsSync(current)) break;
+    if (fs.lstatSync(current).isSymbolicLink()) {
+      throw new Error(`Destination contains a symbolic link: ${current}`);
+    }
+  }
+}
+
 export function readText(p: string): string {
   return fs.readFileSync(p, 'utf8');
 }

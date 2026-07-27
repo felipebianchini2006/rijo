@@ -115,7 +115,7 @@ export const BROWNFIELD_MAP_PLAN_CONTENT = [
 /**
  * Create a pristine fixture: fresh tmp dir, `npm init -y`, a package.json whose
  * only verification script is `node --test`, the installed tarball, a real git
- * repo with a local identity, a root .gitignore and the deterministic PLANO.md.
+ * repo with a local identity, a root .gitignore and the deterministic PLAN.md.
  * The RIJO config (`.rijo/config.yml`) is pre-seeded so `rijo new` runs on the
  * cheap all-haiku tiers from its very first (extraction) call.
  */
@@ -149,10 +149,10 @@ export function createFixture(tarball: string, prefix: string, configYaml: strin
   execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: root, encoding: 'utf8' });
 
   fs.writeFileSync(path.join(root, '.gitignore'), ['node_modules/', '*.tgz', ''].join('\n'));
-  fs.writeFileSync(path.join(root, 'PLANO.md'), PLAN_CONTENT);
+  fs.writeFileSync(path.join(root, 'PLAN.md'), PLAN_CONTENT);
   execFileSync(
     'git',
-    ['add', '.gitignore', 'PLANO.md', 'package.json', 'package-lock.json'],
+    ['add', '.gitignore', 'PLAN.md', 'package.json', 'package-lock.json'],
     { cwd: root, encoding: 'utf8' },
   );
   execFileSync(
@@ -186,7 +186,7 @@ export function createBrownfieldMapFixture(tarball: string, prefix: string, conf
       '',
     ].join('\n'),
   );
-  fs.writeFileSync(path.join(fixture.root, 'PLANO.md'), BROWNFIELD_MAP_PLAN_CONTENT);
+  fs.writeFileSync(path.join(fixture.root, 'PLAN.md'), BROWNFIELD_MAP_PLAN_CONTENT);
   execFileSync('git', ['add', '-A'], { cwd: fixture.root, encoding: 'utf8' });
   execFileSync('git', ['commit', '-m', 'feat: seed brownfield counter with history'], {
     cwd: fixture.root,

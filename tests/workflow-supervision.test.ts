@@ -64,7 +64,7 @@ describe('workflow supervision (P0.6 item 3)', () => {
     const d = deps(root, { planPayload: (p) => twoParallelTasks(p, phaseReqIds(root, p)) });
     // T02's agent hangs forever; the supervisor must bound it while T01 lands.
     d.runner.on((t) => t.id === 'exec-01-T02', () => new Promise<AgentResult>(() => {}));
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
 
     const outcome = await runWorkflow(root, {}, { ...d, supervisorConfig: fastSupervisor() });
 
@@ -86,7 +86,7 @@ describe('workflow supervision (P0.6 item 3)', () => {
       task_id: t.id, ok: false, summary: 'worker boom', files_written: [], payload: null, scope_requests: [],
       attempt_id: null, generation: null, lease_id: null,
     }));
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
 
     const outcome = await runWorkflow(root, {}, {
       ...d,

@@ -22,9 +22,9 @@ function localPlanPayload(phaseId: string) {
     tasks: [
       {
         id: 'T01',
-        name: 'Implementar módulo',
+        name: 'Implement module',
         requirement_ids: [reqId],
-        technical_justification: 'infra da fase',
+        technical_justification: 'phase infrastructure',
         files: ['src/a.ts'],
         mapped_references: [newMappedReference('src/a.ts')],
         write_scope: ['src/a.ts'],
@@ -32,14 +32,14 @@ function localPlanPayload(phaseId: string) {
         parallel: false,
         tdd: true,
         tests: ['echo test-a'],
-        evidence_expected: 'testes passam',
+        evidence_expected: 'tests pass',
         done: false,
       },
       {
         id: 'T02',
-        name: 'Integrar módulo',
+        name: 'Integrate module',
         requirement_ids: [reqId],
-        technical_justification: 'integração',
+        technical_justification: 'integration',
         files: ['src/b.ts'],
         mapped_references: [newMappedReference('src/b.ts')],
         write_scope: ['src/b.ts'],
@@ -47,7 +47,7 @@ function localPlanPayload(phaseId: string) {
         parallel: false,
         tdd: false,
         tests: [],
-        evidence_expected: 'build passa',
+        evidence_expected: 'build passes',
         done: false,
       },
     ],
@@ -131,7 +131,7 @@ function fakeHostResult(task: AgentTask, root: string): AgentResult {
     const specBase = task.workspace?.root ?? root;
     const specPath = path.isAbsolute(task.write_scope[0]!) ? task.write_scope[0]! : path.join(specBase, task.write_scope[0]!);
     fs.mkdirSync(path.dirname(specPath), { recursive: true });
-    fs.writeFileSync(specPath, `# Spec\n\nCenários observáveis de aceite.\n`, 'utf8');
+    fs.writeFileSync(specPath, `# Spec\n\nObservable acceptance scenarios.\n`, 'utf8');
     return okResult(task, { files_written: [task.write_scope[0]!] });
   }
   if (task.id.startsWith('map-shard-')) {
@@ -141,10 +141,10 @@ function fakeHostResult(task: AgentTask, root: string): AgentResult {
   if (task.id.startsWith('new-research')) {
     return okResult(task, {
       payload: {
-        summary: 'Node 24 é o Active LTS.',
+        summary: 'Node.js 24 is Active LTS.',
         sources: [
           {
-            claim: 'Node.js 24 é Active LTS',
+            claim: 'Node.js 24 is Active LTS',
             source: 'nodejs.org previous releases',
             url: 'https://nodejs.org/en/about/previous-releases',
             checked_at: '2026-07-23T00:00:00.000Z',
@@ -230,7 +230,7 @@ describe('host↔core JSON-RPC bridge', () => {
 
   it('drives rijo new to completion over the transport', async () => {
     const host = startHost(root);
-    const resp = await host.callWorkflow(1, 'workflow.new', { planFile: '@PLANO.md' });
+    const resp = await host.callWorkflow(1, 'workflow.new', { planFile: '@PLAN.md' });
 
     expect(resp.error).toBeUndefined();
     expect(resp.result).toBeTruthy();
@@ -270,7 +270,7 @@ describe('host↔core JSON-RPC bridge', () => {
 
   it('drives a subsequent rijo run at least through the first phase', async () => {
     const host = startHost(root);
-    const created = await host.callWorkflow(1, 'workflow.new', { planFile: '@PLANO.md' });
+    const created = await host.callWorkflow(1, 'workflow.new', { planFile: '@PLAN.md' });
     expect(created.result.ok, JSON.stringify(created)).toBe(true);
 
     const before = host.seenTasks.length;

@@ -42,7 +42,7 @@ describe('commit and evidence model (real git repository)', () => {
 
   it('C1 code commit has no self-hash; C2..seal contain only evidence metadata; tree ends clean', async () => {
     const d = { ...deps(root), git: new SystemGit() };
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok, outcome.message).toBe(true);
 
@@ -55,7 +55,7 @@ describe('commit and evidence model (real git repository)', () => {
     const seal = sealLine.split(' ')[0]!;
 
     // C1 contains the code and the phase state WITHOUT its own hash
-    const verificationAtC1 = git(root, ['show', `${c1}:.rijo/milestones/M001-loja-simples/phases/01-catalogo/VERIFICATION.md`]);
+    const verificationAtC1 = git(root, ['show', `${c1}:.rijo/milestones/M001-simple-store/phases/01-catalog/VERIFICATION.md`]);
     expect(verificationAtC1).toContain('tested_commit: null');
     const c1Files = git(root, ['show', '--name-only', '--pretty=format:', c1]).split('\n').filter(Boolean);
     expect(c1Files).toContain('src/a.ts');
@@ -63,21 +63,24 @@ describe('commit and evidence model (real git repository)', () => {
     // C2 points at C1 and touches ONLY allowed evidence metadata
     const c2Files = git(root, ['show', '--name-only', '--pretty=format:', c2]).split('\n').filter(Boolean);
     const allowed = [
-      '.rijo/milestones/M001-loja-simples/phases/01-catalogo/VERIFICATION.md',
-      '.rijo/milestones/M001-loja-simples/ROADMAP.md',
+      '.rijo/milestones/M001-simple-store/phases/01-catalog/VERIFICATION.md',
+      '.rijo/milestones/M001-simple-store/ROADMAP.md',
       '.rijo/STATE.md',
       '.rijo/manifest.json',
       '.rijo/MILESTONES.md',
+      '.rijo/REQUIREMENTS.md',
+      '.rijo/ROADMAP.md',
+      '.rijo/events.jsonl',
     ];
     for (const f of c2Files) expect(allowed, `illegal evidence path ${f}`).toContain(f);
-    const verificationAtC2 = git(root, ['show', `${c2}:.rijo/milestones/M001-loja-simples/phases/01-catalogo/VERIFICATION.md`]);
+    const verificationAtC2 = git(root, ['show', `${c2}:.rijo/milestones/M001-simple-store/phases/01-catalog/VERIFICATION.md`]);
     expect(verificationAtC2).toContain(`tested_commit: ${c1}`);
 
     // seal commit records the evidence commit id, evidence paths only
     const sealFiles = git(root, ['show', '--name-only', '--pretty=format:', seal]).split('\n').filter(Boolean);
     for (const f of sealFiles) expect(allowed).toContain(f);
     const finalVerification = fs.readFileSync(
-      path.join(milestoneDir(root), 'phases', '01-catalogo', 'VERIFICATION.md'),
+      path.join(milestoneDir(root), 'phases', '01-catalog', 'VERIFICATION.md'),
       'utf8',
     );
     const fm = parseFrontmatter<Record<string, unknown>>(finalVerification).data;
@@ -96,7 +99,7 @@ describe('commit and evidence model (real git repository)', () => {
     fs.mkdirSync(path.join(root, 'src'), { recursive: true });
     fs.writeFileSync(path.join(root, 'src', 'a.ts'), '// user work in progress\n');
     const d = { ...deps(root), git: new SystemGit() };
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(`${outcome.message} ${outcome.details?.join(' ')}`).toMatch(/pre-existing local changes/);
@@ -107,7 +110,7 @@ describe('commit and evidence model (real git repository)', () => {
 
   it('fix follows the same model: C1 fix commit, C2 evidence-only, verified range', async () => {
     const d = { ...deps(root), git: new SystemGit() };
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     d.runner
       .on(
         (t) => t.id.startsWith('fix-diagnose'),
@@ -121,17 +124,17 @@ describe('commit and evidence model (real git repository)', () => {
           fs.writeFileSync(path.join(base, 'src', 'fixed.ts'), '// fix\n');
           return ok(t, {
             payload: {
-              fixed: true, root_cause: 'off-by-one', change_summary: 'corrige limite', regression_test: 'tests/fixed.test.ts',
+              fixed: true, root_cause: 'off-by-one', change_summary: 'repair the limit', regression_test: 'tests/fixed.test.ts',
               regression_test_impossible_reason: null, verification_commands: ['npm test'], residual_risk: 'none',
             },
           });
         },
       );
-    const outcome = await fixWorkflow(root, { description: 'lista corta o último item' }, d);
+    const outcome = await fixWorkflow(root, { description: 'list truncates the last item' }, d);
     expect(outcome.ok, outcome.message).toBe(true);
 
     const log = git(root, ['log', '--pretty=%H %s']).split('\n');
-    const c1 = log.find((l) => l.includes('rijo(fix): lista'))!.split(' ')[0]!;
+    const c1 = log.find((l) => l.includes('rijo(fix): list'))!.split(' ')[0]!;
     const c2 = log.find((l) => l.includes('rijo(fix): evidence for'))!.split(' ')[0]!;
     const c2Files = git(root, ['show', '--name-only', '--pretty=format:', c2]).split('\n').filter(Boolean);
     expect(c2Files).toHaveLength(1);
@@ -148,11 +151,11 @@ describe('commit and evidence model (real git repository)', () => {
       const d = deps(noGitRoot);
       d.git.repo = false; // no repository at all
       d.git.init = () => false; // and initialization is unavailable (pure no-VCS mode)
-      await newWorkflow(noGitRoot, { planFile: '@PLANO.md' }, d);
+      await newWorkflow(noGitRoot, { planFile: '@PLAN.md' }, d);
       const outcome = await runWorkflow(noGitRoot, {}, d);
       expect(outcome.ok, outcome.message).toBe(true);
       const verification = fs.readFileSync(
-        path.join(milestoneDir(noGitRoot), 'phases', '01-catalogo', 'VERIFICATION.md'),
+        path.join(milestoneDir(noGitRoot), 'phases', '01-catalog', 'VERIFICATION.md'),
         'utf8',
       );
       const fm = parseFrontmatter<Record<string, unknown>>(verification).data;

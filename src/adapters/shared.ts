@@ -1,6 +1,7 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { exists, readTextIfExists, writeFileAtomic } from '../core/fsx.js';
+import { assertContainedWithoutSymlinks, exists, readTextIfExists, writeFileAtomic } from '../core/fsx.js';
 
 export const BEGIN = '<!-- RIJO:BEGIN -->';
 export const END = '<!-- RIJO:END -->';
@@ -24,56 +25,43 @@ export function upsertMarkerFile(filePath: string, blockBody: string): void {
   writeFileAtomic(filePath, upsertMarkerBlock(readTextIfExists(filePath), blockBody));
 }
 
+/** Validate every existing provider destination segment before installation. */
+export function assertProviderDestinationsSafe(root: string, destinations: string[]): void {
+  for (const destination of destinations) {
+    assertContainedWithoutSymlinks(root, destination);
+  }
+}
+
 /** The canonical instruction block injected into CLAUDE.md / AGENTS.md. */
 export function rijoInstructionBlock(): string {
   return [
-    '1. Leia `.rijo/STATE.md`.',
-    '2. Leia `.rijo/RULES.md`.',
-    '3. Leia a `SPEC.md` e a `PLAN.md` da fase ativa.',
-    '4. Para brownfield, carregue primeiro `.rijo/codebase/SUMMARY.md` e consulte os índices JSON; não carregue o mapa detalhado inteiro.',
-    '5. Carregue `.rijo/PROJECT.md`, `.rijo/STACK.md` e o `REQUIREMENTS.md` do milestone ativo somente quando a tarefa exigir.',
-    '6. Não marque trabalho como concluído sem evidência.',
-    '7. Resolva decisões técnicas reversíveis autonomamente pela política de `.rijo/config.yml`; nunca gere menus de opções.',
-    '8. Após uma tarefa verificada, atualize o estado por meio do protocolo RIJO (CLI `rijo`).',
+    'RIJO project memory is in `.rijo/`.',
     '',
-    hostBridgeNote(),
+    '1. Use `$rijo` for RIJO work in Codex. Use `/rijo` for RIJO work in Claude Code.',
+    '2. Read `.rijo/STATE.md` first when it exists.',
+    '3. Load only the active phase context.',
+    '4. Read `.rijo/RULES.md` before you change project files.',
+    '5. Use the codebase summary before you open detailed codebase map files.',
+    '6. Delegate bounded work to native subagents.',
+    '7. Create a durable task record before each delegation.',
+    '8. Record each native subagent result or failure.',
+    '9. Use worktree isolation for implementation writers when the host supports it.',
+    '10. Do not run `codex exec` from the native workflow.',
+    '11. Do not run `claude -p` from the native workflow.',
+    '12. Do not start a nested host process.',
+    '13. Do not claim completion without evidence.',
+    '14. Use deterministic RIJO helper commands only for state, validation, evidence, checkpoints, and recovery.',
+    '15. Resolve reversible technical decisions with `.rijo/config.yml` and `.rijo/DECISIONS.md`.',
+    '16. Use English for every RIJO host message and generated artifact.',
   ].join('\n');
 }
 
-/**
- * Host↔core bridge instructions injected into every adapter instruction block.
- * Turnkey mode (`rijo <cmd> --host …`) is the recommended path; the raw
- * `npx rijo serve --stdio` JSON-RPC protocol is documented afterward as the
- * advanced API for hosts that embed RIJO directly.
- */
+/** Compatibility export for callers that still import the old helper. */
 export function hostBridgeNote(): string {
   return [
-    '## Execução autônoma (turnkey)',
-    '',
-    'Para operar o RIJO de ponta a ponta com o seu próprio CLI, NÃO programe um loop de protocolo — use o comando turnkey e deixe o RIJO detectar o host, supervisionar cada tentativa e transmitir o progresso:',
-    '',
-    '```',
-    'rijo run all --host claude      # ou: --host codex',
-    'rijo new @PLANO.md --host claude --run',
-    '```',
-    '',
-    '- O host vem de `--host` ou de `host.provider` no `.rijo/config.yml` (default `none`).',
-    '- Um CLI de host ausente resulta em BLOCKED (exit 3) — nada é simulado. Progresso/heartbeat vão para o stderr; o resultado final `[rijo …]` sai no stdout.',
-    '',
-    '## Host bridge (API avançada para hosts externos)',
-    '',
-    'Um host que embute o RIJO diretamente pode, em vez disso, iniciar o processo bridge e falar JSON-RPC (uma mensagem JSON por linha) sobre stdio:',
-    '',
-    '```',
-    'npx rijo serve --stdio',
-    '```',
-    '',
-    '- Dispare um workflow enviando um request, ex.: `{"type":"request","method":"workflow.run","id":1,"params":{"target":"all"}}`',
-    '  (métodos: `workflow.map|new|run|ui|fix|check`; `params` carrega as opções do workflow e um `capabilities` opcional).',
-    '- O core responde cada tarefa com `{"type":"request","method":"agent.runTask","id":<n>,"params":<AgentTask>}`.',
-    '  Execute o subagente descrito e responda `{"type":"response","id":<n>,"result":{...AgentResult...}}` na mesma pipe.',
-    '- Progresso chega como `{"type":"notification","method":"progress","params":{"line":"..."}}` — nada não-JSON trafega no stdout.',
-    '- Ao final, o core envia `{"type":"response","id":<id-do-workflow>,"result":<WorkflowOutcome>}`.',
+    'The active Codex or Claude Code session is the RIJO orchestrator.',
+    'Use native subagents for delegated work.',
+    'Do not start another host process from a native RIJO workflow.',
   ].join('\n');
 }
 
@@ -86,8 +74,42 @@ export function packageRoot(): string {
 
 /** Load a canonical skill source shipped with the package. */
 export function loadSkillSource(name: string): string | null {
-  const p = path.join(packageRoot(), 'skills', `${name}.md`);
-  return exists(p) ? readTextIfExists(p) : null;
+  const canonical = path.join(packageRoot(), 'skills', name, 'SKILL.md');
+  if (exists(canonical)) return readTextIfExists(canonical);
+  const legacy = path.join(packageRoot(), 'skills', `${name}.md`);
+  return exists(legacy) ? readTextIfExists(legacy) : null;
+}
+
+/** Copy the canonical skill tree without following links or reading outside it. */
+export function installCanonicalSkill(destination: string): string[] {
+  const sourceRoot = path.join(packageRoot(), 'skills', 'rijo');
+  if (!exists(path.join(sourceRoot, 'SKILL.md'))) {
+    throw new Error('The canonical RIJO skill is missing from the package.');
+  }
+
+  const generated: string[] = [];
+  const copy = (sourceDir: string, destinationDir: string): void => {
+    const entries = [...requireDirectoryEntries(sourceDir)].sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const source = path.join(sourceDir, entry.name);
+      const target = path.join(destinationDir, entry.name);
+      if (entry.isDirectory()) {
+        copy(source, target);
+      } else if (entry.isFile()) {
+        const content = readTextIfExists(source);
+        if (content === null) throw new Error(`Skill source disappeared during installation: ${source}`);
+        writeFileAtomic(target, content);
+        generated.push(target);
+      }
+    }
+  };
+  copy(sourceRoot, destination);
+  return generated;
+}
+
+function requireDirectoryEntries(directory: string): import('node:fs').Dirent[] {
+  // Importing through the namespace keeps this helper synchronous like fsx.
+  return fs.readdirSync(directory, { withFileTypes: true });
 }
 
 export interface AdapterReport {

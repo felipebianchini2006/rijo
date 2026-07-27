@@ -4,7 +4,6 @@ import { writeFileAtomic } from '../core/fsx.js';
 
 const DURABLE_IGNORES = [
   'runtime/',
-  'events.jsonl',
   'state/rijo.db',
   'state/rijo.db-wal',
   'state/rijo.db-shm',

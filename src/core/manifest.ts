@@ -7,13 +7,25 @@ import type { RijoPaths } from './paths.js';
 export const RIJO_VERSION = '0.1.0-alpha.1';
 
 /** Global files tracked for drift detection, relative to .rijo/. */
-const TRACKED = ['PROJECT.md', 'RULES.md', 'STACK.md', 'MILESTONES.md', 'STATE.md', 'DECISIONS.md', 'config.yml'];
+const TRACKED = [
+  'PROJECT.md',
+  'REQUIREMENTS.md',
+  'ROADMAP.md',
+  'STACK.md',
+  'ARCHITECTURE.md',
+  'INTEGRATIONS.md',
+  'RULES.md',
+  'MILESTONES.md',
+  'STATE.md',
+  'DECISIONS.md',
+  'config.yml',
+];
 
 /** Per-milestone canonical artifacts tracked for drift. */
 const MILESTONE_TRACKED = ['SCOPE.md', 'REQUIREMENTS.md', 'ROADMAP.md', 'RESEARCH.md', 'CLOSEOUT.md'];
 
 /** Per-phase canonical artifacts tracked for drift. */
-const PHASE_TRACKED = ['SPEC.md', 'PLAN.md', 'VERIFICATION.md', 'REVIEW.md'];
+const PHASE_TRACKED = ['RESEARCH.md', 'SPEC.md', 'PLAN.md', 'VERIFICATION.md', 'REVIEW.md'];
 
 /**
  * Overlay of not-yet-written contents keyed by path relative to `.rijo/`.

@@ -1,3 +1,3 @@
 # Spec
 
-Cenários observáveis de aceite.
+Observable acceptance scenarios.

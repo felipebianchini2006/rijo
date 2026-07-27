@@ -91,7 +91,7 @@ describe('serve() workflow deadline — unwind before response, queue stays bloc
       // first agent call and must be released by the deadline.
       void serve(t, root, { workflowDeadlineMs: 150, workflowUnwindMarginMs: 5_000, shutdownGraceMs: 50, installSignalHandlers: false });
 
-      t.deliver({ type: 'request', method: 'workflow.new', id: 1, params: { planFile: '@PLANO.md' } });
+      t.deliver({ type: 'request', method: 'workflow.new', id: 1, params: { planFile: '@PLAN.md' } });
 
       const r1 = await responded(1);
       expect(r1.error).toBe('WORKFLOW_DEADLINE_EXCEEDED');
@@ -145,8 +145,8 @@ describe('serve() workflow deadline — unwind before response, queue stays bloc
       void serve(t, root, { workflowDeadlineMs: 150, workflowUnwindMarginMs: 5_000, shutdownGraceMs: 50, installSignalHandlers: false });
 
       // Enqueue both requests back-to-back, before either is answered.
-      t.deliver({ type: 'request', method: 'workflow.new', id: 1, params: { planFile: '@PLANO.md' } });
-      t.deliver({ type: 'request', method: 'workflow.new', id: 2, params: { planFile: '@PLANO.md' } });
+      t.deliver({ type: 'request', method: 'workflow.new', id: 1, params: { planFile: '@PLAN.md' } });
+      t.deliver({ type: 'request', method: 'workflow.new', id: 2, params: { planFile: '@PLAN.md' } });
 
       const r1 = await responded(1);
       expect(r1.error).toBe('WORKFLOW_DEADLINE_EXCEEDED');

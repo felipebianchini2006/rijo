@@ -9,7 +9,7 @@ transactions (`src/core/txn.ts`, reconciled inside `withLock`,
 
 ## Milestone transaction reconciliation
 
-Every milestone transition (`rijo new --next`) stages its artifacts under
+Every milestone transition (`$rijo next @PLAN.md`) stages its artifacts under
 `.rijo/runtime/transactions/<txn-id>/` **before** touching anything else in
 the project. The single atomic commit point is a fsync'd `commit.json`
 marker (`MilestoneTransaction.commitPoint()`). Nothing outside the runtime
@@ -30,7 +30,7 @@ crash at **any** injection point (staging a file, the commit marker itself,
 applying a file, or the final `finish()`) leaves either zero observable
 change or a deterministically completed transition — never a partial one.
 `tests/milestone-txn.test.ts` verifies this by injecting a crash after
-*every* durable write recorded during one real `--next` run and asserting
+*every* durable write recorded during one real milestone transition and asserting
 both invariants for every single injection point (see `docs/failure-injection.md`).
 
 `STATE.md` is untouched by any of this — it only ever advances on a
@@ -136,8 +136,7 @@ a fixed hold:
   else already reclaimed it — so a stale holder can never delete a lease
   it no longer owns.
 
-Together, transaction reconciliation, task reconciliation and lock
-reconciliation mean a crash at any point in `rijo new`, `rijo run`,
-`rijo fix`, `rijo ui`, or `rijo check` leaves the project in a state the
-next invocation can always safely resume from — never a state that requires
-manual repair.
+Together, transaction, task, and lock reconciliation protect every native
+workflow. A crash during `new`, `start`, `fix`, `ui`, `test`, `finish`, or
+`next` leaves recoverable durable state. Use `$rijo resume` or `/rijo resume`
+to continue.

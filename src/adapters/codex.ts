@@ -6,9 +6,20 @@ import type { ModelRole } from '../core/schemas/index.js';
 import { resolveCodexTier } from '../agents/roles.js';
 import { EXPERT_PROFILES } from '../experts/catalog.js';
 import { renderProfileBrief } from '../experts/embed.js';
-import { upsertMarkerFile, rijoInstructionBlock, loadSkillSource, type AdapterReport } from './shared.js';
+import {
+  installCanonicalSkill,
+  loadSkillSource,
+  rijoInstructionBlock,
+  assertProviderDestinationsSafe,
+  upsertMarkerFile,
+  type AdapterReport,
+} from './shared.js';
 
-const SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
+const LEGACY_SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo-check'] as const;
+
+export interface CodexAdapterOptions {
+  scope?: 'project' | 'user';
+}
 
 /**
  * Codex adapter: repository skills in .agents/skills/, idempotent AGENTS.md
@@ -16,16 +27,31 @@ const SKILLS = ['rijo-map', 'rijo-new', 'rijo-run', 'rijo-ui', 'rijo-fix', 'rijo
  * without it, progress flows through chat messages, stdout and
  * .rijo/runtime/status.json — never pretending a native integration was used.
  */
-export function generateCodexAdapter(projectRoot: string): AdapterReport {
+export function generateCodexAdapter(projectRoot: string, options: CodexAdapterOptions = {}): AdapterReport {
   const report: AdapterReport = { generated: [], skipped: [], notes: [] };
+  const scope = options.scope ?? 'project';
+  const skillsRoot = path.join(projectRoot, '.agents', 'skills');
+  const instructionFile =
+    scope === 'user' ? path.join(projectRoot, '.codex', 'AGENTS.md') : path.join(projectRoot, 'AGENTS.md');
+  assertProviderDestinationsSafe(projectRoot, [
+    path.join(projectRoot, '.agents'),
+    path.join(projectRoot, '.agents', 'skills'),
+    path.join(projectRoot, '.agents', 'experts'),
+    instructionFile,
+  ]);
 
-  for (const skill of SKILLS) {
+  for (const file of installCanonicalSkill(path.join(skillsRoot, 'rijo'))) {
+    report.generated.push(relativeReportPath(projectRoot, file));
+  }
+
+  // Keep the one-release aliases small. The canonical tree owns all behavior.
+  for (const skill of LEGACY_SKILLS) {
     const source = loadSkillSource(skill);
     if (!source) {
       report.skipped.push(`skill ${skill} (source missing in package)`);
       continue;
     }
-    const dir = path.join(projectRoot, '.agents', 'skills', skill);
+    const dir = path.join(skillsRoot, skill);
     ensureDir(dir);
     writeFileAtomic(path.join(dir, 'SKILL.md'), source);
     report.generated.push(`.agents/skills/${skill}/SKILL.md`);
@@ -67,18 +93,22 @@ export function generateCodexAdapter(projectRoot: string): AdapterReport {
   const codexNotes = [
     rijoInstructionBlock(),
     '',
-    'Progresso observável (Codex):',
-    '- Publique marcadores curtos de transição no chat: `[RIJO M002 F03/05] EXECUTE T02/04  mensagem`.',
-    '- Use subagentes e threads nativos quando disponíveis; mantenha-os inspecionáveis.',
-    '- Com App Server disponível, aproveite streaming de itens e tool progress; sem ele, use chat, stdout e `.rijo/runtime/status.json`.',
-    '- Nunca afirme que uma integração nativa foi usada quando não estava disponível.',
-    '- Host bridge: para execução autônoma, gere `npx rijo serve --stdio` e fale o JSON-RPC descrito acima (veja a seção "Host bridge") — dispare `workflow.*` e responda cada `agent.runTask` com um AgentResult.',
+    '## Codex progress',
+    '',
+    '- Publish one short transition message for each RIJO stage change.',
+    '- Use this format: `[RIJO M002 F03/05] EXECUTE T02/04  Integrate the payment gateway.`',
+    '- Keep each native subagent bounded and inspectable.',
+    '- Record a recoverable lease when the host cannot stop a failed subagent.',
   ].join('\n');
-  upsertMarkerFile(path.join(projectRoot, 'AGENTS.md'), codexNotes);
-  report.generated.push('AGENTS.md (RIJO block)');
+  upsertMarkerFile(instructionFile, codexNotes);
+  report.generated.push(`${relativeReportPath(projectRoot, instructionFile)} (RIJO block)`);
   return report;
 }
 
 export function detectCodex(projectRoot: string): boolean {
   return exists(path.join(projectRoot, '.agents')) || exists(path.join(projectRoot, '.codex'));
+}
+
+function relativeReportPath(root: string, file: string): string {
+  return path.relative(root, file).split(path.sep).join('/');
 }

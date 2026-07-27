@@ -50,7 +50,7 @@ describe('rijo check', () => {
 
   it('is BLOCKED when browser capability is missing — never READY by inference', async () => {
     const d = deps(root); // browser: false
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await checkWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     const report = fs.readFileSync(readinessPath(root), 'utf8');
@@ -61,7 +61,7 @@ describe('rijo check', () => {
   it('all valid gates produce READY with pinned commit and evidence', async () => {
     const d = deps(root, { capabilities: { browser: true } });
     prepareReadyProject(root, d);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, { target: 'all' }, d); // requirements become DONE
     wireJourneys(d, () => ({}));
     const outcome = await checkWorkflow(root, {}, d);
@@ -74,7 +74,7 @@ describe('rijo check', () => {
 
   it('a console error in a critical flow prevents READY', async () => {
     const d = deps(root, { capabilities: { browser: true } });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     wireJourneys(d, (id) => (id === 'J01' ? { console_errors: ['TypeError: cannot read products'] } : {}));
     const outcome = await checkWorkflow(root, {}, d);
     expect(outcome.ok).toBe(false);
@@ -85,7 +85,7 @@ describe('rijo check', () => {
 
   it('a 5xx network error prevents READY', async () => {
     const d = deps(root, { capabilities: { browser: true } });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     wireJourneys(d, (id) => (id === 'J02' ? { network_errors: ['POST /api/checkout → 500'] } : {}));
     const outcome = await checkWorkflow(root, {}, d);
     expect(outcome.ok).toBe(false);
@@ -94,23 +94,23 @@ describe('rijo check', () => {
 
   it('a relevant visual finding appears in the report', async () => {
     const d = deps(root, { capabilities: { browser: true } });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     wireJourneys(d, () => ({}));
     d.runner.on(
       (t) => t.id === 'check-visual',
-      (t) => ok(t, { payload: { findings: [{ severity: 'high', description: 'botão de checkout desalinhado no mobile', evidence: null }] } }),
+      (t) => ok(t, { payload: { findings: [{ severity: 'high', description: 'checkout button is misaligned on mobile', evidence: null }] } }),
     );
     const outcome = await checkWorkflow(root, {}, d);
     expect(outcome.ok).toBe(false);
     const report = fs.readFileSync(readinessPath(root), 'utf8');
-    expect(report).toContain('desalinhado');
+    expect(report).toContain('checkout button is misaligned on mobile');
     expect(report).toContain('[high]');
   });
 
   it('--fix groups failures and re-runs only failing journeys, bounded at 2 rounds', async () => {
     const d = deps(root, { capabilities: { browser: true } });
     prepareReadyProject(root, d);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, { target: 'all' }, d);
     let fixed = false;
     d.runner.on(
@@ -121,7 +121,7 @@ describe('rijo check', () => {
         return ok(t, {
           payload: {
             journey_id: id, passed: !failing, steps: [], console_errors: [], network_errors: [],
-            findings: failing ? [{ severity: 'high', description: 'busca não retorna resultados', evidence: null }] : [],
+            findings: failing ? [{ severity: 'high', description: 'search does not return results', evidence: null }] : [],
             screenshots: [],
           },
         });
@@ -131,7 +131,7 @@ describe('rijo check', () => {
       (t) => t.id.startsWith('check-fix-'),
       (t) => {
         fixed = true;
-        return ok(t, { payload: { done: true, notes: 'causa raiz corrigida' } });
+        return ok(t, { payload: { done: true, notes: 'root cause repaired' } });
       },
     );
     const outcome = await checkWorkflow(root, { fix: true }, d);

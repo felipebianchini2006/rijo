@@ -10,12 +10,12 @@ import { tmpProject, cleanup, writePlanFile, deps, EXTRACTION_PAYLOAD } from './
 
 const M2_EXTRACTION = {
   ...EXTRACTION_PAYLOAD,
-  project_name: 'Pagamentos e Assinatura',
+  project_name: 'Payments and Subscriptions',
   requirements: [
-    { description: 'Assinatura recorrente', acceptance: 'Usuário assina plano mensal', non_functional: false, classification: 'NEW' },
+    { description: 'Recurring subscription', acceptance: 'User starts a monthly subscription', non_functional: false, classification: 'NEW' },
   ],
-  phases: [{ name: 'Assinaturas', requirement_indexes: [0], depends_on_indexes: [], ui_surface: false }],
-  research_topics: [{ key: 'node-lts', topic: 'Node.js LTS recomendado', volatile: true }],
+  phases: [{ name: 'Subscriptions', requirement_indexes: [0], depends_on_indexes: [], ui_surface: false }],
+  research_topics: [{ key: 'node-lts', topic: 'Recommended Node.js LTS', volatile: true }],
 };
 
 describe('milestone cycle', () => {
@@ -23,13 +23,13 @@ describe('milestone cycle', () => {
   beforeEach(() => {
     root = tmpProject();
     writePlanFile(root);
-    writePlanFile(root, 'PLANO2.md', '# Plano M002\n\nPagamentos e assinatura.\n');
+    writePlanFile(root, 'PLAN-2.md', '# Plan M002\n\nPayments and subscriptions.\n');
   });
   afterEach(() => cleanup(root));
 
   it('seals a completed M001 as COMPLETE and M001 stays unchanged after M002 exists', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, { target: 'all' }, d); // completes all requirements
 
     const paths = new RijoPaths(root);
@@ -39,7 +39,7 @@ describe('milestone cycle', () => {
 
     const headBeforeNext = d.git.headCommit()!;
     const d2 = { ...deps(root, { extraction: M2_EXTRACTION }), git: d.git };
-    const outcome = await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, d2);
+    const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, d2);
     expect(outcome.ok, outcome.message).toBe(true);
 
     const manifest = readManifest(paths)!;
@@ -57,10 +57,10 @@ describe('milestone cycle', () => {
 
   it('closes an incomplete milestone as PARTIAL, never COMPLETE, and carries requirements with carried_from', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d); // requirements stay PENDING (no run)
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d); // requirements stay PENDING (no run)
 
     const d2 = deps(root, { extraction: M2_EXTRACTION });
-    const outcome = await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, d2);
+    const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, d2);
     expect(outcome.ok, outcome.message).toBe(true);
 
     const paths = new RijoPaths(root);
@@ -84,20 +84,20 @@ describe('milestone cycle', () => {
 
   it('blocks --next when unknown local changes exist (never discards or stashes)', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const d2 = deps(root, { extraction: M2_EXTRACTION });
     d2.git.dirty = ['src/unknown-edit.ts'];
-    const outcome = await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, d2);
+    const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, d2);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toContain('never be discarded');
   });
 
   it('delta research reuses the cache on the next milestone', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, { target: 'all' }, d);
     const d2 = deps(root, { extraction: M2_EXTRACTION });
-    await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, d2);
+    await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, d2);
     // same research key was cached in M001 → no researcher spawned in M002
     expect(d2.runner.executed.filter((t) => t.id.startsWith('new-research'))).toHaveLength(0);
   });
@@ -108,10 +108,10 @@ describe('milestone cycle', () => {
       (t) => t.id === 'exec-01-T02',
       (t) => ({ task_id: t.id, ok: false, summary: 'interrupted', files_written: [], payload: null, scope_requests: [] }),
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, {}, d); // blocks mid-phase, checkpoint stays open at EXECUTE
     const d2 = deps(root, { extraction: M2_EXTRACTION });
-    const outcome = await newWorkflow(root, { planFile: '@PLANO2.md', next: true }, d2);
+    const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, d2);
     expect(outcome.status).toBe('blocked');
     expect(outcome.details?.join(' ')).toContain('rijo run');
   });

@@ -129,7 +129,7 @@ export async function fixWorkflow(
     }
 
     // ---- repair (bounded by fix_attempts) with regression test
-    bus.emit('fix.repair', { stage: 'REPAIR', message: 'aplicando a menor correção coerente' });
+    bus.emit('fix.repair', { stage: 'REPAIR', message: 'Apply the smallest coherent fix.' });
     // baseline before any edit, so the commit stages only what the fix changed
     const fixBaseline = snapshotFiles(projectRoot);
     let repair: z.infer<typeof RepairSchema> | null = null;
@@ -256,7 +256,7 @@ export async function fixWorkflow(
       }
     }
     markCodebasePathsStale(paths, changedApplicationPaths, `verified fix ${slug || 'fix'}`, now);
-    bus.emit('fix.done', { status: 'completed', message: `correção verificada${commit ? ` (commit ${commit.slice(0, 8)})` : ''}` });
+    bus.emit('fix.done', { status: 'completed', message: `Fix verified${commit ? ` (commit ${commit.slice(0, 8)})` : ''}.` });
     return completed(ctx, `Fix done: ${repair.change_summary}${commit ? ` (tested commit ${commit})` : ''}.`, [
       `Record: ${path.relative(projectRoot, fixPath)}`,
     ]);

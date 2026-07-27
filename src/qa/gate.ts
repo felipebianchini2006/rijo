@@ -80,7 +80,7 @@ function requiresBrowserGate(
   );
   const webScript = Boolean(pkg?.scripts?.['dev'] || pkg?.scripts?.['start']);
   const browserAcceptance = Object.values(acceptanceById).some((text) =>
-    /\b(?:browser|page|screen|viewport|desktop|mobile|click|form|frontend|ui|web|navegador|página|tela|responsiv|botão|formulário)\b/i.test(text),
+    /\b(?:browser|page|screen|viewport|desktop|mobile|click|form|frontend|ui|web|responsive|button)\b/i.test(text),
   );
   return webDependency || webScript || browserAcceptance;
 }
@@ -110,7 +110,9 @@ export async function runProductionGate(
   const qaRelPre = path.relative(projectRoot, deps.qaDir).split(path.sep).join('/');
   const status = git.status(projectRoot);
   if (!status.isRepo) return blockedReport(['No git repository: the production gate certifies an exact commit.']);
-  const dirtyForeign = status.dirtyFiles.filter((f) => !f.startsWith(`${qaRelPre}/traces/`));
+  const dirtyForeign = status.dirtyFiles.filter(
+    (f) => !f.startsWith(`${qaRelPre}/traces/`) && f !== '.rijo/events.jsonl',
+  );
   if (dirtyForeign.length > 0) {
     return blockedReport([
       `Working tree is dirty (${dirtyForeign.length} files); commit or revert before the gate.`,
@@ -159,7 +161,7 @@ export async function runProductionGate(
       return blockedReport(['Target project does not declare @playwright/test; the gate cannot run real browser journeys.'], commit);
     }
     if (exists(path.join(gateDir, 'package-lock.json'))) {
-      deps.emit('gate.install', 'instalando dependências de forma reproduzível (npm ci --ignore-scripts)');
+      deps.emit('gate.install', 'Installing dependencies with npm ci --ignore-scripts.');
       const ev = deps.shell.run('npm ci --no-audit --no-fund', { cwd: gateDir, allowInstall: true, timeoutMs: 10 * 60 * 1000 });
       commands.push(ev);
       if (ev.exit_code !== 0) {
@@ -176,7 +178,7 @@ export async function runProductionGate(
       const installCommand = `playwright install ${qa.browsers.join(' ')}`;
       deps.emit(
         'gate.install',
-        `provisionando browsers da versão travada do projeto (${qa.browsers.join(', ')})`,
+        `Installing the locked browser versions: ${qa.browsers.join(', ')}.`,
       );
       const browserInstall = deps.shell.run(installCommand, {
         cwd: gateDir,
@@ -259,7 +261,7 @@ export async function runProductionGate(
     fs.writeFileSync(pwConfigPath, renderPlaywrightConfig(specDir, artifactsDir, resultsPath, config));
 
     // ---- 7: start the application and wait for health
-    deps.emit('gate.server', `iniciando aplicação: ${qa.start_command.join(' ')}`);
+    deps.emit('gate.server', `Starting the application: ${qa.start_command.join(' ')}`);
     serverLogPath = path.join(evidenceDir, 'server.log');
     const serverLog = fs.openSync(serverLogPath, 'w');
     const serverEnv = { ...buildEnv(gateDir, config.execution), NODE_ENV: 'test' };
@@ -286,7 +288,10 @@ export async function runProductionGate(
     }
 
     // ---- 8: REAL Playwright execution with structured (json) results
-    deps.emit('gate.playwright', `executando ${specs.length} jornadas em ${qa.browsers.join(', ')} × ${qa.viewports.map((v) => v.name).join(', ')}`);
+    deps.emit(
+      'gate.playwright',
+      `Running ${specs.length} journeys on ${qa.browsers.join(', ')} for ${qa.viewports.map((v) => v.name).join(', ')}.`,
+    );
     const pwBin = path.join(gateDir, 'node_modules', '.bin', process.platform === 'win32' ? 'playwright.cmd' : 'playwright');
     if (!exists(pwBin)) {
       return { ...blockedReport(['Playwright binary missing from the checkout node_modules.'], commit), commands, server_log: serverLogPath };
@@ -333,7 +338,9 @@ export async function runProductionGate(
     // own evidence files (qa/), which the caller commits as evidence.
     const after = git.status(projectRoot);
     const headAfter = git.headCommit(projectRoot);
-    const foreignDirty = after.dirtyFiles.filter((f) => !f.startsWith(`${qaRelPre}/traces/`));
+    const foreignDirty = after.dirtyFiles.filter(
+      (f) => !f.startsWith(`${qaRelPre}/traces/`) && f !== '.rijo/events.jsonl',
+    );
     if (headAfter !== commit || foreignDirty.length > 0) {
       return {
         ...blockedReport(

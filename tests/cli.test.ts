@@ -46,17 +46,14 @@ describe('runCli', () => {
     expect(code).toBe(2);
   });
 
-  it('production CLI wiring opens the real durable SQLite engine without an injected test runtime', async () => {
+  it('public native CLI routing refuses to start an unbound agent runtime', async () => {
     writePlanFile(root);
 
-    // No fake runner/executor/deps: this is the same dependency path used by
-    // the packaged CLI. The unbound planner fails, but durable startup must be
-    // real and recoverable — never silently replaced with memory persistence.
-    const code = await runCli(['new', '@PLANO.md'], {}, root);
+    const code = await runCli(['new', '@PLAN.md'], {}, root);
 
-    expect(code).toBe(1);
-    expect(fs.existsSync(path.join(root, '.rijo', 'state', 'rijo.db'))).toBe(true);
-    expect(fs.existsSync(path.join(root, '.rijo', '.gitignore'))).toBe(true);
+    expect(code).toBe(3);
+    expect(logged()).toContain('The native host must orchestrate this command.');
+    expect(fs.existsSync(path.join(root, '.rijo'))).toBe(false);
   });
 
   it('--version prints 0.1.0-alpha.1', async () => {
@@ -67,7 +64,7 @@ describe('runCli', () => {
 
   it('--status --json after init is schema-stable', async () => {
     writePlanFile(root);
-    const outcome = await newWorkflow(root, { planFile: 'PLANO.md' }, deps(root));
+    const outcome = await newWorkflow(root, { planFile: 'PLAN.md' }, deps(root));
     expect(outcome.ok).toBe(true);
 
     log.mockClear();
@@ -76,7 +73,7 @@ describe('runCli', () => {
 
     const parsed = JSON.parse(logged());
     expect(Object.keys(parsed).sort()).toEqual(
-      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'milestones', 'runtime', 'checkpoint', 'supervisor', 'codebase'].sort(),
+      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'active_phase_dir', 'milestones', 'runtime', 'checkpoint', 'supervisor', 'codebase'].sort(),
     );
     expect(parsed.schema_version).toBe(3);
     expect(parsed.rijo_version).toBe('0.1.0-alpha.1');
@@ -87,6 +84,18 @@ describe('runCli', () => {
     expect(parsed.milestones[0]).toMatchObject({ id: 'M001' });
     expect(parsed).toHaveProperty('runtime');
     expect(parsed).toHaveProperty('checkpoint');
+  });
+
+  it('internal recovery reconciles state without entering an agent workflow', async () => {
+    writePlanFile(root);
+    const runtime = deps(root);
+    expect((await newWorkflow(root, { planFile: 'PLAN.md' }, runtime)).ok).toBe(true);
+
+    log.mockClear();
+    const code = await runCli(['internal', 'recovery'], runtime, root);
+
+    expect(code).toBe(0);
+    expect(logged()).toContain('Native workflow state recovered.');
   });
 
   it('supports map full, status, and zero-model query from the CLI', async () => {

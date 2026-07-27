@@ -3,7 +3,6 @@ dist/
 *.tgz
 coverage/
 .rijo/runtime/
-.rijo/events.jsonl
 .rijo/state/rijo.db
 .rijo/state/rijo.db-wal
 .rijo/state/rijo.db-shm

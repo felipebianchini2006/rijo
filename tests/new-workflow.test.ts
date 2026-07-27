@@ -40,7 +40,7 @@ describe('rijo new (greenfield)', () => {
 
   it('creates full context, requirements, roadmap and state from a PLAN.md', async () => {
     const d = deps(root);
-    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     expect(outcome.ok).toBe(true);
 
     const paths = new RijoPaths(root);
@@ -73,7 +73,7 @@ describe('rijo new (greenfield)', () => {
     configured.context_budget_bytes = 12_345;
     saveConfig(paths, configured);
 
-    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, deps(root));
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, deps(root));
 
     expect(outcome.ok).toBe(true);
     expect(loadConfig(paths).context_budget_bytes).toBe(12_345);
@@ -109,7 +109,7 @@ describe('rijo new (greenfield)', () => {
       }),
     );
 
-    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, d);
 
     expect(outcome.ok, outcome.message).toBe(true);
     const correction = d.runner.executed.find((task) => task.id === 'new-extract-r1');
@@ -119,9 +119,9 @@ describe('rijo new (greenfield)', () => {
 
   it('refuses re-initialization without --next (non-destructive)', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const before = fs.readFileSync(new RijoPaths(root).manifest, 'utf8');
-    const second = await newWorkflow(root, { planFile: '@PLANO.md' }, deps(root));
+    const second = await newWorkflow(root, { planFile: '@PLAN.md' }, deps(root));
     expect(second.ok).toBe(false);
     expect(second.status).toBe('blocked');
     expect(second.details?.join(' ')).toContain('--next');
@@ -134,7 +134,7 @@ describe('rijo new (greenfield)', () => {
   });
 
   it('records research sources for volatile decisions', async () => {
-    await newWorkflow(root, { planFile: '@PLANO.md' }, deps(root));
+    await newWorkflow(root, { planFile: '@PLAN.md' }, deps(root));
     const paths = new RijoPaths(root);
     const sources = JSON.parse(fs.readFileSync(paths.researchSources, 'utf8'));
     expect(sources.sources.length).toBeGreaterThan(0);
@@ -159,18 +159,16 @@ describe('rijo new (brownfield)', () => {
   });
   afterEach(() => cleanup(root));
 
-  it('detects stack and commands without rewriting the project', async () => {
+  it('requires an explicit codebase map without rewriting the project', async () => {
     const d = deps(root);
-    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, d);
-    expect(outcome.ok).toBe(true);
-    const stack = fs.readFileSync(new RijoPaths(root).stack, 'utf8');
-    expect(stack).toContain('BROWNFIELD');
-    expect(stack).toContain('express');
-    expect(stack).toContain('npm run build');
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toBe(
+      'Run `$rijo map-codebase`, then run `$rijo new @PLAN.md` again.',
+    );
+    expect(fs.existsSync(new RijoPaths(root).codebaseMapState)).toBe(false);
     // existing source untouched
     expect(fs.readFileSync(path.join(root, 'src', 'mod0.ts'), 'utf8')).toBe('export const x0 = 0;\n');
-    // extraction task received brownfield context
-    const extract = d.runner.executed.find((t) => t.id === 'new-extract')!;
-    expect(extract.notes).toContain('BROWNFIELD');
+    expect(d.runner.executed).toHaveLength(0);
   });
 });

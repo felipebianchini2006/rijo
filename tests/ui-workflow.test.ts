@@ -45,7 +45,7 @@ describe('rijo ui (hardened import pipeline)', () => {
 
   it('rejects a malicious ZIP (path traversal)', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeMaliciousZip();
     const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
     expect(outcome.status).toBe('blocked');
@@ -54,10 +54,28 @@ describe('rijo ui (hardened import pipeline)', () => {
     expect(fs.existsSync(path.join(root, '..', 'evil.txt'))).toBe(false);
   });
 
+  it('rejects a symbolic-link directory input before it reads local files', async () => {
+    if (process.platform === 'win32') return;
+    const outside = tmpProject('rijo-ui-outside-');
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'local secret');
+    fs.symlinkSync(outside, path.join(root, 'design-link'), 'dir');
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+
+    const outcome = await uiWorkflow(root, { input: '@design-link' }, d);
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toMatch(/symbolic link/i);
+    expect(
+      fs.existsSync(path.join(new RijoPaths(root).importsDir, IMPORT_ID, 'staging', 'secret.txt')),
+    ).toBe(false);
+    cleanup(outside);
+  });
+
   it('happy path: mapping, isolated conversion, browser validation and applied patch', async () => {
     const d = deps(root, { capabilities: { browser: true } });
     wireUi(d, root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeDesignZip();
     const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
     expect(outcome.ok, outcome.message + ' :: ' + (outcome.details ?? []).join(' | ')).toBe(true);
@@ -95,7 +113,7 @@ describe('rijo ui (hardened import pipeline)', () => {
         return ok(t, { payload: { converted: true, components_created: t.write_scope, notes: 'converted' } });
       },
     });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeDesignZip();
     const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
     expect(outcome.status).toBe('blocked');
@@ -112,7 +130,7 @@ describe('rijo ui (hardened import pipeline)', () => {
         mappings: [{ from: 'index.html', to: 'app/**', kind: 'component', notes: 'invalid' }],
       },
     });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeDesignZip();
     const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
     expect(outcome.status).toBe('blocked');
@@ -124,7 +142,7 @@ describe('rijo ui (hardened import pipeline)', () => {
     wireUi(d, root, {
       mapping: { ...UI_MAPPING_PAYLOAD, states_covered: ['loading', 'empty', 'success'] },
     });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeDesignZip();
     const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
     expect(outcome.status).toBe('blocked');
@@ -134,7 +152,7 @@ describe('rijo ui (hardened import pipeline)', () => {
   it('blocks a page import when no real browser runtime is available', async () => {
     const d = deps(root, { capabilities: { browser: false } });
     wireUi(d, root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeDesignZip();
     const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
     expect(outcome.status).toBe('blocked');
@@ -144,7 +162,7 @@ describe('rijo ui (hardened import pipeline)', () => {
   it('an executable inside the zip is not extracted', async () => {
     const d = deps(root, { capabilities: { browser: true } });
     wireUi(d, root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zip = new AdmZip();
     zip.addFile('index.html', Buffer.from('<html/>'));
     zip.addFile('tools/helper.exe', Buffer.from('MZ...'));
@@ -174,7 +192,7 @@ describe('rijo ui (hardened import pipeline)', () => {
         return ok(t, { payload: { converted: true, components_created: t.write_scope, notes: 'converted' } });
       },
     });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeDesignZip();
     const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
     expect(outcome.status).toBe('blocked');

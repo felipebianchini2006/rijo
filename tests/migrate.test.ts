@@ -10,7 +10,7 @@ import { tmpProject, cleanup } from './helpers.js';
 
 function seedV1Project(root: string): RijoPaths {
   const paths = new RijoPaths(root);
-  fs.mkdirSync(path.join(root, '.rijo', 'milestones', 'M001-loja', 'phases', '01-catalogo'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.rijo', 'milestones', 'M001-store', 'phases', '01-catalog'), { recursive: true });
   fs.writeFileSync(
     paths.manifest,
     JSON.stringify(
@@ -18,7 +18,7 @@ function seedV1Project(root: string): RijoPaths {
         rijo_version: '0.1.0-alpha.1',
         schema_version: 1,
         active_milestone: 'M001',
-        milestones: [{ id: 'M001', slug: 'loja', status: 'ACTIVE' }],
+        milestones: [{ id: 'M001', slug: 'store', status: 'ACTIVE' }],
         hashes: {},
         updated_at: '2026-07-01T00:00:00.000Z',
       },
@@ -27,7 +27,7 @@ function seedV1Project(root: string): RijoPaths {
     ),
   );
   fs.writeFileSync(paths.config, 'schema_version: 1\n');
-  const planPath = path.join(root, '.rijo', 'milestones', 'M001-loja', 'phases', '01-catalogo', 'PLAN.md');
+  const planPath = path.join(root, '.rijo', 'milestones', 'M001-store', 'phases', '01-catalog', 'PLAN.md');
   fs.writeFileSync(
     planPath,
     [
@@ -70,7 +70,7 @@ describe('schema migration from prior versions to the current schema', () => {
     // backups of the touched files exist
     expect(fs.readdirSync(report.backupDir).length).toBeGreaterThanOrEqual(3);
 
-    const planPath = path.join(root, '.rijo', 'milestones', 'M001-loja', 'phases', '01-catalogo', 'PLAN.md');
+    const planPath = path.join(root, '.rijo', 'milestones', 'M001-store', 'phases', '01-catalog', 'PLAN.md');
     const plan = readPlan(planPath);
     expect(plan.tasks.find((t) => t.id === 'T01')!.status).toBe('DONE');
     expect(plan.tasks.find((t) => t.id === 'T02')!.status).toBe('PENDING');
@@ -97,7 +97,7 @@ describe('schema migration from prior versions to the current schema', () => {
   it('an interrupted migration is safely re-runnable (version flips last)', () => {
     const paths = seedV1Project(root);
     // simulate a crash BEFORE the manifest stamp: plans rewritten, version still 1
-    const planPath = path.join(root, '.rijo', 'milestones', 'M001-loja', 'phases', '01-catalogo', 'PLAN.md');
+    const planPath = path.join(root, '.rijo', 'milestones', 'M001-store', 'phases', '01-catalog', 'PLAN.md');
     migrateProject(paths); // full migration
     // roll the version back to simulate the crash window, then re-run
     const manifest = JSON.parse(fs.readFileSync(paths.manifest, 'utf8'));

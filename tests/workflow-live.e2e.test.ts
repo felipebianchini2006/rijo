@@ -87,7 +87,7 @@ describe('LIVE full-workflow E2E (Claude)', () => {
       try {
         // Single-shot turnkey: new → (research/spec/plan/review/execute/verify/
         // code-review) → transactional finalize, all against the real Claude.
-        const run = runRijo(fixture, ['new', '@PLANO.md', '--host', 'claude', '--run'], { timeoutMs: TEST_TIMEOUT_MS - 60_000 });
+        const run = runRijo(fixture, ['new', '@PLAN.md', '--host', 'claude', '--run'], { timeoutMs: TEST_TIMEOUT_MS - 60_000 });
         expect(run.status, `rijo new --run did not exit 0:\n${run.combined}`).toBe(0);
 
         assertScenarioAOutcome(fixture);
@@ -141,7 +141,7 @@ describe('LIVE full-workflow E2E (Claude)', () => {
           ...process.env,
           PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
         };
-        const run = runRijo(fixture, ['new', '@PLANO.md', '--host', 'claude', '--run'], {
+        const run = runRijo(fixture, ['new', '@PLAN.md', '--host', 'claude', '--run'], {
           env: runEnv,
           timeoutMs: TEST_TIMEOUT_MS - 120_000,
         });
@@ -214,7 +214,7 @@ describe('LIVE full-workflow E2E (Claude)', () => {
         const fullMap = runRijo(fixture, ['map', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
         expect(fullMap.status, `initial Claude map failed:\n${fullMap.combined}`).toBe(0);
 
-        const created = runRijo(fixture, ['new', '@PLANO.md', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
+        const created = runRijo(fixture, ['new', '@PLAN.md', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
         expect(created.status, `Claude new failed:\n${created.combined}`).toBe(0);
 
         const phaseOne = runRijo(fixture, ['run', '01', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });

@@ -65,7 +65,7 @@ describe('LIVE full-workflow E2E (Codex)', () => {
 
       const fixture = createFixture(tarball!, 'rijo-wf-c-', haikuConfigYaml('codex'));
       try {
-        const run = runRijo(fixture, ['new', '@PLANO.md', '--host', 'codex', '--run'], { timeoutMs: TEST_TIMEOUT_MS - 60_000 });
+        const run = runRijo(fixture, ['new', '@PLAN.md', '--host', 'codex', '--run'], { timeoutMs: TEST_TIMEOUT_MS - 60_000 });
 
         // Capacity exhaustion → labelled skip with the host's exact diagnostic.
         if (run.status !== 0 && quotaBlocked(run.combined)) {
@@ -110,7 +110,7 @@ describe('LIVE full-workflow E2E (Codex)', () => {
           return result;
         };
         execute(['map'], 'initial Codex map');
-        execute(['new', '@PLANO.md'], 'Codex new');
+        execute(['new', '@PLAN.md'], 'Codex new');
         execute(['run', '01'], 'Codex phase 01');
         const realCodex = execFileSync('which', ['codex'], { encoding: 'utf8' }).trim();
         failureShim = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-plan-only-codex-'));

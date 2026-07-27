@@ -3,6 +3,8 @@ import * as path from 'node:path';
 import AdmZip from 'adm-zip';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
+import { uiWorkflow } from '../src/workflows/ui.js';
+import { startWorkflow } from '../src/workflows/run.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRoadmap } from '../src/core/roadmap.js';
@@ -17,7 +19,7 @@ function milestoneDir(root: string): string {
   return paths.milestoneDir(entry.id, entry.slug);
 }
 
-describe('new → ui → run composition (single lock, no double-acquire)', () => {
+describe('new → ui → start composition', () => {
   let root: string;
   beforeEach(() => {
     root = tmpProject();
@@ -28,7 +30,7 @@ describe('new → ui → run composition (single lock, no double-acquire)', () =
   });
   afterEach(() => cleanup(root));
 
-  it('runs new, then ui import, then all phases without a lock deadlock', async () => {
+  it('runs each public workflow in order without a lock deadlock', async () => {
     const d = deps(root, { capabilities: { subagents: true, parallelism: true, browser: true } });
     wireUi(d, root);
     // browser:true also activates run.ts's per-phase UI_SMOKE gate for
@@ -38,12 +40,16 @@ describe('new → ui → run composition (single lock, no double-acquire)', () =
       (t) => ok(t, { payload: { passed: true, console_errors: [], network_errors: [], screenshot: null, notes: 'smoke ok' } }),
     );
 
-    const outcome = await newWorkflow(root, { planFile: '@PLANO.md', ui: '@design.zip', run: true }, d);
+    const created = await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    expect(created.ok, created.message).toBe(true);
+    const imported = await uiWorkflow(root, { input: '@design.zip' }, d);
+    expect(imported.ok, imported.message).toBe(true);
+    const outcome = await startWorkflow(root, d);
     expect(outcome.ok, outcome.message + ' :: ' + (outcome.details ?? []).join(' | ')).toBe(true);
 
     // ui import happened
     expect(fs.existsSync(path.join(new RijoPaths(root).importsDir, IMPORT_ID, 'MAPPING.md'))).toBe(true);
-    // and all phases ran to DONE (run composed in the same lock)
+    // and all phases ran to DONE
     const roadmap = readRoadmap(path.join(milestoneDir(root), 'ROADMAP.md'));
     expect(roadmap.phases.every((p) => p.status === 'DONE')).toBe(true);
     // the lock file is released at the end

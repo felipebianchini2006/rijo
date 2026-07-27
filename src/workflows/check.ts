@@ -26,6 +26,7 @@ import {
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
+import { syncQaProjections } from './projections.js';
 
 export interface CheckOptions {
   fix?: boolean;
@@ -52,6 +53,15 @@ export async function checkWorkflow(
   });
 }
 
+/** Native public full product QA route. */
+export async function testWorkflow(
+  projectRoot: string,
+  opts: Omit<CheckOptions, 'production'> = {},
+  deps: WorkflowDeps = {},
+): Promise<WorkflowOutcome> {
+  return checkWorkflow(projectRoot, { ...opts, production: false }, deps);
+}
+
 /**
  * Production/local readiness core for composition under an existing lock.
  * `runCore` calls this directly after the last phase, so autonomous completion
@@ -74,9 +84,9 @@ export async function checkCore(
     const environment = opts.production ? 'production-candidate' : 'local';
     bus.emit('check.start', {
       status: 'running',
-      stage: 'CHECKS',
+      stage: 'PRODUCT_TEST',
       milestone: { id: milestone.id, name: milestone.slug },
-      message: `avaliando commit ${commit?.slice(0, 8) ?? 'sem VCS'} (${environment})`,
+      message: `[RIJO ${milestone.id}] PRODUCT_TEST`,
     });
 
     // ---- PRODUCTION GATE: executable verification of the exact commit.
@@ -88,7 +98,7 @@ export async function checkCore(
     let checks = runDeterministicChecks(ctx);
     const hasBuild = detectHasBuild(ctx);
     const fixesApplied: string[] = [];
-    bus.emit('check.deterministic', { message: `${checks.length} verificações, ${checks.filter((c) => c.exit_code !== 0).length} falhas` });
+    bus.emit('check.deterministic', { message: `${checks.length} checks. ${checks.filter((c) => c.exit_code !== 0).length} checks failed.` });
 
     // ---- 4-6: journeys derived from requirements
     const reqDoc = readRequirements(milestone.paths.requirements);
@@ -110,7 +120,7 @@ export async function checkCore(
       actionsByJourney,
     );
     bus.emit('check.playwright', {
-      message: `${specs.length}/${journeys.length} specs Playwright gerados (jornadas sem ações estruturadas não geram spec)`,
+      message: `Generated ${specs.length}/${journeys.length} Playwright specifications. Journeys without structured actions do not generate a specification.`,
     });
 
     // ---- 7-9: browser journeys (isolated agents), honest about capability
@@ -118,9 +128,9 @@ export async function checkCore(
     let journeyResults: JourneyResult[] = [];
     if (!ctx.runner.capabilities.browser) {
       missingCapabilities.push('browser (Playwright-capable QA runtime)');
-      bus.emit('check.journeys', { stage: 'JOURNEYS', message: 'browser indisponível: jornadas não executadas (BLOCKED)' });
+      bus.emit('check.journeys', { stage: 'JOURNEYS', message: 'The browser is unavailable. Journeys were not executed (BLOCKED).' });
     } else {
-      bus.emit('check.journeys', { stage: 'JOURNEYS', message: `executando ${journeys.length} jornadas em agentes isolados` });
+      bus.emit('check.journeys', { stage: 'JOURNEYS', message: `Run ${journeys.length} journeys with isolated agents.` });
       journeyResults = await runJourneys(ctx, milestone.paths.qaDir, journeys);
 
       // ---- 12: --fix loop (bounded). After each repair the WHOLE matrix is
@@ -131,7 +141,7 @@ export async function checkCore(
           const failingJourneys = journeyResults.filter((r) => !r.passed);
           const failingChecks = checks.filter((c) => c.exit_code !== 0);
           if (failingJourneys.length === 0 && failingChecks.length === 0) break;
-          bus.emit('check.fix', { stage: 'REPAIR', message: `rodada ${round}: corrigindo por causa raiz` });
+          bus.emit('check.fix', { stage: 'REPAIR', message: `Round ${round}: repair the root cause.` });
           const fixTask: AgentTaskDraft = {
             id: `check-fix-${round}`,
             role: 'worker',
@@ -159,7 +169,7 @@ export async function checkCore(
       }
 
       // ---- 10: independent visual review
-      bus.emit('check.visual', { stage: 'REPORT', message: 'revisão visual independente' });
+      bus.emit('check.visual', { stage: 'REPORT', message: 'Run an independent visual review.' });
       const visualTask: AgentTaskDraft = {
         id: 'check-visual',
         role: 'reviewer',
@@ -250,11 +260,12 @@ export async function checkCore(
         ].join('\n'),
       ),
     );
+    syncQaProjections(paths, milestone.paths);
 
     bus.emit('check.done', {
       status: decision.status === 'READY' ? 'completed' : 'blocked',
-      stage: 'REPORT',
-      message: `prontidão: ${decision.status}`,
+      stage: decision.status === 'READY' ? 'READY' : 'PRODUCT_TEST',
+      message: `[RIJO ${milestone.id}] ${decision.status}`,
     });
     const details = [`Report: ${path.relative(projectRoot, milestone.paths.readiness)}`, ...decision.reasons.slice(0, 10)];
     if (decision.status === 'READY') return completed(ctx, `Production readiness: READY (commit ${commit?.slice(0, 8) ?? 'n/a'}).`, details);
@@ -303,7 +314,7 @@ async function productionCheck(
   let round = 0;
   while (opts.fix && gate.status === 'failed' && round < config.limits.qa_fix_loops) {
     round++;
-    bus.emit('check.fix', { stage: 'REPAIR', message: `rodada ${round}: corrigindo por causa raiz e reexecutando a matriz inteira` });
+    bus.emit('check.fix', { stage: 'REPAIR', message: `Round ${round}: repair the root cause. Run the full matrix again.` });
     const fixTask: AgentTaskDraft = {
       id: `check-fix-${round}`,
       role: 'worker',
@@ -322,7 +333,7 @@ async function productionCheck(
     try {
       const res = await dispatch(ctx, attempt.task, { stage: 'EXECUTE' });
       if (!res.ok) {
-        bus.emit('check.fix_failed', { message: `reparo falhou: ${res.summary}` });
+        bus.emit('check.fix_failed', { message: `Repair failed: ${res.summary}` });
         break;
       }
       const beforeApply = snapshotFiles(projectRoot);
@@ -330,7 +341,7 @@ async function productionCheck(
       appliedPaths = diffSnapshots(beforeApply, snapshotFiles(projectRoot)).changed;
       commitDecisionProposals(ctx, res);
     } catch (err) {
-      bus.emit('check.fix_failed', { message: `reparo descartado: ${(err as Error).message}` });
+      bus.emit('check.fix_failed', { message: `Discarded the repair: ${(err as Error).message}` });
       break;
     } finally {
       attempt.workspace.discard();
@@ -420,33 +431,52 @@ async function productionCheck(
       ),
     );
   writeReadiness(null);
+  syncQaProjections(paths, milestone.paths);
 
   // evidence commit: the readiness report points at the tested commit; the
   // report itself lands in a separate, verified evidence-only commit.
   const relReadiness = path.relative(projectRoot, milestone.paths.readiness).split(path.sep).join('/');
   const relQaDir = path.relative(projectRoot, milestone.paths.qaDir).split(path.sep).join('/');
+  const relActiveQaDir = path.relative(projectRoot, paths.qaDir).split(path.sep).join('/');
+  const relEvents = path.relative(projectRoot, paths.events).split(path.sep).join('/');
   let evidenceCommit: string | null = null;
   if (ctx.git.status(projectRoot).isRepo && config.git.commit) {
     // evidence commit: readiness report + the gate's captured evidence
     // (server log, traces, screenshots) — nothing else. A BLOCKED round is
     // evidence too: it is committed so it can never dirty the next round.
     const label = gate.tested_commit ? `for ${gate.tested_commit.slice(0, 12)}` : `(gate ${status})`;
-    evidenceCommit = ctx.git.commitPaths(projectRoot, `rijo(check): readiness evidence ${label}`, [relReadiness, relQaDir]);
+    evidenceCommit = ctx.git.commitPaths(projectRoot, `rijo(check): readiness evidence ${label}`, [
+      relReadiness,
+      relQaDir,
+      relActiveQaDir,
+      relEvents,
+    ]);
     if (evidenceCommit && gate.tested_commit) {
       const range = ctx.git.diffNames(projectRoot, gate.tested_commit, evidenceCommit);
-      const illegal = range.filter((f) => f !== relReadiness && !f.startsWith(relQaDir));
+      const illegal = range.filter(
+        (f) =>
+          f !== relReadiness &&
+          f !== relEvents &&
+          !f.startsWith(relQaDir) &&
+          !f.startsWith(`${relActiveQaDir}/`),
+      );
       if (illegal.length > 0) {
         return blocked(ctx, 'Readiness evidence commit touched non-evidence paths.', illegal);
       }
       writeReadiness(evidenceCommit);
-      ctx.git.commitPaths(projectRoot, `rijo(check): readiness evidence sealed`, [relReadiness]);
+      syncQaProjections(paths, milestone.paths);
+      ctx.git.commitPaths(projectRoot, `rijo(check): readiness evidence sealed`, [
+        relReadiness,
+        relActiveQaDir,
+        relEvents,
+      ]);
     }
   }
 
   bus.emit('check.done', {
     status: status === 'READY' ? 'completed' : 'blocked',
-    stage: 'REPORT',
-    message: `prontidão (production gate): ${status}`,
+    stage: status === 'READY' ? 'READY' : 'PRODUCT_TEST',
+    message: `[RIJO ${milestone.id}] ${status}`,
   });
   const details = [
     `Report: ${path.relative(projectRoot, milestone.paths.readiness)}`,

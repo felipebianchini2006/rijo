@@ -24,9 +24,9 @@ function localPlanPayload(phaseId: string) {
     tasks: [
       {
         id: 'T01',
-        name: 'Implementar módulo',
+        name: 'Implement module',
         requirement_ids: [reqId],
-        technical_justification: 'infra da fase',
+        technical_justification: 'phase infrastructure',
         files: ['src/a.ts'],
         mapped_references: [newMappedReference('src/a.ts')],
         write_scope: ['src/a.ts'],
@@ -34,14 +34,14 @@ function localPlanPayload(phaseId: string) {
         parallel: false,
         tdd: true,
         tests: ['echo test-a'],
-        evidence_expected: 'testes passam',
+        evidence_expected: 'tests pass',
         done: false,
       },
       {
         id: 'T02',
-        name: 'Integrar módulo',
+        name: 'Integrate module',
         requirement_ids: [reqId],
-        technical_justification: 'integração',
+        technical_justification: 'integration',
         files: ['src/b.ts'],
         mapped_references: [newMappedReference('src/b.ts')],
         write_scope: ['src/b.ts'],
@@ -49,7 +49,7 @@ function localPlanPayload(phaseId: string) {
         parallel: false,
         tdd: false,
         tests: [],
-        evidence_expected: 'build passa',
+        evidence_expected: 'build passes',
         done: false,
       },
     ],
@@ -104,16 +104,16 @@ function fakeHostResult(task: AgentTaskWire, root: string) {
       ? task.write_scope[0]!
       : path.join(base, task.write_scope[0]!);
     fs.mkdirSync(path.dirname(specPath), { recursive: true });
-    fs.writeFileSync(specPath, `# Spec\n\nCenários observáveis de aceite.\n`, 'utf8');
+    fs.writeFileSync(specPath, `# Spec\n\nObservable acceptance scenarios.\n`, 'utf8');
     return okResult({ files_written: [task.write_scope[0]!] });
   }
   if (task.id.startsWith('new-research')) {
     return okResult({
       payload: {
-        summary: 'Node 24 é o Active LTS.',
+        summary: 'Node.js 24 is Active LTS.',
         sources: [
           {
-            claim: 'Node.js 24 é Active LTS',
+            claim: 'Node.js 24 is Active LTS',
             source: 'nodejs.org previous releases',
             url: 'https://nodejs.org/en/about/previous-releases',
             checked_at: '2026-07-23T00:00:00.000Z',
@@ -296,7 +296,7 @@ describe('host↔core JSON-RPC bridge (real child process)', () => {
     async () => {
       const host = new ChildHost(root);
       try {
-        const resp = await host.callWorkflow(1, 'workflow.new', { planFile: '@PLANO.md' });
+        const resp = await host.callWorkflow(1, 'workflow.new', { planFile: '@PLAN.md' });
 
         expect(resp.error, JSON.stringify(resp)).toBeUndefined();
         expect(resp.result.ok).toBe(true);
@@ -339,7 +339,7 @@ describe('host↔core JSON-RPC bridge (real child process)', () => {
       try {
         // Start a workflow but never answer its agent.runTask calls: the child
         // is now blocked mid-workflow with an in-flight agent task.
-        host.beginWorkflowNoAnswer(1, 'workflow.new', { planFile: '@PLANO.md' });
+        host.beginWorkflowNoAnswer(1, 'workflow.new', { planFile: '@PLAN.md' });
         await waitUntil(() => host.sawAgentTask);
         expect(host.alive).toBe(true);
         const pid = host.pid;
@@ -364,7 +364,7 @@ describe('host↔core JSON-RPC bridge (real child process)', () => {
       const host = new ChildHost(root);
       try {
         // Block the child mid-workflow (no agent answers), then close its stdin.
-        host.beginWorkflowNoAnswer(1, 'workflow.new', { planFile: '@PLANO.md' });
+        host.beginWorkflowNoAnswer(1, 'workflow.new', { planFile: '@PLAN.md' });
         await waitUntil(() => host.sawAgentTask);
         const pid = host.pid;
 

@@ -28,12 +28,12 @@ describe('rijo run', () => {
 
   it('runs a full phase through the state machine with evidence and commit', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok, outcome.message).toBe(true);
 
     const mdir = milestoneDir(root);
-    const phaseDir = path.join(mdir, 'phases', '01-catalogo');
+    const phaseDir = path.join(mdir, 'phases', '01-catalog');
     for (const f of ['SPEC.md', 'PLAN.md', 'SUMMARY.md', 'REVIEW.md', 'VERIFICATION.md']) {
       expect(fs.existsSync(path.join(phaseDir, f)), f).toBe(true);
     }
@@ -76,7 +76,7 @@ describe('rijo run', () => {
 
   it('run all completes every phase respecting dependencies', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, { target: 'all' }, d);
     expect(outcome.ok).toBe(true);
     const roadmap = readRoadmap(path.join(milestoneDir(root), 'ROADMAP.md'));
@@ -103,7 +103,7 @@ describe('rijo run', () => {
         ],
       }),
     });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(outcome.details?.join('\n')).toMatch(/MISSING_DEP|TASK_WITHOUT_REQ|UNKNOWN_REQ/);
@@ -111,7 +111,7 @@ describe('rijo run', () => {
 
   it('blocks when the independent reviewer keeps rejecting the plan (bounded loop)', async () => {
     const d = deps(root, { reviewApproved: false });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toContain('not approved after 2 revisions');
@@ -127,7 +127,7 @@ describe('rijo run', () => {
       (t) => t.id.startsWith('code-review-'),
       (t) => ok(t, { payload: { approved: false, findings: [{ type: 'spec_gap', severity: 'high', description: 'endpoint diverges from spec', file: null }] } }),
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toContain('returning to specification');
@@ -155,11 +155,11 @@ describe('rijo run', () => {
           },
         }),
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok, outcome.message).toBe(true);
     const review = fs.readFileSync(
-      path.join(milestoneDir(root), 'phases', '01-catalogo', 'REVIEW.md'),
+      path.join(milestoneDir(root), 'phases', '01-catalog', 'REVIEW.md'),
       'utf8',
     );
     expect(review).toContain('wording can be clarified');
@@ -184,7 +184,7 @@ describe('rijo run', () => {
           },
         }),
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const blockedRun = await runWorkflow(root, {}, d);
     expect(blockedRun.status).toBe('blocked');
 
@@ -217,7 +217,7 @@ describe('rijo run', () => {
           },
         }),
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     expect((await runWorkflow(root, {}, d)).status).toBe('blocked');
     fs.appendFileSync(path.join(root, 'src', 'a.ts'), '// concurrent user edit\n');
 
@@ -232,7 +232,7 @@ describe('rijo run', () => {
     // shell always fails for the plan's test command
     const failingShell = new FakeShellRunner([{ match: /echo test-a/, exitCode: 1, output: 'FAIL' }]);
     const d2 = { ...d, shell: failingShell };
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d2);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d2);
     const outcome = await runWorkflow(root, {}, d2);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toContain('verification still failing');
@@ -248,7 +248,7 @@ describe('rijo run', () => {
 
   it('does not instruct a TDD worker to edit tests allocated outside its write scope', async () => {
     const d = deps(root);
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     await runWorkflow(root, {}, d);
     const tddWorker = d.runner.executed.find((t) => t.id === 'exec-01-T01')!;
     expect(tddWorker.write_scope).toEqual(['src/a.ts']);
@@ -264,12 +264,12 @@ describe('rijo run', () => {
       (t) => t.id === 'exec-01-T02' && failT02,
       (t) => ({ task_id: t.id, ok: false, summary: 'interrupted', files_written: [], payload: null, scope_requests: [] }),
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const first = await runWorkflow(root, {}, d);
     expect(first.status).toBe('blocked');
     // T01's patch was applied but the phase never verified: the plan shows the
     // partial implementation WITHOUT promoting it to done.
-    const planPath = path.join(milestoneDir(root), 'phases', '01-catalogo', 'PLAN.md');
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalog', 'PLAN.md');
     const t01AfterFirst = readPlan(planPath).tasks.find((t) => t.id === 'T01')!;
     expect(t01AfterFirst.status).toBe('IMPLEMENTED');
     expect(t01AfterFirst.done).toBe(false);
@@ -299,7 +299,7 @@ describe('rijo run', () => {
         ],
       }),
     });
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok).toBe(true);
     // both parallel workers were dispatched (single group of 2)
@@ -321,7 +321,7 @@ describe('rijo run', () => {
         return ok(t, { files_written: ['src/a.ts'], payload: { done: true, notes: '' } });
       },
     );
-    await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toMatch(/outside its individual write scope/);

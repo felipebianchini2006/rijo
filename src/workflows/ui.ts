@@ -68,6 +68,9 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
   const { projectRoot, paths, bus, now } = ctx;
   const inputPath = path.resolve(projectRoot, opts.input.replace(/^@/, ''));
   if (!exists(inputPath)) return failed(ctx, `Design input not found: ${opts.input}`);
+  if (fs.lstatSync(inputPath).isSymbolicLink()) {
+    return blocked(ctx, 'Design input rejected: the input root is a symbolic link.', [opts.input]);
+  }
 
   {
     const importId = now().toISOString().replace(/[-:.TZ]/g, '').slice(0, 12);
@@ -76,12 +79,12 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     ensureDir(importDir);
 
     // ---- 1-2: safe extraction, no script execution
-    bus.emit('ui.extract', { status: 'running', stage: 'IMPORT', message: 'extraindo design com proteções' });
+    bus.emit('ui.extract', { status: 'running', stage: 'IMPORT', message: 'Extract the design with safety controls.' });
     let inspection: ZipInspection;
     try {
       if (inputPath.toLowerCase().endsWith('.zip')) {
         inspection = extractZipSafely(inputPath, stagingDir);
-      } else if (fs.statSync(inputPath).isDirectory()) {
+      } else if (fs.lstatSync(inputPath).isDirectory()) {
         ensureDir(stagingDir);
         inspection = copyDirectorySafely(inputPath, stagingDir);
       } else {
@@ -104,7 +107,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     }
 
     // ---- 3: deterministic inventory
-    bus.emit('ui.inventory', { stage: 'IMPORT', message: `inventariando ${inspection.entries.length} arquivos` });
+    bus.emit('ui.inventory', { stage: 'IMPORT', message: `Inventory ${inspection.entries.length} files.` });
     const invSummary = buildInventory(inspection);
     writeFileAtomic(
       path.join(importDir, 'INVENTORY.md'),
@@ -131,7 +134,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
 
     // ---- mapping (READ-ONLY agent): the mapping is a validated payload the
     // CORE writes to disk — the agent never touches MAPPING.md itself.
-    bus.emit('ui.convert', { stage: 'IMPORT', message: 'mapeando design para o stack do projeto (agente read-only)' });
+    bus.emit('ui.convert', { stage: 'IMPORT', message: 'Map the design to the project stack with a read-only agent.' });
     const mappingPath = path.join(importDir, 'MAPPING.md');
     const mapTask: AgentTaskDraft = {
       id: `ui-map-${importId}`,
@@ -272,7 +275,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
             'The current runtime has no browser capability; run through a host with browser support (BLOCKED, never skipped).',
           ]);
         }
-        bus.emit('ui.validate', { stage: 'UI_SMOKE', message: 'validação real: rotas, estados, viewports, console' });
+        bus.emit('ui.validate', { stage: 'UI_SMOKE', message: 'Validate routes, states, viewports, and the console.' });
         const validateTask: AgentTaskDraft = {
           id: `ui-validate-${importId}`,
           role: 'qa',
@@ -349,7 +352,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     // STATE.md is hash-tracked: refresh the manifest so the next run does not
     // block on drift caused by RIJO's own state write.
     touchManifest(paths, () => {}, now);
-    bus.emit('ui.done', { status: 'completed', message: `importação ${importId} concluída` });
+    bus.emit('ui.done', { status: 'completed', message: `Completed design import ${importId}.` });
     return completed(ctx, `UI import ${importId} done: ${conv.data.components_created.length} components, ${conv.data.routes_mapped.length} routes.`, [
       `Mapping: ${rel(projectRoot, mappingPath)}`,
       validationNote,
@@ -395,8 +398,18 @@ function rel(root: string, p: string): string {
  *  total size, symlinks skipped, special files rejected. */
 function copyDirectorySafely(from: string, to: string): ZipInspection {
   const inspection: ZipInspection = { entries: [], warnings: [], executables: [], installScripts: [] };
+  const sourceRoot = fs.realpathSync(from);
   let total = 0;
   const walk = (dir: string, relBase: string) => {
+    const realDirectory = fs.realpathSync(dir);
+    const relativeDirectory = path.relative(sourceRoot, realDirectory);
+    if (
+      relativeDirectory === '..' ||
+      relativeDirectory.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relativeDirectory)
+    ) {
+      throw new UnsafeZipError(`Directory leaves the design root: ${relBase || '.'}`);
+    }
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, e.name);
       const rel = relBase ? `${relBase}/${e.name}` : e.name;
@@ -414,13 +427,32 @@ function copyDirectorySafely(from: string, to: string): ZipInspection {
       if (!e.isFile()) {
         throw new UnsafeZipError(`Special file in directory input: ${rel}`, rel);
       }
-      const size = fs.statSync(full).size;
-      if (size > MAX_ENTRY_BYTES) throw new UnsafeZipError(`File exceeds per-entry limit (${size} bytes): ${rel}`, rel);
-      total += size;
-      if (total > MAX_TOTAL_BYTES) throw new UnsafeZipError(`Directory exceeds total size limit (${MAX_TOTAL_BYTES} bytes)`);
-      ensureDir(path.dirname(path.join(to, rel)));
-      fs.copyFileSync(full, path.join(to, rel));
-      inspection.entries.push({ name: rel, size });
+      const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+      let fd: number;
+      try {
+        fd = fs.openSync(full, flags);
+      } catch {
+        throw new UnsafeZipError(`File could not be opened without following links: ${rel}`, rel);
+      }
+      try {
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile()) {
+          throw new UnsafeZipError(`Special file in directory input: ${rel}`, rel);
+        }
+        const size = stat.size;
+        if (size > MAX_ENTRY_BYTES) {
+          throw new UnsafeZipError(`File exceeds per-entry limit (${size} bytes): ${rel}`, rel);
+        }
+        total += size;
+        if (total > MAX_TOTAL_BYTES) {
+          throw new UnsafeZipError(`Directory exceeds total size limit (${MAX_TOTAL_BYTES} bytes)`);
+        }
+        ensureDir(path.dirname(path.join(to, rel)));
+        fs.writeFileSync(path.join(to, rel), fs.readFileSync(fd));
+        inspection.entries.push({ name: rel, size });
+      } finally {
+        fs.closeSync(fd);
+      }
     }
   };
   walk(from, '');

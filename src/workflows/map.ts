@@ -147,7 +147,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   bus.emit('map.preflight', {
     status: 'running',
     stage: 'MAP_PREFLIGHT',
-    message: 'validando raiz, checkout, symlinks e freshness',
+    message: 'Validate the root, checkout, symbolic links, and freshness.',
   });
   const metadata = resolveRepositoryMetadata(projectRoot);
   const requestedRoot = fs.realpathSync(projectRoot);
@@ -176,7 +176,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
 
   let inventory;
   try {
-    bus.emit('map.inventory', { stage: 'MAP_INVENTORY', message: 'inventariando arquivos relevantes sem ler segredos' });
+    bus.emit('map.inventory', { stage: 'MAP_INVENTORY', message: 'Inventory relevant files without reading secrets.' });
     inventory = buildInventory(projectRoot);
   } catch (error) {
     if (error instanceof MapPreflightError) return blocked(ctx, error.message, error.paths);
@@ -196,7 +196,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     (previous?.status === 'COMPLETE' || previous?.status === 'PARTIAL') &&
     sameSourceTree
   ) {
-    bus.emit('map.done', { status: 'completed', stage: 'MAP_DONE', message: 'mapa atual; validação concluída sem remapeamento' });
+    bus.emit('map.done', { status: 'completed', stage: 'MAP_DONE', message: 'The map is current. Validation did not require remapping.' });
     return completed(ctx, 'Codebase map is fresh; no-op.');
   }
 
@@ -243,7 +243,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   if (ctx.executor.capabilities.subagents && shards.length > 0) {
     bus.emit('map.shards', {
       stage: 'MAP_SHARDS',
-      message: `${shards.length} shard(s) com owner único, contexto fresco e supervisão`,
+      message: `${shards.length} shard(s) have one owner, current context, and supervision.`,
       totalUnits: shards.length,
     });
     const before = snapshotTree(projectRoot);
@@ -479,7 +479,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   });
   inventory.coverage = provisionalAssessment.coverage;
 
-  bus.emit('map.review', { stage: 'MAP_REVIEW', message: 'revalidando paths, hashes, símbolos, contradições e cobertura' });
+  bus.emit('map.review', { stage: 'MAP_REVIEW', message: 'Revalidate paths, hashes, symbols, contradictions, and coverage.' });
   const claimReceipts: ClaimReceipt[] = [];
   let consolidationStatus: 'APPROVED' | 'NOT_REVIEWED' = 'NOT_REVIEWED';
   const contradictions = detectClaimContradictions(claims);
@@ -530,7 +530,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     }
   }
 
-  bus.emit('map.baseline', { stage: 'MAP_BASELINE', message: 'executando baseline detectado em workspace isolado' });
+  bus.emit('map.baseline', { stage: 'MAP_BASELINE', message: 'Run the detected baseline in an isolated workspace.' });
   let baseline: BaselineDocument;
   const mustRefreshBaseline =
     operation === 'full' ||
@@ -601,7 +601,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   });
   validateCandidate(candidate.artifacts, candidate.state);
 
-  bus.emit('map.commit', { stage: 'MAP_COMMIT', message: 'promovendo mapa validado por transação recuperável' });
+  bus.emit('map.commit', { stage: 'MAP_COMMIT', message: 'Promote the validated map with a recoverable transaction.' });
   const transaction = MilestoneTransaction.begin(
     paths,
     { kind: 'codebase-map', prev: previous?.mapped_commit ?? null, next: metadata.head },
@@ -659,7 +659,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   bus.emit('map.done', {
     status: candidate.state.status === 'BLOCKED' ? 'blocked' : 'completed',
     stage: 'MAP_DONE',
-    message: `mapa ${operation} ${candidate.state.status.toLowerCase()}: ${inventory.files.length} arquivos, ${graph.modules.length} módulos`,
+    message: `${operation} map ${candidate.state.status.toLowerCase()}: ${inventory.files.length} files, ${graph.modules.length} modules.`,
   });
   return completed(
     ctx,

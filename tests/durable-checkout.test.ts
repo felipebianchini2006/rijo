@@ -25,8 +25,8 @@ describe('durable portable checkout boundary', () => {
     execFileSync('git', ['init', '-b', 'main'], { cwd: root });
     execFileSync('git', ['config', 'user.email', 'rijo-test@example.com'], { cwd: root });
     execFileSync('git', ['config', 'user.name', 'RIJO Test'], { cwd: root });
-    fs.writeFileSync(path.join(root, 'PLANO.md'), '# Durable checkout\n');
-    execFileSync('git', ['add', 'PLANO.md'], { cwd: root });
+    fs.writeFileSync(path.join(root, 'PLAN.md'), '# Durable checkout\n');
+    execFileSync('git', ['add', 'PLAN.md'], { cwd: root });
     execFileSync('git', ['commit', '-m', 'seed'], { cwd: root });
 
     const durable = await openDurableWorkflowEngine(root, {
@@ -55,7 +55,7 @@ describe('durable portable checkout boundary', () => {
       cwd: root,
       encoding: 'utf8',
     }).split('\n');
-    expect(tracked).not.toContain('.rijo/events.jsonl');
+    expect(tracked).toContain('.rijo/events.jsonl');
     expect(tracked.some((file) => file.startsWith('.rijo/ledger/'))).toBe(true);
     expect(tracked).not.toContain('.rijo/state/rijo.db');
     expect(tracked.some((file) => /rijo\.db-(?:wal|shm)$/.test(file))).toBe(false);

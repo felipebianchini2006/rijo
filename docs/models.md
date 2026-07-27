@@ -1,26 +1,35 @@
-# Modelos, papéis e custos
+# Models, roles, and cost
 
-O core do RIJO nunca fixa nomes de modelos. `.rijo/config.yml` mapeia seis
-papéis a tiers de texto livre; o runtime (adapter ou `AgentRunner` injetado)
-resolve cada tier para um modelo concreto disponível.
+The RIJO core does not select a provider model. The active host resolves each
+native subagent role to an available model.
 
-## Papéis
+Secondary automation adapters can use the free-form tiers in
+`.rijo/config.yml`. The adapter resolves each tier to a concrete provider
+model.
 
-| Papel | Responsabilidade | Tier padrão | Perfil de custo |
+## Roles
+
+| Role | Responsibility | Default tier | Cost profile |
 |---|---|---|---|
-| `lead` | orquestração fina, diagnóstico de fix | `strongest` | poucas chamadas, contexto pequeno |
-| `reviewer` | revisão independente de plano/código/visual | `strongest-independent` | 1–2 chamadas por fase; recebe spec+diff+evidência, nunca o raciocínio do autor |
-| `planner` | extração de plano, SPEC.md, PLAN.md | `balanced-reasoning` | 1–3 chamadas por fase (limite de 2 revisões) |
-| `worker` | implementação de uma tarefa com escopo estrito | `economical-coding` | 2–4 por fase; contexto fresco e mínimo |
-| `researcher` | pesquisa delta com fontes oficiais | `economical-research` | até 4 em paralelo no M001; cache depois |
-| `qa` | jornadas de browser, smoke visual | `economical-browser` | 1 por jornada; só quando há browser |
+| `lead` | Thin orchestration and defect diagnosis | `strongest` | Few calls with small context |
+| `reviewer` | Independent plan, code, and visual review | `strongest-independent` | One or two calls per phase |
+| `planner` | Phase research, specification, and planning | `balanced-reasoning` | One to three calls per phase |
+| `worker` | One implementation task with a strict write scope | `economical-coding` | Two to four calls per phase |
+| `researcher` | Focused research from primary sources | `economical-research` | Up to four parallel calls |
+| `qa` | Browser or simulator journeys | `economical-browser` | One call per journey |
 
-Configuração premium-coordena/barato-executa (recomendada para freelancers):
+The reviewer receives the specification, diff, and evidence. The reviewer does
+not receive the author reasoning.
+
+## Secondary adapter configuration
+
+This example uses stronger models for coordination and economical models for
+bounded work:
 
 ```yaml
 models:
   lead: strongest
-  reviewer: strongest-independent   # DEVE ser independente do autor
+  reviewer: strongest-independent
   planner: balanced-reasoning
   worker: economical-coding
   researcher: economical-research
@@ -33,22 +42,30 @@ limits:
   max_parallel_agents: 4
 ```
 
-Remapear papéis nunca exige mudança no core (testado em
-`tests/agents.test.ts`). Runtimes sem subagentes/paralelismo executam os mesmos
-papéis sequencialmente — o RIJO nunca finge que uma capacidade foi usada.
+You can change tier mappings without a core change. A host without parallel
+subagents runs roles in sequence. RIJO records the real host capability.
 
-## Onde os tokens são gastos (e onde não são)
+## Token use
 
-Gastam tokens: extração do plano (1×/milestone), pesquisa (cacheada,
-delta-only), spec+plano (por fase, revisões limitadas), workers (por tarefa),
-reviews (limitadas), jornadas de QA.
+Agent work uses tokens for these operations:
 
-Nunca gastam tokens: validação de schema, lint de plano, cobertura
-requisito-teste, locks, escrita atômica, transições de estado, detecção de
-drift, `rijo --status/--watch`, status line, retomada de checkpoint — tudo
-código determinístico.
+- Project and phase research.
+- Phase specifications and plans.
+- Implementation tasks.
+- Independent reviews.
+- Product Quality Assurance journeys.
 
-Regras de economia embutidas: contexto automático < 24 KB por execução;
-subagentes recebem briefs, não o repositório; pesquisa revalida apenas decisões
-voláteis (TTL 30 dias); mensagens de chat só em transições materiais; sem
-heartbeats para o modelo; percentuais apenas de unidades conhecidas.
+The deterministic core does not use model tokens for these operations:
+
+- Schema validation.
+- Plan lint.
+- Requirement and test traceability.
+- Locks and atomic writes.
+- State transitions.
+- Drift detection.
+- Status rendering.
+- Checkpoint recovery.
+
+RIJO gives each subagent a bounded brief. The brief contains the objective,
+required files, write scope, acceptance criteria, verification commands, and
+output contract. RIJO does not send the full repository by default.

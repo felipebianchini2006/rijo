@@ -32,22 +32,22 @@ export function cleanup(dir: string): void {
   fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
-export function writePlanFile(root: string, name = 'PLANO.md', content?: string): string {
+export function writePlanFile(root: string, name = 'PLAN.md', content?: string): string {
   const p = path.join(root, name);
   fs.writeFileSync(
     p,
     content ??
       [
-        '# Plano — Loja simples',
+        '# Development plan: Simple Store',
         '',
-        'Uma loja online mínima com catálogo e checkout.',
+        'A small online store with a catalog and checkout.',
         '',
-        '## Requisitos',
-        '- Catálogo de produtos com listagem e busca',
-        '- Checkout com pagamento por cartão',
+        '## Requirements',
+        '- Product catalog with listing and search',
+        '- Checkout with card payment',
         '',
-        '## Fora de escopo',
-        '- Programa de fidelidade',
+        '## Out of scope',
+        '- Loyalty program',
       ].join('\n'),
     'utf8',
   );
@@ -158,21 +158,21 @@ export function mapFragmentFor(task: AgentTask): unknown {
 }
 
 export const EXTRACTION_PAYLOAD = {
-  project_name: 'Loja Simples',
-  project_summary: 'Loja online mínima com catálogo e checkout.',
-  stack_summary: 'Node.js 24 + TypeScript (verificado).',
-  rules: ['Sem dados de cartão em logs.'],
-  out_of_scope: ['Programa de fidelidade'],
-  acceptance: ['Compra completa funciona de ponta a ponta'],
+  project_name: 'Simple Store',
+  project_summary: 'Small online store with a catalog and checkout.',
+  stack_summary: 'Node.js 24 and TypeScript (verified).',
+  rules: ['Do not write card data to logs.'],
+  out_of_scope: ['Loyalty program'],
+  acceptance: ['The complete purchase works end to end'],
   requirements: [
-    { description: 'Catálogo de produtos com listagem e busca', acceptance: 'Usuário vê lista e busca por nome', non_functional: false, classification: 'NEW' },
-    { description: 'Checkout com pagamento por cartão', acceptance: 'Usuário conclui compra com cartão de teste', non_functional: false, classification: 'NEW' },
+    { description: 'Product catalog with listing and search', acceptance: 'User sees the list and searches by name', non_functional: false, classification: 'NEW' },
+    { description: 'Checkout with card payment', acceptance: 'User completes a purchase with a test card', non_functional: false, classification: 'NEW' },
   ],
   phases: [
-    { name: 'Catálogo', requirement_indexes: [0], depends_on_indexes: [], ui_surface: true },
+    { name: 'Catalog', requirement_indexes: [0], depends_on_indexes: [], ui_surface: true },
     { name: 'Checkout', requirement_indexes: [1], depends_on_indexes: [0], ui_surface: true },
   ],
-  research_topics: [{ key: 'node-lts', topic: 'Node.js LTS recomendado', volatile: true }],
+  research_topics: [{ key: 'node-lts', topic: 'Recommended Node.js LTS', volatile: true }],
 };
 
 export function newMappedReference(path: string, parentModule = 'greenfield-root') {
@@ -224,10 +224,10 @@ export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
     tasks: [
       {
         id: 'T01',
-        name: 'Implementar módulo',
+        name: 'Implement module',
         // cover the phase's requirements so the bidirectional coverage lint passes
         requirement_ids: reqIds,
-        technical_justification: reqIds.length ? null : 'infra da fase',
+        technical_justification: reqIds.length ? null : 'phase infrastructure',
         files: ['src/a.ts'],
         mapped_references: [newMappedReference('src/a.ts')],
         write_scope: ['src/a.ts'],
@@ -235,14 +235,14 @@ export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
         parallel: false,
         tdd: true,
         tests: ['echo test-a'],
-        evidence_expected: 'testes passam',
+        evidence_expected: 'tests pass',
         done: false,
       },
       {
         id: 'T02',
-        name: 'Integrar módulo',
+        name: 'Integrate module',
         requirement_ids: [],
-        technical_justification: 'integração',
+        technical_justification: 'integration',
         files: ['src/b.ts'],
         mapped_references: [newMappedReference('src/b.ts')],
         write_scope: ['src/b.ts'],
@@ -250,7 +250,7 @@ export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
         parallel: false,
         tdd: false,
         tests: [],
-        evidence_expected: 'build passa',
+        evidence_expected: 'build passes',
         done: false,
       },
     ],
@@ -302,10 +302,10 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
       (t) =>
         ok(t, {
           payload: {
-            summary: 'Node 24 é o Active LTS.',
+            summary: 'Node.js 24 is Active LTS.',
             sources: [
               {
-                claim: 'Node.js 24 é Active LTS',
+                claim: 'Node.js 24 is Active LTS',
                 source: 'nodejs.org previous releases',
                 url: 'https://nodejs.org/en/about/previous-releases',
                 checked_at: '2026-07-23T00:00:00.000Z',
@@ -324,7 +324,7 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
         const base = t.workspace?.root ?? root;
         const specPath = path.isAbsolute(t.write_scope[0]!) ? t.write_scope[0]! : path.join(base, t.write_scope[0]!);
         fs.mkdirSync(path.dirname(specPath), { recursive: true });
-        fs.writeFileSync(specPath, `# Spec\n\nCenários observáveis de aceite.\n`, 'utf8');
+        fs.writeFileSync(specPath, `# Spec\n\nObservable acceptance scenarios.\n`, 'utf8');
         return ok(t, { files_written: [t.write_scope[0]!] });
       },
     )

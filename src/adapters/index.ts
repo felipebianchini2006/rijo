@@ -4,6 +4,7 @@ import { generateGenericAdapter } from './generic.js';
 import type { AdapterReport } from './shared.js';
 
 export type AdapterName = 'claude' | 'codex' | 'generic';
+export type AdapterScope = 'project' | 'user';
 
 /**
  * Generate adapters relevant to the detected runtime. Detection is
@@ -20,10 +21,12 @@ export function generateAdapters(projectRoot: string, force?: AdapterName[]): Ad
 
   const claude = wants('claude', detectClaude(projectRoot));
   const codex = wants('codex', detectCodex(projectRoot));
-  if (claude) merge(generateClaudeAdapter(projectRoot));
-  if (codex) merge(generateCodexAdapter(projectRoot));
+  if (claude) merge(generateClaudeAdapter(projectRoot, { scope: 'project' }));
+  if (codex) merge(generateCodexAdapter(projectRoot, { scope: 'project' }));
   if (!claude && !codex) merge(generateGenericAdapter(projectRoot));
   return report;
 }
 
 export { generateClaudeAdapter, generateCodexAdapter, generateGenericAdapter };
+export type { ClaudeAdapterOptions } from './claude.js';
+export type { CodexAdapterOptions } from './codex.js';
