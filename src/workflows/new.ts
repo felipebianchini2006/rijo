@@ -95,6 +95,33 @@ export const PlanExtractionSchema = z.object({
 });
 export type PlanExtraction = z.infer<typeof PlanExtractionSchema>;
 
+export function validatePlanExtractionFidelity(plan: string, extraction: PlanExtraction): string[] {
+  const errors: string[] = [];
+  const numberWords: Record<string, number> = {
+    one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    uma: 1, duas: 2, tres: 3, quatro: 4, cinco: 5, seis: 6, sete: 7, oito: 8, nove: 9, dez: 10,
+  };
+  const normalizedPlan = plan.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+  const countMatch = normalizedPlan.match(/\b(?:exactly|exatamente)\s+(\d+|[a-z]+)\s+(?:sequential\s+|sequenciais?\s+)?(?:phases|fases)\b/);
+  if (countMatch) {
+    const token = countMatch[1]!;
+    const expected = /^\d+$/.test(token) ? Number(token) : numberWords[token];
+    if (expected !== undefined && extraction.phases.length !== expected) {
+      errors.push(`phases: plan explicitly requires ${expected}, but extraction returned ${extraction.phases.length}`);
+    }
+  }
+  const dependencyPattern = /\b(?:phase|fase)\s+0?(\d+)\s+(?:depends\s+on|depende\s+d[ae])\s+(?:phase|fase)\s+0?(\d+)\b/g;
+  for (const match of normalizedPlan.matchAll(dependencyPattern)) {
+    const phaseIndex = Number(match[1]) - 1;
+    const dependencyIndex = Number(match[2]) - 1;
+    const phase = extraction.phases[phaseIndex];
+    if (phase && !phase.depends_on_indexes.includes(dependencyIndex)) {
+      errors.push(`phases.${phaseIndex}.depends_on_indexes: plan explicitly requires dependency on phase ${dependencyIndex + 1}`);
+    }
+  }
+  return errors;
+}
+
 interface BrownfieldInfo {
   isBrownfield: boolean;
   stackNotes: string[];
@@ -256,13 +283,18 @@ export async function newWorkflow(
       if (extractResult.ok && extractResult.payload) {
         const parsed = PlanExtractionSchema.safeParse(extractResult.payload);
         if (parsed.success) {
-          extraction = parsed.data;
-          extractionEnvelope = extractResult;
-          break;
+          const fidelityErrors = validatePlanExtractionFidelity(planContent, parsed.data);
+          if (fidelityErrors.length === 0) {
+            extraction = parsed.data;
+            extractionEnvelope = extractResult;
+            break;
+          }
+          lastExtractErrors = fidelityErrors;
+        } else {
+          lastExtractErrors = parsed.error.issues.map(
+            (issue) => `${issue.path.length > 0 ? issue.path.join('.') : '<payload>'}: ${issue.message}`,
+          );
         }
-        lastExtractErrors = parsed.error.issues.map(
-          (issue) => `${issue.path.length > 0 ? issue.path.join('.') : '<payload>'}: ${issue.message}`,
-        );
       } else if (!extractResult.ok) {
         lastExtractErrors = [`AgentResult rejected: ${extractResult.summary}`];
       } else {

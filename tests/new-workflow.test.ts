@@ -1,13 +1,34 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { newWorkflow } from '../src/workflows/new.js';
+import { newWorkflow, validatePlanExtractionFidelity } from '../src/workflows/new.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { defaultConfig, loadConfig, saveConfig } from '../src/core/config.js';
 import { tmpProject, cleanup, writePlanFile, deps, EXTRACTION_PAYLOAD } from './helpers.js';
+
+it('rejects extraction that omits an explicit phase count or dependency', () => {
+  const plan = [
+    'Implement in exactly two sequential phases.',
+    'Phase 01 — Increment.',
+    'Phase 02 — Decrement.',
+    'Phase 02 depends on phase 01.',
+  ].join('\n');
+  expect(
+    validatePlanExtractionFidelity(plan, {
+      ...EXTRACTION_PAYLOAD,
+      phases: [EXTRACTION_PAYLOAD.phases[0]!],
+    }),
+  ).toContain('phases: plan explicitly requires 2, but extraction returned 1');
+  expect(
+    validatePlanExtractionFidelity(plan, {
+      ...EXTRACTION_PAYLOAD,
+      phases: EXTRACTION_PAYLOAD.phases.map((phase) => ({ ...phase, depends_on_indexes: [] })),
+    }),
+  ).toContain('phases.1.depends_on_indexes: plan explicitly requires dependency on phase 1');
+});
 
 describe('rijo new (greenfield)', () => {
   let root: string;
