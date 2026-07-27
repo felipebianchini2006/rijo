@@ -149,6 +149,11 @@ export async function newWorkflow(
   const planContent = readText(planPath);
   const planHash = computePlanHash(planContent);
   const hasRijo = exists(paths.manifest);
+  const existingManifest = hasRijo ? readManifest(paths) : null;
+  const isSetupManifest =
+    existingManifest !== null &&
+    existingManifest.active_milestone === null &&
+    existingManifest.milestones.length === 0;
   if (!hasRijo && opts.next) {
     return failed(ctx, '--next requires an existing RIJO project; run rijo new without --next first.');
   }
@@ -172,7 +177,7 @@ export async function newWorkflow(
           : [`To start the next milestone run: rijo new @${path.basename(planPath)} --next`],
       );
     }
-    if (hasRijo && !opts.next) {
+    if (hasRijo && !opts.next && !isSetupManifest) {
       return blockedReadOnly(
         ctx,
         'A RIJO project already exists here. Re-initialization is refused (non-destructive).',

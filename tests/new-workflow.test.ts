@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow, validatePlanExtractionFidelity } from '../src/workflows/new.js';
 import { RijoPaths } from '../src/core/paths.js';
-import { readManifest } from '../src/core/manifest.js';
+import { newManifest, readManifest, writeManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { defaultConfig, loadConfig, saveConfig } from '../src/core/config.js';
@@ -126,6 +126,19 @@ describe('rijo new (greenfield)', () => {
     expect(second.status).toBe('blocked');
     expect(second.details?.join(' ')).toContain('--next');
     expect(fs.readFileSync(new RijoPaths(root).manifest, 'utf8')).toBe(before);
+  });
+
+  it('resumes setup when the manifest has no milestone', async () => {
+    const paths = new RijoPaths(root);
+    fs.mkdirSync(paths.root, { recursive: true });
+    writeManifest(paths, newManifest(() => new Date('2026-07-27T00:00:00.000Z')));
+
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, deps(root));
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const manifest = readManifest(paths)!;
+    expect(manifest.active_milestone).toBe('M001');
+    expect(manifest.milestones).toHaveLength(1);
   });
 
   it('fails when the plan file does not exist', async () => {
