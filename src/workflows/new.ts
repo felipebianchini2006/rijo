@@ -470,7 +470,7 @@ export async function newWorkflow(
         acceptance_criteria: ['Every volatile claim has source title, url, check date and version'],
         verification_commands: [],
         return_format:
-          'JSON payload: {summary: string, sources: [{claim, source, url, checked_at, version, confidence, tier: official|advisory|secondary}]}. tier=official for official docs/registries, advisory for primary security advisories.',
+          'JSON payload: {summary: string, sources: [{claim: string, source: string, url: string, checked_at: ISO-8601 string, version: string, confidence: high|medium|low, tier: official|advisory|secondary}]}. Use the exact confidence and tier strings. Use tier=official for official docs or registries. Use tier=advisory for primary security advisories.',
         notes: '',
       }));
       const results = await dispatchBatch(ctx, tasks, undefined, () => ({ stage: 'RESEARCH' }));

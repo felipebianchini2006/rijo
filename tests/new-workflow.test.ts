@@ -147,13 +147,17 @@ describe('rijo new (greenfield)', () => {
   });
 
   it('records research sources for volatile decisions', async () => {
-    await newWorkflow(root, { planFile: '@PLAN.md' }, deps(root));
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const paths = new RijoPaths(root);
     const sources = JSON.parse(fs.readFileSync(paths.researchSources, 'utf8'));
     expect(sources.sources.length).toBeGreaterThan(0);
     expect(sources.sources[0]).toMatchObject({ url: expect.stringContaining('nodejs.org') });
     const cache = JSON.parse(fs.readFileSync(paths.researchCache, 'utf8'));
     expect(cache.entries[0]!.key).toBe('node-lts');
+    const researchTask = d.runner.executed.find((task) => task.id === 'new-research-1')!;
+    expect(researchTask.return_format).toContain('confidence: high|medium|low');
+    expect(researchTask.return_format).toContain('checked_at: ISO-8601 string');
   });
 });
 

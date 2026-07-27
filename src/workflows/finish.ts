@@ -110,13 +110,7 @@ export async function finishWorkflow(
     const headCommit = ctx.git.headCommit(projectRoot);
     if (gitStatus.isRepo && testedCommit && headCommit && testedCommit !== headCommit) {
       const afterTest = ctx.git.diffNames(projectRoot, testedCommit, headCommit);
-      const unsafe = afterTest.filter(
-        (file) =>
-          !file.startsWith('.rijo/qa/') &&
-          !file.includes('/qa/') &&
-          file !== '.rijo/events.jsonl' &&
-          !file.startsWith('.rijo/ledger/'),
-      );
+      const unsafe = afterTest.filter((file) => !file.startsWith('.rijo/'));
       if (unsafe.length > 0) {
         return blockedReadOnly(ctx, 'The tested commit is not the current product commit.', [
           `Untested paths: ${unsafe.join(', ')}`,

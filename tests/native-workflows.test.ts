@@ -94,4 +94,34 @@ describe('native workflow lifecycle', () => {
     expect(fs.existsSync(path.join(milestoneDir, 'CLOSEOUT.md'))).toBe(true);
     expect(readManifest(paths)!.milestones[0]!.status).toBe('COMPLETE');
   });
+
+  it('finish accepts portable RIJO evidence commits after the tested product commit', async () => {
+    const runtime = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, runtime);
+    await startWorkflow(root, runtime);
+    const paths = new RijoPaths(root);
+    const manifest = readManifest(paths)!;
+    const milestone = manifest.milestones.find(
+      (candidate) => candidate.id === manifest.active_milestone,
+    )!;
+    const milestoneDir = paths.milestoneDir(milestone.id, milestone.slug);
+    const testedCommit = runtime.git.headCommit(root)!;
+    runtime.git.commitPaths(root, 'rijo(state): record QA evidence', [
+      '.rijo/events.jsonl',
+      '.rijo/manifest.json',
+      `.rijo/milestones/${milestone.id}-${milestone.slug}/qa/production-readiness.md`,
+    ]);
+    fs.writeFileSync(
+      path.join(milestoneDir, 'qa', 'production-readiness.md'),
+      serializeFrontmatter(
+        { status: 'READY', tested_commit: testedCommit },
+        '# Product QA\n\nStatus: READY\n',
+      ),
+    );
+
+    const result = await finishWorkflow(root, runtime);
+
+    expect(result.ok, result.message).toBe(true);
+    expect(readManifest(paths)!.milestones[0]!.status).toBe('COMPLETE');
+  });
 });
