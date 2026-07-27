@@ -101,8 +101,13 @@ export interface CloseoutInput {
  * Validate that a milestone CAN be sealed with the given closeout input.
  * Throws with a precise diagnostic; mutates nothing.
  */
-export function validateSeal(ref: MilestoneRef, input: CloseoutInput, reqDoc: { requirements: Requirement[] } | null): void {
-  if (exists(ref.paths.closeout)) {
+export function validateSeal(
+  ref: MilestoneRef,
+  input: CloseoutInput,
+  reqDoc: { requirements: Requirement[] } | null,
+  options: { allowExistingCloseout?: boolean } = {},
+): void {
+  if (exists(ref.paths.closeout) && !options.allowExistingCloseout) {
     throw new Error(`Milestone ${ref.id} already has a CLOSEOUT.md; historic milestones are immutable`);
   }
   const undone = reqDoc?.requirements.filter((r) => r.status !== 'DONE') ?? [];
@@ -209,6 +214,34 @@ export function sealMilestone(
     paths,
     (m) => {
       const entry = m.milestones.find((x) => x.id === ref.id);
+      if (entry) entry.status = input.status;
+    },
+    now,
+  );
+  updateMilestonesIndex(paths, now);
+}
+
+/**
+ * Register a closeout that the native host wrote before it called the helper.
+ * Preserve the host report. Update only the portable milestone indexes.
+ */
+export function registerExistingCloseout(
+  paths: RijoPaths,
+  ref: MilestoneRef,
+  input: CloseoutInput,
+  now: () => Date = () => new Date(),
+): void {
+  if (!exists(ref.paths.closeout)) {
+    throw new Error(`Milestone ${ref.id} has no CLOSEOUT.md to register`);
+  }
+  const reqDoc = exists(ref.paths.requirements) ? readRequirements(ref.paths.requirements) : null;
+  validateSeal(ref, input, reqDoc, { allowExistingCloseout: true });
+  const doneDoc = reqDoc ? applySealDispositions(reqDoc, input.carryover) : null;
+  if (doneDoc) writeRequirements(ref.paths.requirements, doneDoc);
+  touchManifest(
+    paths,
+    (manifest) => {
+      const entry = manifest.milestones.find((candidate) => candidate.id === ref.id);
       if (entry) entry.status = input.status;
     },
     now,

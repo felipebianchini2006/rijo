@@ -124,4 +124,46 @@ describe('native workflow lifecycle', () => {
     expect(result.ok, result.message).toBe(true);
     expect(readManifest(paths)!.milestones[0]!.status).toBe('COMPLETE');
   });
+
+  it('finish registers a native host closeout when the portable manifest is still active', async () => {
+    const runtime = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, runtime);
+    await startWorkflow(root, runtime);
+    const paths = new RijoPaths(root);
+    const manifest = readManifest(paths)!;
+    const milestone = manifest.milestones.find(
+      (candidate) => candidate.id === manifest.active_milestone,
+    )!;
+    const milestoneDir = paths.milestoneDir(milestone.id, milestone.slug);
+    fs.writeFileSync(
+      path.join(milestoneDir, 'qa', 'production-readiness.md'),
+      serializeFrontmatter(
+        { status: 'READY', tested_commit: runtime.git.headCommit(root) },
+        '# Product QA\n\nStatus: READY\n',
+      ),
+    );
+    fs.writeFileSync(
+      path.join(milestoneDir, 'CLOSEOUT.md'),
+      serializeFrontmatter(
+        { milestone: milestone.id, status: 'SEALED' },
+        `# Closeout — ${milestone.id}\n\nThe native host wrote this report.\n`,
+      ),
+    );
+    runtime.git.dirty = [
+      path.relative(root, path.join(milestoneDir, 'CLOSEOUT.md')),
+    ];
+
+    const result = await finishWorkflow(root, runtime);
+
+    expect(result.ok, result.message).toBe(true);
+    expect(result.message).toContain('sealed with QA result READY');
+    expect(readManifest(paths)!.milestones[0]!.status).toBe('COMPLETE');
+    expect(fs.readFileSync(path.join(milestoneDir, 'CLOSEOUT.md'), 'utf8')).toContain(
+      'The native host wrote this report.',
+    );
+    expect(fs.readFileSync(paths.milestonesIndex, 'utf8')).toContain(
+      `| ${milestone.id} | ${milestone.slug} | COMPLETE |`,
+    );
+    expect(runtime.git.dirty).toEqual([]);
+  });
 });

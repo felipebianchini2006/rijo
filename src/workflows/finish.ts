@@ -2,8 +2,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { parseFrontmatter } from '../core/frontmatter.js';
 import { exists, readText, writeFileAtomic } from '../core/fsx.js';
-import { touchManifest } from '../core/manifest.js';
-import { activeMilestone, sealMilestone } from '../core/milestones.js';
+import { readManifest, touchManifest } from '../core/manifest.js';
+import {
+  activeMilestone,
+  registerExistingCloseout,
+  sealMilestone,
+} from '../core/milestones.js';
 import { readRoadmap, readRequirements } from '../core/roadmap.js';
 import { TaskRecordSchema } from '../core/schemas/index.js';
 import { readState, writeState } from '../core/state.js';
@@ -34,7 +38,10 @@ export async function finishWorkflow(
   return withLock(ctx, async () => {
     const milestone = activeMilestone(ctx.paths);
     if (!milestone) return failed(ctx, 'No active milestone.');
-    if (exists(milestone.paths.closeout)) {
+    const manifestEntry = readManifest(ctx.paths)?.milestones.find(
+      (candidate) => candidate.id === milestone.id,
+    );
+    if (exists(milestone.paths.closeout) && manifestEntry?.status !== 'ACTIVE') {
       const existingStatus = ctx.git.status(projectRoot);
       if (existingStatus.isRepo && ctx.config.git.commit && existingStatus.dirtyFiles.length > 0) {
         const recoverable = existingStatus.dirtyFiles.filter((file) => file.startsWith('.rijo/'));
@@ -96,7 +103,15 @@ export async function finishWorkflow(
     }
 
     const gitStatus = ctx.git.status(projectRoot);
-    const userDirty = gitStatus.dirtyFiles.filter((file) => file !== '.rijo/events.jsonl');
+    const sealDrafts = exists(milestone.paths.closeout)
+      ? new Set([
+          '.rijo/events.jsonl',
+          '.rijo/STATE.md',
+          path.relative(projectRoot, milestone.paths.closeout),
+          path.relative(projectRoot, path.join(milestone.dir, 'ARCHIVE.md')),
+        ])
+      : new Set(['.rijo/events.jsonl']);
+    const userDirty = gitStatus.dirtyFiles.filter((file) => !sealDrafts.has(file));
     if (gitStatus.isRepo && userDirty.length > 0) {
       return blockedReadOnly(ctx, 'The working tree must be clean before finish.', [
         `Dirty files: ${userDirty.slice(0, 20).join(', ')}`,
@@ -131,24 +146,24 @@ export async function finishWorkflow(
         '',
       ].join('\n'),
     );
-    sealMilestone(
-      ctx.paths,
-      milestone,
-      {
-        status: 'COMPLETE',
-        baselineCommit: testedCommit,
-        baselineBranch: gitStatus.branch,
-        deliveredVersion: null,
-        carryover: unresolved.map((requirement) => ({
-          requirement,
-          disposition: requirement.status === 'BLOCKED' ? 'blocked' as const : 'carried' as const,
-        })),
-        evidence: [path.relative(projectRoot, milestone.paths.readiness)],
-        residualRisks: qaResult === 'READY' ? [] : [`Product QA result: ${qaResult}`],
-        productionState: qaResult,
-      },
-      ctx.now,
-    );
+    const closeoutInput = {
+      status: 'COMPLETE' as const,
+      baselineCommit: testedCommit,
+      baselineBranch: gitStatus.branch,
+      deliveredVersion: null,
+      carryover: unresolved.map((requirement) => ({
+        requirement,
+        disposition: requirement.status === 'BLOCKED' ? 'blocked' as const : 'carried' as const,
+      })),
+      evidence: [path.relative(projectRoot, milestone.paths.readiness)],
+      residualRisks: qaResult === 'READY' ? [] : [`Product QA result: ${qaResult}`],
+      productionState: qaResult,
+    };
+    if (exists(milestone.paths.closeout)) {
+      registerExistingCloseout(ctx.paths, milestone, closeoutInput, ctx.now);
+    } else {
+      sealMilestone(ctx.paths, milestone, closeoutInput, ctx.now);
+    }
 
     const previousState = readState(ctx.paths);
     if (previousState) {
