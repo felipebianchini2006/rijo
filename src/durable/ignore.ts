@@ -7,6 +7,7 @@ const DURABLE_IGNORES = [
   'state/rijo.db',
   'state/rijo.db-wal',
   'state/rijo.db-shm',
+  'state/rijo.db.corrupt-*',
   'state/backups/',
 ] as const;
 

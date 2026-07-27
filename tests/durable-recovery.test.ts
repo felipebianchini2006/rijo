@@ -142,6 +142,7 @@ describe('durable recovery and outbox projection', () => {
     expect(first).toEqual(second);
     expect(content).toContain('state/rijo.db');
     expect(content).toContain('state/rijo.db-wal');
+    expect(content).toContain('state/rijo.db.corrupt-*');
     expect(content).toContain('state/backups/');
     expect(content).toContain('runtime/');
     expect(content).not.toContain('ledger/');
