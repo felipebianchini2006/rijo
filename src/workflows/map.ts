@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { RijoPaths } from '../core/paths.js';
-import { exists, readJsonIfExists, sha256 } from '../core/fsx.js';
+import { ensureDir, exists, readJsonIfExists, sha256, writeJsonAtomic } from '../core/fsx.js';
 import { MilestoneTransaction } from '../core/txn.js';
 import { snapshotTree, diffTrees } from '../core/workspace.js';
 import type { AgentTaskDraft } from '../agents/protocol.js';
@@ -15,11 +15,14 @@ import {
   dispatchBatch,
   dispatch,
   dispatchReadOnly,
+  commitDecisionProposals,
+  discardDecisionProposals,
   replaceableAttempt,
   guardSchema,
   type WorkflowContext,
   type WorkflowDeps,
   type WorkflowOutcome,
+  type ValidatedAgentEnvelope,
 } from './shared.js';
 import { buildInventory, MapPreflightError } from '../codebase/inventory.js';
 import {
@@ -32,6 +35,7 @@ import {
   partitionInventory,
   validateClaims,
   validateFragmentDetailed,
+  validateUniqueAnalysisOwnership,
 } from '../codebase/analyze.js';
 import {
   collectGitHistory,
@@ -47,6 +51,7 @@ import {
   ClaimsDocumentSchema,
   MapReviewSchema,
   MapStateSchema,
+  type ClaimReceipt,
   type BaselineDocument,
   type CodebaseMapState,
   type InventoryDocument,
@@ -201,10 +206,27 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   const graph = buildDependencyGraph(inventory);
   const impactScopes = operation === 'full' ? [] : expandImpactPaths(inventory, graph, surfaces, effectiveScopes);
   const shards = partitionInventory(inventory, impactScopes);
-  const deterministic = deterministicClaims(inventory, graph);
+  const deterministic = deterministicClaims(inventory, graph).map((claim) =>
+    withClaimIdentity(claim, 'deterministic'),
+  );
   const agentClaims: MapClaim[] = [];
   const gaps: string[] = [];
-  const mapperObservations: Array<{ shard_id: string; message: string }> = [];
+  const mapperObservations: Array<{
+    shard_id: string;
+    code: 'MAPPER_REPORTED' | 'MAPPER_INSUFFICIENT';
+    message: string;
+    affected_paths: string[];
+    affected_modules: string[];
+  }> = [];
+  const mapDecisionEnvelopes: ValidatedAgentEnvelope[] = [];
+  const fragmentReceipts: Array<{
+    shard_id: string;
+    allowed_paths: string[];
+    neighbor_contract_paths: string[];
+    accepted_evidence: Array<{ path: string; ownership: 'primary' | 'external_contract' }>;
+    rejected_evidence: Array<{ path: string; reason: string }>;
+    semantic_coverage: import('../codebase/schemas.js').SemanticCoverageRecord[];
+  }> = [];
 
   if (ctx.executor.capabilities.subagents && shards.length > 0) {
     bus.emit('map.shards', {
@@ -213,33 +235,54 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
       totalUnits: shards.length,
     });
     const before = snapshotTree(projectRoot);
-    const tasks: AgentTaskDraft[] = shards.map((shard) => ({
-      id: shard.id,
+    const tasks: AgentTaskDraft[] = shards.map((shard) => {
+      const primaryPaths = new Set(shard.files.map((file) => file.path));
+      const neighborPaths = explicitNeighborContractPaths(shard.module_ids, graph, inventory, primaryPaths);
+      return {
+        id: shard.id,
       role: 'researcher',
+      tier: 'balanced-reasoning',
       objective:
-        'Map only the assigned shard. Return evidence-backed JSON about responsibilities, contracts, invariants, conventions, data flow, operations, and risks. Do not read files outside code_files, do not write any file, and do not infer a claim from a path name alone. For a shard containing only documentation or assets, zero claims and zero gaps is valid; absence of source code is not a coverage gap.',
+        'Map only the assigned shard. Return evidence-backed JSON about responsibilities, contracts, invariants, conventions, data flow, operations, and risks. Do not read files outside code_files, do not write any file, and do not infer a claim from a path name alone. Every inventoried path named in a claim statement must appear in that claim evidence. Avoid subjective labels such as standard, minimal, simple, clean, conventional, or fragile unless exact file evidence proves the label. For a shard containing only documentation or assets, zero claims and zero gaps is valid; absence of source code is not a coverage gap.',
       canonical_files: [],
       code_files: shard.files.map((file) => path.join(projectRoot, file.path)),
       write_scope: [],
       acceptance_criteria: [
         'Every claim has a real path and sha256 from the supplied shard inventory',
-        'Every path belongs to exactly one assigned module',
+        'Primary evidence belongs to the exact code_files set, not merely another segment of the same module',
+        'A supplied neighbor contract is marked ownership=external_contract and is never claimed as owned',
+        'A behavioral shard returns a real semantic claim or an explicit factual gap',
         'No source or RIJO artifact is written',
       ],
       verification_commands: [],
       return_format:
-        'AgentResult.payload JSON: {shard_id, module_ids[], claims[{kind: responsibility|contract|invariant|risk|convention|operation|data_flow, statement, evidence[{path,symbol?,lines?,file_hash}]}], gaps[]}',
-      notes: `SHARD INVENTORY:\n${JSON.stringify(
-        shard.files.map((file) => ({
-          path: file.path,
-          module_id: file.module_id,
-          kind: file.kind,
-          file_hash: file.file_hash,
-          imports: file.imports,
-          exports: file.exports,
-        })),
-      )}`,
-    }));
+        'AgentResult.payload JSON: {shard_id, module_ids[], claims[{kind: responsibility|entrypoint|contract|invariant|dependency|consumer|data_flow|convention|test|operation|risk|placement, statement, evidence[{path,symbol?,lines?,file_hash,ownership:primary|external_contract}]}], semantic_coverage:[{module_id,category:responsibility|entrypoints|contracts|invariants|dependencies|consumers|data_flow|conventions|tests|operations|risks|placement,status:COVERED|GAP|NOT_APPLICABLE,rationale}], gaps:[{code:RESPONSIBILITY_UNKNOWN|ENTRYPOINT_UNKNOWN|CONTRACT_UNKNOWN|INVARIANT_UNKNOWN|DEPENDENCY_UNKNOWN|CONSUMER_UNKNOWN|DATA_FLOW_UNKNOWN|CONVENTION_UNKNOWN|TEST_COVERAGE_UNKNOWN|OPERATION_UNKNOWN|RISK_UNKNOWN|PLACEMENT_UNKNOWN,message,affected_paths[]}]} . Every behavioral module must disposition every semantic category exactly once. COVERED needs a matching primary claim of the corresponding kind, GAP needs the matching factual gap, and NOT_APPLICABLE is forbidden when the supplied matrix says applicable=true.',
+      notes: [
+        `SHARD INVENTORY:\n${JSON.stringify(
+          shard.files.map((file) => ({
+            path: file.path,
+            module_id: file.module_id,
+            kind: file.kind,
+            file_hash: file.file_hash,
+            imports: file.imports,
+            exports: file.exports,
+          })),
+        )}`,
+        `REQUIRED SEMANTIC COVERAGE MATRIX:\n${JSON.stringify(
+          semanticCoverageRequirements(shard.files),
+        )}`,
+        `EVIDENCE OWNERSHIP MATRIX:\n${JSON.stringify([
+          ...[...primaryPaths].sort().map((evidencePath) => ({ path: evidencePath, ownership: 'primary' })),
+          ...[...neighborPaths].sort().map((evidencePath) => ({
+            path: evidencePath,
+            ownership: 'external_contract',
+          })),
+        ])}`,
+        'Every evidence object must use the ownership value assigned to its exact path above. Never infer external_contract from an import relationship. A claim statement must never name a literal path absent from this matrix.',
+        'Return exactly one semantic_coverage record for every module_id/category pair in that matrix. Use COVERED with a matching primary claim, GAP with the matching factual gap, or NOT_APPLICABLE only where applicable=false.',
+      ].join('\n\n'),
+      };
+    });
     const attempts = tasks.map((task) =>
       replaceableAttempt(ctx, task, {}, {
         stage: 'RESEARCH',
@@ -268,20 +311,34 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     }
     for (let i = 0; i < results.length; i++) {
       const shard = shards[i]!;
+      const allowedPaths = new Set(shard.files.map((file) => file.path));
+      const neighborContractPaths = explicitNeighborContractPaths(shard.module_ids, graph, inventory, allowedPaths);
       let result = results[i]!;
       if (!result.ok) {
         return blocked(ctx, `Supervised mapper ${shard.id} failed; the valid map was not replaced.`, [result.summary]);
       }
-      let validation = validateFragmentDetailed(projectRoot, inventory, result.payload, shard.module_ids);
+      let validation = validateFragmentDetailed(
+        projectRoot,
+        inventory,
+        result.payload,
+        allowedPaths,
+        neighborContractPaths,
+      );
       if (!validation.fragment) {
+        discardDecisionProposals(ctx, result);
         const correctionBefore = snapshotTree(projectRoot);
         const correction = replaceableAttempt(
           ctx,
           {
             ...tasks[i]!,
             id: `${shard.id}-correction`,
-            objective: `${tasks[i]!.objective} Correct the previous structured payload using the exact schema errors below; do not repeat or omit them.`,
-            notes: `PREVIOUS PAYLOAD ERRORS:\n${validation.errors.join('\n')}\n\n${tasks[i]!.notes ?? ''}`,
+            objective: `${tasks[i]!.objective} Correct the previous structured payload using the exact schema errors below; do not repeat or omit them. Revalidate the entire output contract, not only the listed field. If a claim cites a path outside the supplied ownership matrix, delete or rewrite that claim; never import evidence from another shard.`,
+            notes: [
+              `REQUIRED LOGICAL SHARD OWNER: return shard_id exactly "${shard.id}".`,
+              `The dispatch attempt id "${shard.id}-correction" is not a shard owner and must never appear as payload.shard_id.`,
+              `PREVIOUS PAYLOAD ERRORS:\n${validation.errors.join('\n')}`,
+              tasks[i]!.notes ?? '',
+            ].join('\n\n'),
           },
           {},
           {
@@ -313,18 +370,60 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
         if (correctionViolation.length > 0) {
           return blocked(ctx, `Mapper ${shard.id} correction modified the controlled checkout.`, correctionViolation);
         }
-        validation = validateFragmentDetailed(projectRoot, inventory, result.payload, shard.module_ids);
+        validation = validateFragmentDetailed(
+          projectRoot,
+          inventory,
+          result.payload,
+          allowedPaths,
+          neighborContractPaths,
+        );
       }
       if (!validation.fragment) {
-        return blocked(ctx, `Mapper ${shard.id} returned invalid or unsupported evidence; the valid map was not replaced.`, [
-          'Expected a Zod-valid fragment whose paths, hashes, lines, symbols, and module ownership match the assigned shard.',
-          ...validation.errors.slice(0, 12),
-        ]);
+        const essentialBehavior = shard.files.some((file) =>
+          ['code', 'test', 'migration', 'script'].includes(file.kind),
+        );
+        if (essentialBehavior) {
+          return blocked(ctx, `Mapper ${shard.id} returned invalid or unsupported evidence; the valid map was not replaced.`, [
+            'Expected a Zod-valid fragment whose paths, hashes, lines, symbols, and module ownership match the assigned shard.',
+            ...validation.errors.slice(0, 12),
+          ]);
+        }
+        fragmentReceipts.push(validation.receipt);
+        mapperObservations.push({
+          shard_id: shard.id,
+          code: 'MAPPER_INSUFFICIENT',
+          message: `MAPPER_INSUFFICIENT: ${validation.errors.join('; ')}`,
+          affected_paths: shard.files.map((file) => file.path),
+          affected_modules: shard.module_ids,
+        });
+        discardDecisionProposals(ctx, result);
+        bus.emit('map.shard_partial', {
+          stage: 'MAP_SYNTHESIS',
+          message: `${shard.id}: insufficient non-code analysis recorded as a structured PARTIAL gap`,
+        });
+        continue;
       }
       const fragment = validation.fragment;
-      agentClaims.push(...fragment.claims);
+      if (fragment.shard_id !== shard.id) {
+        return blocked(ctx, `Mapper ${shard.id} returned a fragment for another shard; the valid map was not replaced.`, [
+          `Expected shard_id=${shard.id}; received ${fragment.shard_id}.`,
+        ]);
+      }
+      fragmentReceipts.push(validation.receipt);
+      const ownershipErrors = validateUniqueAnalysisOwnership(fragmentReceipts);
+      if (ownershipErrors.length > 0) {
+        return blocked(ctx, 'Map synthesis found conflicting exact-path analysis ownership.', ownershipErrors);
+      }
+      mapDecisionEnvelopes.push(result);
+      agentClaims.push(...fragment.claims.map((claim) => withClaimIdentity(claim, shard.id)));
       mapperObservations.push(
-        ...fragment.gaps.map((message) => ({ shard_id: shard.id, message })),
+        ...fragment.gaps.map((gap) => ({
+          shard_id: shard.id,
+          code: 'MAPPER_REPORTED' as const,
+          message: `${gap.code}: ${gap.message} (${gap.affected_paths.join(', ')})`,
+          affected_paths: gap.affected_paths,
+          affected_modules: fragment.module_ids,
+        })),
       );
       const requiresCodeSemanticCoverage = shard.files.some(
         (file) => file.kind !== 'documentation' && file.kind !== 'asset',
@@ -349,7 +448,11 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     previousClaims?.success
       ? previousClaims.data.claims.filter((claim) => claimStillCurrent(claim, inventory, impactScopes))
       : [];
-  let claims = dedupeClaims([...retainedClaims, ...deterministic, ...agentClaims]);
+  let claims = dedupeClaims([
+    ...retainedClaims.map((claim) => withClaimIdentity(claim, claim.source_shard ?? 'retained')),
+    ...deterministic,
+    ...agentClaims,
+  ]);
   const claimErrors = validateClaims(projectRoot, inventory, claims);
   if (claimErrors.length > 0) return blocked(ctx, 'Map synthesis contains invalid evidence.', claimErrors);
   const provisionalAssessment = assessMapCoverage(inventory, symbols, surfaces, graph, claims, {
@@ -359,12 +462,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   inventory.coverage = provisionalAssessment.coverage;
 
   bus.emit('map.review', { stage: 'MAP_REVIEW', message: 'revalidando paths, hashes, símbolos, contradições e cobertura' });
-  const claimReceipts: Array<{
-    claim_hash: string;
-    review_shard: string;
-    structural: 'PASSED';
-    semantic: 'APPROVED' | 'NOT_REVIEWED';
-  }> = [];
+  const claimReceipts: ClaimReceipt[] = [];
   let consolidationStatus: 'APPROVED' | 'NOT_REVIEWED' = 'NOT_REVIEWED';
   const contradictions = detectClaimContradictions(claims);
   if (contradictions.length > 0) {
@@ -377,43 +475,29 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     ];
     let review = await reviewClaimSet(ctx, inventory, claims, reviewContext, 'map-review');
     if (review.status === 'INVALID') {
+      persistRejectedClaimReceipts(ctx, claims, review);
       return blocked(ctx, 'Independent map review did not produce a valid verdict; the valid map was not replaced.', review.details);
     }
     if (review.status === 'REJECTED') {
-      bus.emit(
-        'map.review_fallback',
-        { message: 'claims enriquecidas rejeitadas; refazendo candidato apenas com claims determinísticas' },
-        { findings: review.details },
-      );
-      claims = dedupeClaims(deterministic);
-      const fallbackErrors = validateClaims(projectRoot, inventory, claims);
-      if (fallbackErrors.length > 0) {
-        return blocked(ctx, 'Deterministic map fallback contains invalid evidence.', fallbackErrors);
-      }
-      inventory.coverage = assessMapCoverage(inventory, symbols, surfaces, graph, claims, {
-        baselineStatus: 'NOT_AVAILABLE',
-        gaps,
-      }).coverage;
-      review = await reviewClaimSet(ctx, inventory, claims, reviewContext, 'map-review-fallback');
-      if (review.status !== 'APPROVED') {
-        return blocked(
-          ctx,
-          review.status === 'INVALID'
-            ? 'Deterministic map fallback did not receive a valid verdict.'
-            : 'Independent map review rejected the deterministic fallback.',
-          review.details,
-        );
-      }
+      persistRejectedClaimReceipts(ctx, claims, review);
+      return blocked(ctx, 'Independent map review rejected candidate claims; the valid map was not replaced.', [
+        ...review.details,
+      ]);
     }
     claimReceipts.push(...review.receipts);
+    mapDecisionEnvelopes.push(...(review.envelopes ?? []));
     consolidationStatus = review.consolidation;
   } else {
     for (const claim of claims) {
       claimReceipts.push({
-        claim_hash: sha256(JSON.stringify(claim)),
-        review_shard: 'deterministic-only',
-        structural: 'PASSED',
-        semantic: 'NOT_REVIEWED',
+        claim_id: claim.claim_id!,
+        source_shard: claim.source_shard!,
+        structural_status: 'PASSED',
+        semantic_status: 'NOT_REVIEWED',
+        reviewer_attempt: null,
+        reviewed_at: now().toISOString(),
+        evidence_hash: claimEvidenceHash(claim),
+        final_disposition: 'PARTIAL',
       });
     }
   }
@@ -431,9 +515,28 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   }
   const assessment = assessMapCoverage(inventory, symbols, surfaces, graph, claims, {
     baselineStatus: baseline.overall_status,
-    gaps,
+    gaps: [
+      ...gaps,
+      ...mapperObservations.map((observation) => `${observation.shard_id}: ${observation.message}`),
+    ],
+    gapRecords: mapperObservations.map((observation) => ({
+      code: observation.code,
+      category: 'semantic' as const,
+      severity: 'non_critical' as const,
+      message: `${observation.shard_id}: ${observation.message}`,
+      affected_paths: observation.affected_paths,
+      affected_modules: observation.affected_modules,
+    })),
+    claimReceipts,
+    runtimeAvailable: ctx.executor.capabilities.subagents,
+    baselineWaiverSafe: baseline.overall_status === 'WAIVED' && baseline.waiver?.safe === true,
   });
   inventory.coverage = assessment.coverage;
+  if (assessment.status === 'BLOCKED') {
+    return blockedReadOnly(ctx, `Codebase map ${operation} is BLOCKED; the valid previous map was preserved.`, [
+      ...assessment.gaps,
+    ]);
+  }
 
   const staleReasons = [
     ...(baseUnavailable ? ['mapped commit is no longer accessible; full remap performed'] : []),
@@ -448,6 +551,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     baseline,
     claims,
     gaps: assessment.gaps,
+    gapRecords: assessment.gapRecords,
     observations: mapperObservations,
     commit: metadata.head,
     branch: metadata.branch,
@@ -459,6 +563,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     status: assessment.status,
     reviewReceipts: {
       claim_receipts: claimReceipts,
+      shard_receipts: fragmentReceipts,
       mapper_observations: mapperObservations.map((observation) => ({
         ...observation,
         review_status: 'APPROVED_NON_BLOCKING' as const,
@@ -495,31 +600,62 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
       return blocked(ctx, 'Codebase map was promoted but its configured Git commit failed.', commitPaths);
     }
   }
+  for (const envelope of mapDecisionEnvelopes) commitDecisionProposals(ctx, envelope);
+  if (
+    options.commit !== false &&
+    ctx.config.git.commit &&
+    metadata.is_repo &&
+    ctx.config.decisions.record_material_decisions &&
+    mapDecisionEnvelopes.some((envelope) =>
+      envelope.pending_decisions.some((decision) => decision.proposal.material),
+    )
+  ) {
+    const decisionPaths = [paths.decisions, paths.manifest]
+      .filter((target) => exists(target))
+      .map((target) => rel(projectRoot, target));
+    const dirtyDecisionPaths = ctx.git
+      .status(projectRoot)
+      .dirtyFiles.filter((dirty) => decisionPaths.includes(dirty));
+    if (
+      dirtyDecisionPaths.length > 0 &&
+      !ctx.git.commitPaths(projectRoot, `rijo(map): persist approved decisions`, dirtyDecisionPaths)
+    ) {
+      return blocked(
+        ctx,
+        'Codebase map decisions were approved and persisted, but their configured Git commit failed.',
+        dirtyDecisionPaths,
+      );
+    }
+  }
 
   bus.emit('map.done', {
     status: candidate.state.status === 'BLOCKED' ? 'blocked' : 'completed',
     stage: 'MAP_DONE',
     message: `mapa ${operation} ${candidate.state.status.toLowerCase()}: ${inventory.files.length} arquivos, ${graph.modules.length} módulos`,
   });
-  if (candidate.state.status === 'BLOCKED') {
-    return blockedReadOnly(ctx, `Codebase map ${operation} is BLOCKED for safe planning.`, candidate.state.gaps);
-  }
   return completed(
     ctx,
     `Codebase map ${operation} ${candidate.state.status.toLowerCase()} (${inventory.files.length} files, ${graph.modules.length} modules).`,
   );
 }
 
-type ClaimReviewReceipt = {
-  claim_hash: string;
-  review_shard: string;
-  structural: 'PASSED';
-  semantic: 'APPROVED';
-};
+type ClaimReviewReceipt = ClaimReceipt;
 
 type ClaimReviewOutcome =
-  | { status: 'APPROVED'; details: string[]; receipts: ClaimReviewReceipt[]; consolidation: 'APPROVED' }
-  | { status: 'REJECTED' | 'INVALID'; details: string[]; receipts: []; consolidation: 'NOT_REVIEWED' };
+  | {
+      status: 'APPROVED';
+      details: string[];
+      receipts: ClaimReviewReceipt[];
+      consolidation: 'APPROVED';
+      envelopes: ValidatedAgentEnvelope[];
+    }
+  | {
+      status: 'REJECTED' | 'INVALID';
+      details: string[];
+      receipts: ClaimReviewReceipt[];
+      consolidation: 'NOT_REVIEWED';
+      envelopes?: never;
+    };
 
 async function reviewClaimSet(
   ctx: WorkflowContext,
@@ -580,11 +716,13 @@ async function reviewClaimSet(
     };
   }
   const receipts: ClaimReviewReceipt[] = [];
+  const approvedEnvelopes: ValidatedAgentEnvelope[] = [];
   const rejected: string[] = [];
   for (let index = 0; index < results.length; index++) {
     const result = results[index]!;
     const review = MapReviewSchema.safeParse(result.payload);
     if (!result.ok || !review.success) {
+      discardDecisionProposals(ctx, result);
       return {
         status: 'INVALID',
         details: [result.summary],
@@ -606,6 +744,19 @@ async function reviewClaimSet(
       }
     }
     if (!review.data.approved || review.data.findings.length > 0) {
+      discardDecisionProposals(ctx, result);
+      for (const claim of claimShards[index]!) {
+        receipts.push({
+          claim_id: claim.claim_id!,
+          source_shard: claim.source_shard!,
+          structural_status: 'PASSED',
+          semantic_status: 'REJECTED',
+          reviewer_attempt: reviewTasks[index]!.id,
+          reviewed_at: ctx.now().toISOString(),
+          evidence_hash: claimEvidenceHash(claim),
+          final_disposition: 'REJECTED',
+        });
+      }
       rejected.push(
         ...(review.data.findings.length > 0
           ? review.data.findings.map((finding) => finding.message)
@@ -613,17 +764,22 @@ async function reviewClaimSet(
       );
       continue;
     }
+    approvedEnvelopes.push(result);
     for (const claim of claimShards[index]!) {
       receipts.push({
-        claim_hash: sha256(JSON.stringify(claim)),
-        review_shard: reviewTasks[index]!.id,
-        structural: 'PASSED',
-        semantic: 'APPROVED',
+        claim_id: claim.claim_id!,
+        source_shard: claim.source_shard!,
+        structural_status: 'PASSED',
+        semantic_status: 'APPROVED',
+        reviewer_attempt: reviewTasks[index]!.id,
+        reviewed_at: ctx.now().toISOString(),
+        evidence_hash: claimEvidenceHash(claim),
+        final_disposition: 'APPROVED',
       });
     }
   }
   if (rejected.length > 0) {
-    return { status: 'REJECTED', details: rejected, receipts: [], consolidation: 'NOT_REVIEWED' };
+    return { status: 'REJECTED', details: rejected, receipts, consolidation: 'NOT_REVIEWED' };
   }
   if (claimShards.length > 1) {
     const { result, violation: consolidationViolation } = await dispatchReadOnlyMapConsolidation(
@@ -642,6 +798,7 @@ async function reviewClaimSet(
     }
     const review = MapReviewSchema.safeParse(result.payload);
     if (!result.ok || !review.success) {
+      discardDecisionProposals(ctx, result);
       return {
         status: 'INVALID',
         details: [result.summary],
@@ -650,30 +807,78 @@ async function reviewClaimSet(
       };
     }
     if (!review.data.approved || review.data.findings.length > 0) {
+      discardDecisionProposals(ctx, result);
       return {
         status: 'REJECTED',
         details: review.data.findings.map((finding) => finding.message),
-        receipts: [],
+        receipts: receipts.map((receipt) => ({
+          ...receipt,
+          semantic_status: 'REJECTED' as const,
+          final_disposition: 'REJECTED' as const,
+          reviewer_attempt: `${idPrefix}-consolidation`,
+          reviewed_at: ctx.now().toISOString(),
+        })),
         consolidation: 'NOT_REVIEWED',
       };
     }
+    approvedEnvelopes.push(result);
   }
-  return { status: 'APPROVED', details: [], receipts, consolidation: 'APPROVED' };
+  return {
+    status: 'APPROVED',
+    details: [],
+    receipts,
+    consolidation: 'APPROVED',
+    envelopes: approvedEnvelopes,
+  };
+}
+
+function persistRejectedClaimReceipts(
+  ctx: WorkflowContext,
+  claims: MapClaim[],
+  review: Exclude<ClaimReviewOutcome, { status: 'APPROVED' }>,
+): void {
+  const byId = new Map(review.receipts.map((receipt) => [receipt.claim_id, receipt]));
+  const receipts = claims.map(
+    (claim): ClaimReceipt =>
+      byId.get(claim.claim_id!) ?? {
+        claim_id: claim.claim_id!,
+        source_shard: claim.source_shard!,
+        structural_status: 'PASSED',
+        semantic_status: 'NOT_REVIEWED',
+        reviewer_attempt: null,
+        reviewed_at: ctx.now().toISOString(),
+        evidence_hash: claimEvidenceHash(claim),
+        final_disposition: 'PARTIAL',
+      },
+  );
+  const dir = path.join(ctx.paths.runtimeDir, 'map-review-rejections');
+  ensureDir(dir);
+  const candidateHash = sha256(
+    JSON.stringify(receipts.map((receipt) => [receipt.claim_id, receipt.evidence_hash, receipt.final_disposition])),
+  );
+  writeJsonAtomic(path.join(dir, `${candidateHash}.json`), {
+    schema_version: 1,
+    status: review.status,
+    reviewed_at: ctx.now().toISOString(),
+    details: review.details,
+    receipts,
+  });
 }
 
 async function dispatchReadOnlyMapConsolidation(
   ctx: WorkflowContext,
   claimShards: MapClaim[][],
-  receipts: Array<{ claim_hash: string; review_shard: string; structural: 'PASSED'; semantic: 'APPROVED' | 'NOT_REVIEWED' }>,
+  receipts: ClaimReceipt[],
   taskId = 'map-review-consolidation',
-): Promise<{ result: import('../agents/protocol.js').AgentResult; violation: string[] }> {
+): Promise<{ result: ValidatedAgentEnvelope; violation: string[] }> {
   const summaries = claimShards.map((shard, index) => ({
     shard: `map-review-${String(index + 1).padStart(3, '0')}`,
     claims: shard.map((claim) => ({
       kind: claim.kind,
       statement: claim.statement,
       evidence_paths: claim.evidence.map((item) => item.path),
-      claim_hash: sha256(JSON.stringify(claim)),
+      claim_id: claim.claim_id,
+      evidence_hash: claimEvidenceHash(claim),
     })),
   }));
   return dispatchReadOnly(
@@ -693,7 +898,7 @@ async function dispatchReadOnlyMapConsolidation(
       verification_commands: [],
       return_format:
         'AgentResult.payload JSON: {approved:boolean, findings:[{code:MISSING_EVIDENCE|BAD_PATH|BAD_HASH|BAD_SYMBOL|CONTRADICTION|COVERAGE_GAP,message,evidence:[]}]}',
-      notes: `REVIEWED SHARD SUMMARIES:\n${JSON.stringify(summaries)}\nRECEIPT COUNT: ${receipts.length}`,
+      notes: `REVIEWED SHARD SUMMARIES:\n${JSON.stringify(summaries)}\nFINAL RECEIPTS:\n${JSON.stringify(receipts)}`,
     },
     {
       stage: 'CODE_REVIEW',
@@ -740,6 +945,40 @@ function dedupeClaims(claims: MapClaim[]): MapClaim[] {
   return [...map.values()];
 }
 
+function claimEvidenceHash(claim: MapClaim): string {
+  return sha256(
+    JSON.stringify(
+      claim.evidence
+        .map((evidence) => ({
+          path: evidence.path,
+          symbol: evidence.symbol ?? null,
+          lines: evidence.lines ?? null,
+          file_hash: evidence.file_hash,
+          ownership: evidence.ownership,
+        }))
+        .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+    ),
+  );
+}
+
+function withClaimIdentity(claim: MapClaim, sourceShard: string): MapClaim {
+  const source = claim.source_shard ?? sourceShard;
+  return {
+    ...claim,
+    source_shard: source,
+    claim_id:
+      claim.claim_id ??
+      `claim-${sha256(
+        JSON.stringify({
+          source,
+          kind: claim.kind,
+          statement: claim.statement,
+          evidence_hash: claimEvidenceHash(claim),
+        }),
+      ).slice(0, 24)}`,
+  };
+}
+
 function validateCandidate(artifacts: Record<string, string>, state: CodebaseMapState): void {
   MapStateSchema.parse(state);
   for (const [name, expected] of Object.entries(state.artifact_hashes)) {
@@ -772,6 +1011,76 @@ function claimStillCurrent(
       !affectedPaths.some(
         (affected) => evidence.path === affected || evidence.path.startsWith(`${affected.replace(/\/$/, '')}/`),
       ) && byPath.get(evidence.path) === evidence.file_hash,
+  );
+}
+
+function semanticCoverageRequirements(files: InventoryDocument['files']): Array<{
+  module_id: string;
+  category: string;
+  applicable: boolean;
+}> {
+  const categories = [
+    'responsibility',
+    'entrypoints',
+    'contracts',
+    'invariants',
+    'dependencies',
+    'consumers',
+    'data_flow',
+    'conventions',
+    'tests',
+    'operations',
+    'risks',
+    'placement',
+  ] as const;
+  const behavioralModules = [
+    ...new Set(
+      files
+        .filter((file) => ['code', 'test', 'migration', 'script'].includes(file.kind))
+        .map((file) => file.module_id),
+    ),
+  ].sort();
+  return behavioralModules.flatMap((moduleId) => {
+    const moduleFiles = files.filter((file) => file.module_id === moduleId);
+    const applicable = new Set<string>(['responsibility', 'conventions', 'placement']);
+    if (moduleFiles.some((file) => file.kind === 'code' && file.exports.length > 0)) {
+      applicable.add('entrypoints');
+      applicable.add('contracts');
+    }
+    if (moduleFiles.some((file) => file.kind === 'code' && file.imports.length > 0)) {
+      applicable.add('dependencies');
+    }
+    if (moduleFiles.some((file) => file.kind === 'test')) applicable.add('tests');
+    if (moduleFiles.some((file) => file.kind === 'script')) applicable.add('operations');
+    if (moduleFiles.some((file) => file.kind === 'migration')) applicable.add('data_flow');
+    return categories.map((category) => ({
+      module_id: moduleId,
+      category,
+      applicable: applicable.has(category),
+    }));
+  });
+}
+
+function explicitNeighborContractPaths(
+  moduleIds: string[],
+  graph: ReturnType<typeof buildDependencyGraph>,
+  inventory: InventoryDocument,
+  allowedPaths: Set<string>,
+): Set<string> {
+  const neighbors = new Set(
+    graph.modules
+      .filter((module) => moduleIds.includes(module.id))
+      .flatMap((module) => [...module.dependencies, ...module.consumers]),
+  );
+  return new Set(
+    inventory.files
+      .filter(
+        (file) =>
+          !allowedPaths.has(file.path) &&
+          neighbors.has(file.module_id) &&
+          file.exports.length > 0,
+      )
+      .map((file) => file.path),
   );
 }
 

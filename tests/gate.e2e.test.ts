@@ -12,7 +12,7 @@ import { nativeSandboxAvailable } from '../src/security/execpolicy.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { parseFrontmatter } from '../src/core/frontmatter.js';
-import { tmpProject, cleanup, writePlanFile, deps } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, mappedNewReferenceFor } from './helpers.js';
 
 /**
  * REAL production-gate E2E: real git repository, real npm install, real HTTP
@@ -80,8 +80,8 @@ function fixturePlan(root: string) {
     return {
       phase: phaseId,
       tasks: [
-        { id: 'T01', name: 'Implementar saudação', requirement_ids: reqIds, technical_justification: null, files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: [], parallel: false, tdd: false, tests: ['node test.js'], evidence_expected: 'teste passa', done: false },
-        { id: 'T02', name: 'Integração', requirement_ids: [], technical_justification: 'integração', files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: ['T01'], parallel: false, tdd: false, tests: [], evidence_expected: 'build passa', done: false },
+        { id: 'T01', name: 'Implementar saudação', requirement_ids: reqIds, technical_justification: null, files: ['a.js'], mapped_references: [mappedNewReferenceFor(root, 'a.js')], write_scope: ['a.js'], depends_on: [], parallel: false, tdd: false, tests: ['node test.js'], evidence_expected: 'teste passa', done: false },
+        { id: 'T02', name: 'Integração', requirement_ids: [], technical_justification: 'integração', files: ['b.js'], mapped_references: [mappedNewReferenceFor(root, 'b.js')], write_scope: ['b.js'], depends_on: ['T01'], parallel: false, tdd: false, tests: [], evidence_expected: 'build passa', done: false },
       ],
     };
   };
@@ -135,7 +135,7 @@ describe.runIf(canRun)('production gate E2E (real app, real server, real Playwri
     const created = await newWorkflow(root, { planFile: '@PLANO.md' }, d);
     expect(created.ok, created.message).toBe(true);
     const ran = await runWorkflow(root, { target: 'all' }, d);
-    expect(ran.ok, ran.message).toBe(true);
+    expect(ran.ok, JSON.stringify(ran)).toBe(true);
 
     // ---- structured journey actions + qa gate configuration (versioned, committed)
     const paths = new RijoPaths(root);

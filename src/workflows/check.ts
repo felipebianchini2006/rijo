@@ -18,6 +18,8 @@ import {
   failed,
   dispatch,
   dispatchBatch,
+  commitDecisionProposals,
+  discardDecisionProposals,
   prepareAttempt,
   guardSchema,
   type WorkflowContext,
@@ -129,6 +131,7 @@ export async function checkWorkflow(
           };
           const fixRes = await dispatch(ctx, fixTask, { stage: 'EXECUTE' });
           if (!fixRes.ok) break;
+          commitDecisionProposals(ctx, fixRes);
           fixesApplied.push(`round ${round}: ${fixRes.summary}`);
           // re-run the entire deterministic matrix, not only the failing subset
           checks = runDeterministicChecks(ctx);
@@ -157,6 +160,7 @@ export async function checkWorkflow(
         const parsed = JourneyResultSchema.pick({ findings: true }).safeParse(visualRes.payload);
         if (parsed.success && journeyResults.length > 0) {
           journeyResults[0]!.findings.push(...parsed.data.findings);
+          commitDecisionProposals(ctx, visualRes);
         }
       }
     }
@@ -307,6 +311,7 @@ async function productionCheck(
       const beforeApply = snapshotFiles(projectRoot);
       attempt.workspace.applyVerifiedPatch();
       appliedPaths = diffSnapshots(beforeApply, snapshotFiles(projectRoot)).changed;
+      commitDecisionProposals(ctx, res);
     } catch (err) {
       bus.emit('check.fix_failed', { message: `reparo descartado: ${(err as Error).message}` });
       break;
@@ -504,6 +509,8 @@ async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journe
   for (let i = 0; i < results.length; i++) {
     const r = results[i]!;
     const parsed = JourneyResultSchema.safeParse(r.payload);
+    if (r.ok && parsed.success) commitDecisionProposals(ctx, r);
+    else discardDecisionProposals(ctx, r);
     out.push(
       parsed.success
         ? parsed.data

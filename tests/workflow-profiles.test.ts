@@ -7,7 +7,7 @@ import { checkWorkflow } from '../src/workflows/check.js';
 import { renderBrief } from '../src/agents/prompts.js';
 import type { AgentTask } from '../src/agents/protocol.js';
 import type { FakeAgentRunner } from '../src/agents/runner.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok, wireUi, phaseReqIds } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, newMappedReference, ok, wireUi, phaseReqIds } from './helpers.js';
 
 /** The last executed task whose id matches a prefix (routing is stamped on it). */
 function lastExecuted(runner: FakeAgentRunner, idPrefix: string): AgentTask {
@@ -66,12 +66,12 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
         tasks: [
           {
             id: 'T01', name: 'auth session guard', requirement_ids: phaseReqIds(root, phaseId),
-            technical_justification: null, files: ['src/auth/session.ts'], write_scope: ['src/auth/session.ts'],
+            technical_justification: null, files: ['src/auth/session.ts'], mapped_references: [newMappedReference('src/auth/session.ts')], write_scope: ['src/auth/session.ts'],
             depends_on: [], parallel: false, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false,
           },
           {
             id: 'T02', name: 'wire it', requirement_ids: [], technical_justification: 'integration',
-            files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: ['T01'],
+            files: ['src/b.ts'], mapped_references: [newMappedReference('src/b.ts')], write_scope: ['src/b.ts'], depends_on: ['T01'],
             parallel: false, tdd: false, tests: [], evidence_expected: 'e', done: false,
           },
         ],

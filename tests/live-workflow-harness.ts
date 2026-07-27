@@ -251,7 +251,7 @@ export function haikuConfigYaml(provider: 'claude' | 'codex', ov: SupervisorOver
   const hardKill = ov.hardKillGraceMs ?? 5_000;
   const maxRepl = ov.maxReplacements ?? 1;
   return [
-    'schema_version: 3',
+    'schema_version: 4',
     'models:',
     '  lead: economical-research',
     '  reviewer: balanced-reasoning',

@@ -18,6 +18,14 @@ function task(id: string, over: Partial<PlanTask> = {}): PlanTask {
     id,
     name: `Task ${id}`,
     files: [`src/${id}.ts`],
+    mapped_references: [
+      {
+        path: `src/${id}.ts`,
+        intent: 'new',
+        parent_module: 'src',
+        placement_evidence: [{ path: 'src', reason: 'test fixture module' }],
+      },
+    ],
     write_scope: [`src/${id}.ts`],
     evidence_expected: 'tests pass',
     technical_justification: 'infra',
@@ -179,12 +187,20 @@ describe('setTaskStatus (task lifecycle)', () => {
     cleanup(root);
   });
 
+  const persisted = (tasks: PlanTask[]): PhasePlan => ({
+    phase: '01',
+    tasks,
+    mapped_commit: 'GREENFIELD',
+    mapped_tree_hash: 'GREENFIELD',
+    planned_at: '2026-07-23T00:00:00.000Z',
+    context_packet_hash: 'a'.repeat(64),
+    mapped_reference_hashes: {},
+    decision_context_hash: 'b'.repeat(64),
+  });
+
   it('walks the full lifecycle and only DONE flips the done flag', () => {
     const planPath = path.join(root, 'PLAN.md');
-    const plan: PhasePlan = {
-      phase: '01',
-      tasks: [task('T01'), task('T02', { depends_on: ['T01'] })],
-    };
+    const plan = persisted([task('T01'), task('T02', { depends_on: ['T01'] })]);
     writePlan(planPath, plan, 'A short narrative for the phase.');
 
     const before = readPlan(planPath);
@@ -211,7 +227,7 @@ describe('setTaskStatus (task lifecycle)', () => {
 
   it('rejects skipping the lifecycle (PENDING → DONE is a core error)', () => {
     const planPath = path.join(root, 'PLAN.md');
-    writePlan(planPath, { phase: '01', tasks: [task('T01'), task('T02')] }, 'narrative');
+    writePlan(planPath, persisted([task('T01'), task('T02')]), 'narrative');
     expect(() => setTaskStatus(planPath, 'T01', 'DONE')).toThrow(/invalid lifecycle transition/);
     expect(() => setTaskStatus(planPath, 'T01', 'VERIFIED')).toThrow(/invalid lifecycle transition/);
     // the failed attempts persisted nothing
@@ -220,7 +236,7 @@ describe('setTaskStatus (task lifecycle)', () => {
 
   it('throws for an unknown task id', () => {
     const planPath = path.join(root, 'PLAN.md');
-    writePlan(planPath, { phase: '01', tasks: [task('T01'), task('T02')] }, 'narrative');
+    writePlan(planPath, persisted([task('T01'), task('T02')]), 'narrative');
     expect(() => setTaskStatus(planPath, 'T99', 'RUNNING')).toThrow(/T99 not found/);
   });
 });

@@ -69,25 +69,90 @@ export function ok(task: AgentTask, extra: Partial<AgentResult> = {}): AgentResu
 /** Evidence-valid structured payload for a RIJO map shard fake. */
 export function mapFragmentFor(task: AgentTask): unknown {
   const marker = 'SHARD INVENTORY:\n';
-  const raw = task.notes.slice(task.notes.indexOf(marker) + marker.length).split('\n\nAUTONOMOUS DECISION POLICY')[0]!;
+  const raw = task.notes
+    .slice(task.notes.indexOf(marker) + marker.length)
+    .split('\n\nREQUIRED SEMANTIC COVERAGE MATRIX:')[0]!
+    .split('\n\nAUTONOMOUS DECISION POLICY')[0]!;
   const files = JSON.parse(raw) as Array<{
     path: string;
     module_id: string;
     file_hash: string;
     exports: string[];
+    imports: string[];
+    kind: string;
   }>;
   const modules = [...new Set(files.map((file) => file.module_id))];
-  return {
-    shard_id: task.id,
-    module_ids: modules,
-    claims: modules.map((moduleId) => {
-      const anchor = files.find((file) => file.module_id === moduleId)!;
-      return {
+  const claims = modules.flatMap((moduleId) => {
+    const moduleFiles = files.filter((file) => file.module_id === moduleId);
+    const anchor = moduleFiles[0]!;
+    const evidence = [{ path: anchor.path, file_hash: anchor.file_hash }];
+    return [
+      {
         kind: 'responsibility',
-        statement: `${moduleId} is owned by its mapped shard.`,
-        evidence: [{ path: anchor.path, file_hash: anchor.file_hash }],
-      };
-    }),
+        statement: `${moduleId} implements behavior evidenced by its assigned source shard.`,
+        evidence,
+      },
+      {
+        kind: 'convention',
+        statement: `New ${moduleId} behavior belongs beside the assigned module files.`,
+        evidence,
+      },
+      ...(moduleFiles.some((file) => file.exports.length > 0)
+        ? [{ kind: 'contract', statement: `${moduleId} exposes its listed exports as entrypoints.`, evidence }]
+        : []),
+      ...(moduleFiles.some((file) => file.imports.length > 0 || file.kind === 'migration')
+        ? [{ kind: 'data_flow', statement: `${moduleId} data and dependency flow follows its listed imports.`, evidence }]
+        : []),
+      ...(moduleFiles.some((file) => file.kind === 'test' || file.kind === 'configuration' || file.kind === 'script')
+        ? [{ kind: 'operation', statement: `${moduleId} has test or operational behavior in its assigned files.`, evidence }]
+        : []),
+    ];
+  });
+  const categories = [
+    'responsibility',
+    'entrypoints',
+    'contracts',
+    'invariants',
+    'dependencies',
+    'consumers',
+    'data_flow',
+    'conventions',
+    'tests',
+    'operations',
+    'risks',
+    'placement',
+  ] as const;
+  const semanticCoverage = modules.flatMap((moduleId) => {
+    const moduleFiles = files.filter((file) => file.module_id === moduleId);
+    const hasExports = moduleFiles.some((file) => file.exports.length > 0);
+    const hasImports = moduleFiles.some((file) => file.imports.length > 0);
+    const hasTests = moduleFiles.some((file) => file.kind === 'test');
+    const hasOperations = moduleFiles.some((file) => file.kind === 'configuration' || file.kind === 'script');
+    const hasData = moduleFiles.some((file) => file.kind === 'migration');
+    const covered = new Set([
+      'responsibility',
+      'conventions',
+      'placement',
+      ...(hasExports ? ['entrypoints', 'contracts'] : []),
+      ...(hasImports ? ['dependencies'] : []),
+      ...(hasTests ? ['tests'] : []),
+      ...(hasOperations ? ['operations'] : []),
+      ...(hasData ? ['data_flow'] : []),
+    ]);
+    return categories.map((category) => ({
+      module_id: moduleId,
+      category,
+      status: covered.has(category) ? ('COVERED' as const) : ('NOT_APPLICABLE' as const),
+      rationale: covered.has(category)
+        ? `${category} is evidenced by the assigned module files`
+        : `${category} is not present in the assigned inventory`,
+    }));
+  });
+  return {
+    shard_id: task.id.replace(/-correction$/, ''),
+    module_ids: modules,
+    claims,
+    semantic_coverage: semanticCoverage,
     gaps: [],
   };
 }
@@ -110,6 +175,49 @@ export const EXTRACTION_PAYLOAD = {
   research_topics: [{ key: 'node-lts', topic: 'Node.js LTS recomendado', volatile: true }],
 };
 
+export function newMappedReference(path: string, parentModule = 'greenfield-root') {
+  return {
+    path,
+    intent: 'new' as const,
+    parent_module: parentModule,
+    placement_evidence: [{ path: '.', reason: 'greenfield project root' }],
+  };
+}
+
+export function mappedNewReferenceFor(root: string, file: string) {
+  const graphPath = path.join(root, '.rijo', 'codebase', 'dependency-graph.json');
+  if (!fs.existsSync(graphPath)) return newMappedReference(file);
+  const graph = JSON.parse(fs.readFileSync(graphPath, 'utf8')) as {
+    modules: Array<{ id: string; paths: string[] }>;
+  };
+  const destination = path.posix.dirname(file);
+  const owner =
+    graph.modules.find((module) =>
+      module.paths.some((owned) => {
+        const rootDir = path.posix.dirname(owned);
+        return destination === rootDir || destination.startsWith(`${rootDir}/`);
+      }),
+    ) ?? graph.modules[0]!;
+  const evidencePath = owner.paths[0]!;
+  return {
+    path: file,
+    intent: 'new' as const,
+    parent_module: owner.id,
+    placement_evidence: [{ path: evidencePath, reason: 'existing mapped module root' }],
+  };
+}
+
+export function testPlanFreshness() {
+  return {
+    mapped_commit: 'a'.repeat(40),
+    mapped_tree_hash: 'b'.repeat(64),
+    planned_at: '2026-07-26T00:00:00.000Z',
+    context_packet_hash: 'c'.repeat(64),
+    mapped_reference_hashes: {},
+    decision_context_hash: 'd'.repeat(64),
+  };
+}
+
 export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
   return {
     phase: phaseId,
@@ -121,6 +229,7 @@ export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
         requirement_ids: reqIds,
         technical_justification: reqIds.length ? null : 'infra da fase',
         files: ['src/a.ts'],
+        mapped_references: [newMappedReference('src/a.ts')],
         write_scope: ['src/a.ts'],
         depends_on: [],
         parallel: false,
@@ -135,6 +244,7 @@ export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
         requirement_ids: [],
         technical_justification: 'integração',
         files: ['src/b.ts'],
+        mapped_references: [newMappedReference('src/b.ts')],
         write_scope: ['src/b.ts'],
         depends_on: ['T01'],
         parallel: false,
@@ -145,6 +255,26 @@ export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
       },
     ],
   };
+}
+
+function mappedPlanPayloadFor(root: string, phaseId: string, reqIds: string[]): unknown {
+  const payload = planPayloadFor(phaseId, reqIds);
+  const inventoryPath = path.join(root, '.rijo', 'codebase', 'inventory.json');
+  const graphPath = path.join(root, '.rijo', 'codebase', 'dependency-graph.json');
+  if (!fs.existsSync(inventoryPath) || !fs.existsSync(graphPath)) return payload;
+  const inventory = JSON.parse(fs.readFileSync(inventoryPath, 'utf8')) as {
+    files: Array<{ path: string; file_hash: string; module_id: string }>;
+  };
+  for (const task of payload.tasks) {
+    task.mapped_references = task.files.map((file) => {
+      const existing = inventory.files.find((entry) => entry.path === file);
+      if (existing) {
+        return { path: file, intent: 'existing' as const, file_hash: existing.file_hash };
+      }
+      return mappedNewReferenceFor(root, file);
+    });
+  }
+  return payload;
 }
 
 export interface StandardRunnerOpts {
@@ -203,7 +333,7 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
       (t) => {
         const phaseId = t.id.match(/plan-(\d{2})/)?.[1] ?? '01';
         if (opts.planPayload) return ok(t, { payload: opts.planPayload(phaseId) });
-        return ok(t, { payload: planPayloadFor(phaseId, phaseReqIds(root, phaseId)) });
+        return ok(t, { payload: mappedPlanPayloadFor(root, phaseId, phaseReqIds(root, phaseId)) });
       },
     )
     .on(

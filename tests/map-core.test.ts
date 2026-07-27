@@ -17,9 +17,33 @@ import {
   validateFragment,
   validateFragmentDetailed,
 } from '../src/codebase/analyze.js';
-import { PhasePlanSchema } from '../src/core/schemas/index.js';
+import { PhasePlanDraftSchema } from '../src/core/schemas/index.js';
 import { EvidenceSchema, MapClaimSchema } from '../src/codebase/schemas.js';
 import { cleanup, tmpProject } from './helpers.js';
+
+const semanticCategories = [
+  'responsibility',
+  'entrypoints',
+  'contracts',
+  'invariants',
+  'dependencies',
+  'consumers',
+  'data_flow',
+  'conventions',
+  'tests',
+  'operations',
+  'risks',
+  'placement',
+] as const;
+
+function semanticCoverage(moduleId: string, covered: Array<(typeof semanticCategories)[number]>) {
+  return semanticCategories.map((category) => ({
+    module_id: moduleId,
+    category,
+    status: covered.includes(category) ? ('COVERED' as const) : ('NOT_APPLICABLE' as const),
+    rationale: `${category} disposition for the exact test shard`,
+  }));
+}
 
 describe('codebase inventory', () => {
   let root: string;
@@ -74,7 +98,7 @@ describe('codebase inventory', () => {
     );
 
     expect(Object.values(assessment.coverage).some((value) => value < 1)).toBe(true);
-    expect(assessment.status).toBe('PARTIAL');
+    expect(assessment.status).toBe('BLOCKED');
   });
 
   it('derives BLOCKED when a critical ownership gap makes the map unsafe for planning', () => {
@@ -85,7 +109,20 @@ describe('codebase inventory', () => {
       extractSurfaces(root, inventory),
       buildDependencyGraph(inventory),
       [],
-      { baselineStatus: 'PASSED', gaps: ['CRITICAL: conflicting owners for src/index.ts'] },
+      {
+        baselineStatus: 'PASSED',
+        gaps: ['conflicting owners for src/index.ts'],
+        gapRecords: [
+          {
+            code: 'OWNERSHIP_CONFLICT',
+            category: 'ownership',
+            severity: 'critical',
+            message: 'conflicting owners for src/index.ts',
+            affected_paths: ['src/index.ts'],
+            affected_modules: [],
+          },
+        ],
+      },
     );
 
     expect(assessment.status).toBe('BLOCKED');
@@ -116,7 +153,7 @@ describe('codebase inventory', () => {
         statement: 'Tests exist.',
         evidence: [{ path: 'test/index.test.ts', file_hash: 'b'.repeat(64) }],
       }).kind,
-    ).toBe('operation');
+    ).toBe('test');
   });
 
   it('splits comma-joined host symbols but still validates every symbol against the live file', () => {
@@ -134,6 +171,16 @@ describe('codebase inventory', () => {
         module_ids: [source.module_id],
         claims: [
           {
+            kind: 'responsibility',
+            statement: 'The source shard owns the exported API implementation.',
+            evidence: [{ path: source.path, file_hash: source.file_hash }],
+          },
+          {
+            kind: 'convention',
+            statement: 'New API behavior belongs beside the exported source.',
+            evidence: [{ path: source.path, file_hash: source.file_hash }],
+          },
+          {
             kind: 'contract',
             statement: 'The module exposes both public entrypoints.',
             evidence: [
@@ -145,13 +192,24 @@ describe('codebase inventory', () => {
             ],
           },
         ],
+        semantic_coverage: semanticCoverage(source.module_id, [
+          'responsibility',
+          'entrypoints',
+          'contracts',
+          'conventions',
+          'placement',
+        ]),
         gaps: [],
       },
-      [source.module_id],
+      new Set([source.path]),
     );
 
     expect(result.errors).toEqual([]);
-    expect(result.fragment?.claims[0]?.evidence.map((entry) => entry.symbol)).toEqual([
+    expect(
+      result.fragment?.claims.find((claim) => claim.statement === 'The module exposes both public entrypoints.')?.evidence.map(
+        (entry) => entry.symbol,
+      ),
+    ).toEqual([
       'publicApi',
       'secondaryApi',
     ]);
@@ -170,11 +228,33 @@ describe('codebase inventory', () => {
       module_ids: [testFile.module_id],
       claims: [
         {
+          kind: 'responsibility',
+          statement: 'The test shard owns the baseline verification behavior.',
+          evidence: [{ path: testFile.path, file_hash: testFile.file_hash }],
+        },
+        {
+          kind: 'convention',
+          statement: 'Counter regression tests belong beside this assigned test.',
+          evidence: [{ path: testFile.path, file_hash: testFile.file_hash }],
+        },
+        {
+          kind: 'data_flow',
+          statement: 'The test imports its runtime through the declared dependency.',
+          evidence: [{ path: testFile.path, file_hash: testFile.file_hash }],
+        },
+        {
           kind: 'operation',
           statement: 'The mapped test records the current counter baseline.',
           evidence: [{ path: testFile.path, symbol, file_hash: testFile.file_hash }],
         },
       ],
+      semantic_coverage: semanticCoverage(testFile.module_id, [
+        'responsibility',
+        'dependencies',
+        'conventions',
+        'tests',
+        'placement',
+      ]),
       gaps: [],
     });
 
@@ -183,7 +263,7 @@ describe('codebase inventory', () => {
         root,
         inventory,
         fragment("test('current baseline')"),
-        [testFile.module_id],
+        new Set([testFile.path]),
       ).errors,
     ).toEqual([]);
     expect(
@@ -191,7 +271,7 @@ describe('codebase inventory', () => {
         root,
         inventory,
         fragment("test('invented behavior')"),
-        [testFile.module_id],
+        new Set([testFile.path]),
       ).errors,
     ).toEqual([`symbol test('invented behavior') not found in ${testFile.path}`]);
   });
@@ -218,7 +298,7 @@ describe('codebase inventory', () => {
           ],
           gaps: [],
         },
-        [auth.module_id],
+        new Set([auth.path]),
       ),
     ).toBeNull();
   });
@@ -435,7 +515,7 @@ describe('directed codebase context', () => {
     const symbols = extractSymbols(root, inventory);
     fs.writeFileSync(path.join(root, '.rijo', 'codebase', 'inventory.json'), JSON.stringify(inventory));
     fs.writeFileSync(path.join(root, '.rijo', 'codebase', 'symbols.json'), JSON.stringify(symbols));
-    const plan = PhasePlanSchema.parse({
+    const plan = PhasePlanDraftSchema.parse({
       phase: '01',
       tasks: [
         {
@@ -446,6 +526,7 @@ describe('directed codebase context', () => {
           mapped_references: [
             {
               path: 'src/auth/service.ts',
+              intent: 'existing',
               symbol: 'inventedSessionContract',
               file_hash: 'f'.repeat(64),
             },
@@ -462,6 +543,7 @@ describe('directed codebase context', () => {
           mapped_references: [
             {
               path: 'missing/deep/file.ts',
+              intent: 'existing',
               file_hash: 'e'.repeat(64),
             },
           ],
@@ -473,7 +555,7 @@ describe('directed codebase context', () => {
     });
     const issues = validatePlanMapReferences(root, plan);
     expect(issues.map((issue) => issue.code)).toEqual(
-      expect.arrayContaining(['MAP_HASH_MISMATCH', 'MAP_SYMBOL_NOT_FOUND', 'MAP_PATH_NOT_FOUND']),
+      expect.arrayContaining(['MAP_HASH_MISMATCH', 'MAP_SYMBOL_NOT_FOUND', 'MAP_INTENT_MISMATCH']),
     );
   });
 
@@ -506,7 +588,7 @@ describe('directed codebase context', () => {
         ],
       }),
     );
-    const plan = PhasePlanSchema.parse({
+    const plan = PhasePlanDraftSchema.parse({
       phase: '01',
       tasks: [
         {
@@ -517,6 +599,7 @@ describe('directed codebase context', () => {
           mapped_references: [
             {
               path: authFile.path,
+              intent: 'existing',
               symbol: 'validateSession',
               file_hash: authFile.file_hash,
             },
@@ -533,6 +616,7 @@ describe('directed codebase context', () => {
           mapped_references: [
             {
               path: authFile.path,
+              intent: 'existing',
               symbol: 'validateSession',
               file_hash: authFile.file_hash,
             },

@@ -3,8 +3,9 @@ import * as path from 'node:path';
 import { z } from 'zod';
 import type { DecisionPolicyConfig } from './schemas/index.js';
 import type { RijoPaths } from './paths.js';
-import { sha256File, writeFileAtomic } from './fsx.js';
+import { ensureDir, readJsonIfExists, sha256, sha256File, writeFileAtomic, writeJsonAtomic } from './fsx.js';
 import { EvidenceSchema } from '../codebase/schemas.js';
+import { touchManifest } from './manifest.js';
 
 export const DecisionBlockerCategorySchema = z.enum([
   'external_business_rule',
@@ -112,12 +113,17 @@ function validateEvidence(paths: RijoPaths, proposal: DecisionProposal): void {
   }
 }
 
-function appendRecord(paths: RijoPaths, record: DecisionRecord): void {
+function appendRecord(paths: RijoPaths, record: DecisionRecord, idempotencyKey?: string): void {
   const existing = fs.existsSync(paths.decisions) ? fs.readFileSync(paths.decisions, 'utf8').trimEnd() : '# Decisions (append-only)';
+  const marker = idempotencyKey ? `<!-- decision-idempotency:${idempotencyKey} -->` : '';
+  if (marker && existing.includes(marker)) return;
+  const escapedId = record.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (new RegExp(`^## ${escapedId}$`, 'm').test(existing)) return;
   const evidence = record.evidence
     .map((e) => `\`${e.path}\`${e.symbol ? ` — \`${e.symbol}\`` : ''}${e.lines ? ` lines ${e.lines}` : ''} sha256:${e.file_hash}`)
     .join('; ');
   const block = [
+    marker,
     `## ${record.id}`,
     '',
     `- Decided at: ${record.decided_at}`,
@@ -132,6 +138,167 @@ function appendRecord(paths: RijoPaths, record: DecisionRecord): void {
     `- Review when: ${record.review_condition}`,
   ].join('\n');
   writeFileAtomic(paths.decisions, `${existing}\n\n${block}\n`);
+}
+
+export interface PendingDecision {
+  proposal: DecisionProposal;
+  idempotency_key: string;
+  task_id: string;
+  attempt_id: string;
+  generation: number;
+}
+
+export interface DecisionCommitHooks {
+  afterPrepared?: () => void;
+  afterAppend?: () => void;
+  afterManifest?: () => void;
+}
+
+const DecisionJournalSchema = z.object({
+  schema_version: z.literal(1),
+  idempotency_key: z.string().regex(/^[a-f0-9]{64}$/),
+  task_id: z.string().min(1),
+  attempt_id: z.string().min(1),
+  generation: z.number().int().min(1),
+  proposal: DecisionProposalSchema,
+  record: DecisionRecordSchema.nullable().optional(),
+  status: z.enum(['PREPARED', 'APPENDED', 'MANIFESTED']),
+  updated_at: z.string().datetime(),
+});
+type DecisionJournal = z.infer<typeof DecisionJournalSchema>;
+
+function decisionJournalDir(paths: RijoPaths): string {
+  return path.join(paths.runtimeDir, 'decision-commits');
+}
+
+function decisionJournalPath(paths: RijoPaths, key: string): string {
+  return path.join(decisionJournalDir(paths), `${key}.json`);
+}
+
+export function decisionIdempotencyKey(
+  decisionId: string,
+  taskId: string,
+  attemptId: string,
+  generation: number,
+): string {
+  return sha256(`${decisionId}\0${taskId}\0${attemptId}\0${generation}`);
+}
+
+export function prepareDecision(
+  paths: RijoPaths,
+  policy: DecisionPolicyConfig,
+  raw: unknown,
+  identity: { task_id: string; attempt_id: string; generation: number },
+  now: () => Date = () => new Date(),
+): PendingDecision | DecisionOutcome {
+  const proposal = DecisionProposalSchema.parse(raw);
+  const outcome = resolveDecision(
+    paths,
+    { ...policy, record_material_decisions: false },
+    proposal,
+    now,
+  );
+  if (outcome.status === 'BLOCKED') return outcome;
+  return {
+    proposal,
+    idempotency_key: decisionIdempotencyKey(
+      proposal.id,
+      identity.task_id,
+      identity.attempt_id,
+      identity.generation,
+    ),
+    task_id: identity.task_id,
+    attempt_id: identity.attempt_id,
+    generation: identity.generation,
+  };
+}
+
+export function commitPendingDecision(
+  paths: RijoPaths,
+  policy: DecisionPolicyConfig,
+  pending: PendingDecision,
+  now: () => Date = () => new Date(),
+  hooks: DecisionCommitHooks = {},
+): DecisionOutcome {
+  const target = decisionJournalPath(paths, pending.idempotency_key);
+  const existing = DecisionJournalSchema.safeParse(readJsonIfExists<unknown>(target));
+  if (existing.success && existing.data.status === 'MANIFESTED') {
+    return {
+      status: 'DECIDED',
+      record: existing.data.record ?? null,
+      note: `Decision ${pending.proposal.id} was already committed transactionally.`,
+    };
+  }
+  ensureDir(decisionJournalDir(paths));
+  const journal: DecisionJournal = existing.success
+    ? existing.data
+    : DecisionJournalSchema.parse({
+        schema_version: 1,
+        ...pending,
+        status: 'PREPARED',
+        updated_at: now().toISOString(),
+      });
+  writeJsonAtomic(target, journal);
+  hooks.afterPrepared?.();
+
+  if (journal.status === 'APPENDED') {
+    if (fs.existsSync(paths.manifest)) touchManifest(paths, () => {}, now);
+    writeJsonAtomic(target, { ...journal, status: 'MANIFESTED', updated_at: now().toISOString() });
+    hooks.afterManifest?.();
+    return {
+      status: 'DECIDED',
+      record: journal.record ?? null,
+      note: `Decision ${journal.proposal.id} recovered after its append stage.`,
+    };
+  }
+
+  const outcome = resolveDecision(
+    paths,
+    { ...policy, record_material_decisions: false },
+    journal.proposal,
+    now,
+  );
+  if (outcome.status === 'BLOCKED') return outcome;
+  if (outcome.record && policy.record_material_decisions) {
+    appendRecord(paths, outcome.record, journal.idempotency_key);
+  }
+  writeJsonAtomic(target, {
+    ...journal,
+    record: outcome.record,
+    status: 'APPENDED',
+    updated_at: now().toISOString(),
+  });
+  hooks.afterAppend?.();
+
+  if (fs.existsSync(paths.manifest)) touchManifest(paths, () => {}, now);
+  writeJsonAtomic(target, { ...journal, status: 'MANIFESTED', updated_at: now().toISOString() });
+  hooks.afterManifest?.();
+  return outcome;
+}
+
+export function reconcileDecisionCommits(
+  paths: RijoPaths,
+  policy: DecisionPolicyConfig,
+  now: () => Date = () => new Date(),
+): string[] {
+  const dir = decisionJournalDir(paths);
+  if (!fs.existsSync(dir)) return [];
+  const reconciled: string[] = [];
+  for (const name of fs.readdirSync(dir).filter((entry) => entry.endsWith('.json')).sort()) {
+    const target = path.join(dir, name);
+    const parsed = DecisionJournalSchema.safeParse(readJsonIfExists<unknown>(target));
+    if (!parsed.success || parsed.data.status === 'MANIFESTED') continue;
+    const pending: PendingDecision = {
+      proposal: parsed.data.proposal,
+      idempotency_key: parsed.data.idempotency_key,
+      task_id: parsed.data.task_id,
+      attempt_id: parsed.data.attempt_id,
+      generation: parsed.data.generation,
+    };
+    commitPendingDecision(paths, policy, pending, now);
+    reconciled.push(parsed.data.idempotency_key);
+  }
+  return reconciled;
 }
 
 export function resolveDecision(

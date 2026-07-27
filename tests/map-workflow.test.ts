@@ -142,12 +142,17 @@ describe('rijo map workflow', () => {
       fs.readFileSync(path.join(new RijoPaths(root).codebaseDir, 'review-receipts.json'), 'utf8'),
     );
     expect(receipts.claim_receipts).toHaveLength(claims.length);
-    expect(receipts.claim_receipts.every((receipt: any) => receipt.structural === 'PASSED')).toBe(true);
-    expect(receipts.claim_receipts.every((receipt: any) => receipt.semantic === 'APPROVED')).toBe(true);
+    expect(receipts.claim_receipts.every((receipt: any) => receipt.structural_status === 'PASSED')).toBe(true);
+    expect(receipts.claim_receipts.every((receipt: any) => receipt.semantic_status === 'APPROVED')).toBe(true);
+    expect(receipts.claim_receipts.every((receipt: any) => receipt.final_disposition === 'APPROVED')).toBe(true);
     expect(receipts.consolidation.status).toBe('APPROVED');
   }, 120_000);
 
-  it('drops rejected enriched claims and promotes only a re-reviewed deterministic fallback', async () => {
+  it('rejects an unapproved candidate without replacing the valid map', async () => {
+    const initial = await mapWorkflow(root, { full: true }, { ...deps(root), git: new SystemGit() });
+    expect(initial.ok).toBe(true);
+    const paths = new RijoPaths(root);
+    const previousClaims = fs.readFileSync(path.join(paths.codebaseDir, 'claims.json'), 'utf8');
     const d = deps(root);
     d.runner.on(
       (task) => task.id === 'map-review-001',
@@ -171,14 +176,16 @@ describe('rijo map workflow', () => {
     );
 
     const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
-    expect(outcome.ok, outcome.message).toBe(true);
-    const claims = JSON.parse(
-      fs.readFileSync(path.join(new RijoPaths(root).codebaseDir, 'claims.json'), 'utf8'),
-    ).claims as Array<{ statement: string }>;
-    expect(claims.some((claim) => claim.statement.includes('owned by its mapped shard'))).toBe(false);
-    expect(d.runner.executed.some((task) => task.id === 'map-review-fallback-001')).toBe(true);
-    const events = fs.readFileSync(new RijoPaths(root).events, 'utf8');
-    expect(events).toContain('map.review_fallback');
+    expect(outcome.status).toBe('blocked');
+    expect(fs.readFileSync(path.join(paths.codebaseDir, 'claims.json'), 'utf8')).toBe(previousClaims);
+    expect(d.runner.executed.some((task) => task.id === 'map-review-fallback-001')).toBe(false);
+    const rejectionDir = path.join(paths.runtimeDir, 'map-review-rejections');
+    const rejection = JSON.parse(
+      fs.readFileSync(path.join(rejectionDir, fs.readdirSync(rejectionDir)[0]!), 'utf8'),
+    );
+    expect(rejection.status).toBe('REJECTED');
+    expect(rejection.receipts.length).toBeGreaterThan(0);
+    expect(rejection.receipts.some((receipt: any) => receipt.final_disposition === 'REJECTED')).toBe(true);
   });
 
   it('refuses a dirty checkout without corrupting the durable checkpoint needed for a clean retry', async () => {
@@ -240,7 +247,10 @@ describe('rijo map workflow', () => {
       (task) => {
         const marker = 'SHARD INVENTORY:\n';
         const inventory = JSON.parse(
-          task.notes.slice(task.notes.indexOf(marker) + marker.length).split('\n\nAUTONOMOUS DECISION POLICY')[0]!,
+          task.notes
+            .slice(task.notes.indexOf(marker) + marker.length)
+            .split('\n\nREQUIRED SEMANTIC COVERAGE MATRIX:')[0]!
+            .split('\n\nAUTONOMOUS DECISION POLICY')[0]!,
         ) as Array<{
           path: string;
           module_id: string;
@@ -255,9 +265,7 @@ describe('rijo map workflow', () => {
             shard_id: task.id,
             module_ids: [...new Set(inventory.map((entry) => entry.module_id))],
             claims: [],
-            gaps: [
-              'No source code (only this documentation file) is assigned to this shard, so no code-level responsibilities can be derived.',
-            ],
+            gaps: [],
           },
           scope_requests: [],
         };
@@ -281,11 +289,21 @@ describe('rijo map workflow', () => {
           shard_id: string;
           module_ids: string[];
           claims: unknown[];
-          gaps: string[];
-        };
-        payload.gaps = [
-          'No consumer of the newly exported revision marker is visible in the assigned shard.',
-        ];
+        gaps: Array<{ code: string; message: string; affected_paths: string[] }>;
+      };
+      payload.gaps = [
+        {
+          code: 'CONSUMER_UNKNOWN',
+          message: 'No consumer of the newly exported revision marker is visible in the assigned shard.',
+          affected_paths: [
+            (
+              payload.claims[0] as {
+                evidence: Array<{ path: string }>;
+              }
+            ).evidence[0]!.path,
+          ],
+        },
+      ];
         return {
           task_id: task.id,
           ok: true,
@@ -302,8 +320,8 @@ describe('rijo map workflow', () => {
     expect(outcome.ok, outcome.message).toBe(true);
     const paths = new RijoPaths(root);
     const state = JSON.parse(fs.readFileSync(paths.codebaseMapState, 'utf8'));
-    expect(state.status).toBe('COMPLETE');
-    expect(state.gaps).toEqual([]);
+    expect(state.status).toBe('PARTIAL');
+    expect(state.gaps).toContainEqual(expect.stringMatching(/no consumer/i));
     const receipts = JSON.parse(
       fs.readFileSync(path.join(paths.codebaseDir, 'review-receipts.json'), 'utf8'),
     );
@@ -473,6 +491,36 @@ describe('rijo map workflow', () => {
 
     expect(outcome.ok, outcome.message).toBe(true);
     expect(d.runner.executed.some((task) => task.id === 'map-shard-1-correction')).toBe(true);
+  });
+
+  it('blocks an insufficient mapper after its single correction and preserves the previous map', async () => {
+    const initial = await mapWorkflow(root, { full: true }, { ...deps(root), git: new SystemGit() });
+    expect(initial.ok).toBe(true);
+    const paths = new RijoPaths(root);
+    const previousState = fs.readFileSync(paths.codebaseMapState, 'utf8');
+    const previousClaims = fs.readFileSync(path.join(paths.codebaseDir, 'claims.json'), 'utf8');
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id.startsWith('map-shard-1'),
+      (task) => {
+        const fragment = mapFragmentFor(task) as any;
+        return {
+          task_id: task.id,
+          ok: true,
+          summary: 'still semantically empty',
+          files_written: [],
+          payload: { ...fragment, claims: [], gaps: [] },
+          scope_requests: [],
+        };
+      },
+    );
+
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+
+    expect(outcome.status).toBe('blocked');
+    expect(d.runner.executed.some((task) => task.id === 'map-shard-1-correction')).toBe(true);
+    expect(fs.readFileSync(paths.codebaseMapState, 'utf8')).toBe(previousState);
+    expect(fs.readFileSync(path.join(paths.codebaseDir, 'claims.json'), 'utf8')).toBe(previousClaims);
   });
 
   it('falls back to a full map when the recorded base commit is no longer reachable', async () => {
@@ -670,5 +718,172 @@ describe('rijo new brownfield map integration', () => {
         }),
       }),
     );
+  });
+
+  it('invalidates and replans an existing unexecuted PLAN when its map becomes stale', async () => {
+    const d = deps(root);
+    const wired = { ...d, git: new SystemGit() };
+    let failWorkers = true;
+    d.runner.on(
+      (task) => task.id.startsWith('exec-'),
+      (task) => {
+        if (failWorkers) {
+          return { task_id: task.id, ok: false, summary: 'stop after plan persistence', files_written: [], payload: null, scope_requests: [] };
+        }
+        const written: string[] = [];
+        for (const scope of task.write_scope) {
+          if (scope.includes('*')) continue;
+          const target = path.join(task.workspace!.root, scope);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, `// ${task.id}\n`);
+          written.push(scope);
+        }
+        return { task_id: task.id, ok: true, summary: 'implemented after replan', files_written: written, payload: { done: true }, scope_requests: [] };
+      },
+    );
+    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
+    const firstPlanCalls = d.runner.executed.filter(
+      (task) => task.id.startsWith('plan-01') && !task.id.startsWith('plan-review'),
+    ).length;
+
+    fs.appendFileSync(path.join(root, 'src', 'auth', 'service.ts'), '\nexport const externalRevision = 2;\n');
+    git(root, ['add', 'src/auth/service.ts']);
+    git(root, ['commit', '-m', 'feat(auth): external relevant change']);
+    failWorkers = false;
+    const resumedAfterStale = await runWorkflow(root, {}, wired);
+
+    const planCallsAfterStale = d.runner.executed.filter(
+      (task) => task.id.startsWith('plan-01') && !task.id.startsWith('plan-review'),
+    ).length;
+    expect(planCallsAfterStale, JSON.stringify(resumedAfterStale)).toBeGreaterThan(firstPlanCalls);
+    const markerDir = path.join(root, '.rijo', 'runtime', 'plan-invalidations');
+    const marker = JSON.parse(fs.readFileSync(path.join(markerDir, fs.readdirSync(markerDir)[0]!), 'utf8'));
+    expect(marker.status).toBe('REPLANNED');
+    expect(marker.reasons.join('\n')).toMatch(/mapped_|context_packet_hash/);
+    const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
+    expect(state.changed_paths_since_map).toContain('src/auth/service.ts');
+  });
+
+  it('recovers idempotently after a crash during durable plan invalidation', async () => {
+    const d = deps(root);
+    let failWorkers = true;
+    d.runner.on(
+      (task) => task.id.startsWith('exec-'),
+      (task) => {
+        if (failWorkers) {
+          return { task_id: task.id, ok: false, summary: 'hold persisted plan', files_written: [], payload: null, scope_requests: [] };
+        }
+        const written = task.write_scope.map((scope) => {
+          const target = path.join(task.workspace!.root, scope);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, `// ${task.id}\n`);
+          return scope;
+        });
+        return { task_id: task.id, ok: true, summary: 'implemented', files_written: written, payload: { done: true }, scope_requests: [] };
+      },
+    );
+    const wired = { ...d, git: new SystemGit() };
+    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
+    fs.appendFileSync(path.join(root, 'src', 'auth', 'service.ts'), '\nexport const crashRevision = 3;\n');
+    git(root, ['add', 'src/auth/service.ts']);
+    git(root, ['commit', '-m', 'feat(auth): trigger stale plan crash recovery']);
+
+    let crashed = false;
+    await expect(
+      runWorkflow(root, {}, {
+        ...wired,
+        planHooks: {
+          afterInvalidated: () => {
+            if (!crashed) {
+              crashed = true;
+              throw new Error('simulated crash after invalidation marker');
+            }
+          },
+        },
+      }),
+    ).rejects.toThrow(/simulated crash/);
+    const markerDir = path.join(root, '.rijo', 'runtime', 'plan-invalidations');
+    const markerPath = path.join(markerDir, fs.readdirSync(markerDir)[0]!);
+    expect(JSON.parse(fs.readFileSync(markerPath, 'utf8')).status).toBe('INVALIDATED');
+
+    failWorkers = false;
+    const recovered = await runWorkflow(root, {}, wired);
+    expect(recovered.ok, recovered.message).toBe(true);
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    expect(marker.status).toBe('REPLANNED');
+    expect(marker.old_plan_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(marker.new_plan_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('blocks an existing applied PLAN when an external change overlaps its controlled paths', async () => {
+    const d = deps(root);
+    const wired = { ...d, git: new SystemGit() };
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'hold after implementation',
+        files_written: [],
+        payload: {
+          approved: false,
+          findings: [{ type: 'spec_gap', severity: 'critical', description: 'hold', file: 'src/a.ts' }],
+        },
+        scope_requests: [],
+      }),
+    );
+    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
+    fs.appendFileSync(path.join(root, 'src', 'a.ts'), '// external overlap\n');
+    const before = fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8');
+
+    const resumed = await runWorkflow(root, {}, wired);
+    expect(resumed.status).toBe('blocked');
+    expect(resumed.message).toMatch(/external changes overlap/i);
+    expect(resumed.details?.join('\n')).toContain('src/a.ts');
+    expect(fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8')).toBe(before);
+  });
+
+  it('records a non-overlapping external change and continues an applied PLAN without replanning', async () => {
+    const d = deps(root);
+    const wired = { ...d, git: new SystemGit() };
+    let holdReview = true;
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: holdReview ? 'hold after implementation' : 'approved after unrelated change',
+        files_written: [],
+        payload: holdReview
+          ? {
+              approved: false,
+              findings: [{ type: 'spec_gap', severity: 'critical', description: 'hold', file: 'src/a.ts' }],
+            }
+          : { approved: true, findings: [] },
+        scope_requests: [],
+      }),
+    );
+    expect((await newWorkflow(root, { planFile: '@PLANO.md' }, wired)).ok).toBe(true);
+    expect((await runWorkflow(root, {}, wired)).status).toBe('blocked');
+    const planCalls = d.runner.executed.filter(
+      (task) => task.id.startsWith('plan-01') && !task.id.startsWith('plan-review'),
+    ).length;
+    fs.writeFileSync(path.join(root, 'notes.txt'), 'external but unrelated\n');
+    holdReview = false;
+
+    await runWorkflow(root, {}, wired);
+    const resumedPlanCalls = d.runner.executed.filter(
+      (task) => task.id.startsWith('plan-01') && !task.id.startsWith('plan-review'),
+    ).length;
+    const markerDir = path.join(root, '.rijo', 'runtime', 'plan-invalidations');
+    const diagnostic = fs.existsSync(markerDir)
+      ? fs.readFileSync(path.join(markerDir, fs.readdirSync(markerDir)[0]!), 'utf8')
+      : fs.readFileSync(new RijoPaths(root).events, 'utf8').slice(-4000);
+    expect(resumedPlanCalls, diagnostic).toBe(planCalls);
+    expect(fs.readFileSync(new RijoPaths(root).events, 'utf8')).toContain('run.external_change_non_overlapping');
+    expect(fs.readFileSync(path.join(root, 'notes.txt'), 'utf8')).toBe('external but unrelated\n');
   });
 });

@@ -14,7 +14,7 @@ import type {
 } from '../src/hosts/controller.js';
 import { SupervisedExecutor } from '../src/workflows/executor.js';
 import { TaskStore } from '../src/supervisor/store.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, newMappedReference, ok, phaseReqIds } from './helpers.js';
 
 // Any dangling runner promise from a deliberately-hung attempt must not surface
 // as an unhandled rejection (it stays pending, never rejects).
@@ -43,8 +43,8 @@ function fastSupervisor(over: Partial<Record<string, unknown>> = {}): Supervisor
 const twoParallelTasks = (phaseId: string, reqIds: string[]) => ({
   phase: phaseId,
   tasks: [
-    { id: 'T01', name: 'a', requirement_ids: reqIds, technical_justification: null, files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
-    { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
+    { id: 'T01', name: 'a', requirement_ids: reqIds, technical_justification: null, files: ['src/a.ts'], mapped_references: [newMappedReference('src/a.ts')], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
+    { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], mapped_references: [newMappedReference('src/b.ts')], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
   ],
 });
 

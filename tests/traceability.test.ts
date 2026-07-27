@@ -8,6 +8,7 @@ import {
   type RoadmapPhase,
   type PhasePlan,
 } from '../src/core/schemas/index.js';
+import { newMappedReference, testPlanFreshness } from './helpers.js';
 
 function req(id: string, over: Partial<Requirement> = {}): Requirement {
   return RequirementSchema.parse({
@@ -97,12 +98,14 @@ describe('validateTraceability', () => {
   it('flags PARALLEL_WRITE_CONFLICT for independent parallel tasks sharing scope', () => {
     const plan: PhasePlan = PhasePlanSchema.parse({
       phase: '01',
+      ...testPlanFreshness(),
       tasks: [
         {
           id: 'T01',
           name: 'Task one',
           technical_justification: 'infra',
           files: ['src/shared.ts'],
+          mapped_references: [newMappedReference('src/shared.ts')],
           write_scope: ['src/shared.ts'],
           parallel: true,
           evidence_expected: 'tests pass',
@@ -112,6 +115,7 @@ describe('validateTraceability', () => {
           name: 'Task two',
           technical_justification: 'infra',
           files: ['src/shared.ts'],
+          mapped_references: [newMappedReference('src/shared.ts')],
           write_scope: ['src/shared.ts'],
           parallel: true,
           evidence_expected: 'tests pass',
@@ -129,12 +133,14 @@ describe('validateTraceability', () => {
   it('yields no errors for a clean input', () => {
     const plan: PhasePlan = PhasePlanSchema.parse({
       phase: '01',
+      ...testPlanFreshness(),
       tasks: [
         {
           id: 'T01',
           name: 'Task one',
           requirement_ids: ['M001-REQ-001'],
           files: ['src/a.ts'],
+          mapped_references: [newMappedReference('src/a.ts')],
           write_scope: ['src/a.ts'],
           parallel: true,
           evidence_expected: 'tests pass',
@@ -144,6 +150,7 @@ describe('validateTraceability', () => {
           name: 'Task two',
           requirement_ids: ['M001-REQ-002'],
           files: ['src/b.ts'],
+          mapped_references: [newMappedReference('src/b.ts')],
           write_scope: ['src/b.ts'],
           parallel: true,
           evidence_expected: 'tests pass',

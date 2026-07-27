@@ -12,11 +12,13 @@ import {
   SymbolsDocumentSchema,
   type CodebaseInventoryEntry,
   type CodebaseCoverage,
+  type ClaimReceipt,
   type DependencyGraph,
   type Evidence,
   type InventoryDocument,
   type MapAgentFragment,
   type MapClaim,
+  type MapGap,
   type SurfacesDocument,
   type SymbolsDocument,
 } from './schemas.js';
@@ -270,6 +272,7 @@ export interface MapCoverageAssessment {
   coverage: CodebaseCoverage;
   status: 'COMPLETE' | 'PARTIAL' | 'BLOCKED';
   gaps: string[];
+  gapRecords: MapGap[];
 }
 
 export function assessMapCoverage(
@@ -278,7 +281,14 @@ export function assessMapCoverage(
   surfaces: SurfacesDocument,
   graph: DependencyGraph,
   claims: MapClaim[],
-  options: { baselineStatus: string; gaps: string[] },
+  options: {
+    baselineStatus: string;
+    gaps: string[];
+    gapRecords?: MapGap[];
+    claimReceipts?: ClaimReceipt[];
+    runtimeAvailable?: boolean;
+    baselineWaiverSafe?: boolean;
+  },
 ): MapCoverageAssessment {
   const analyzedEvidence = new Set([
     ...claims.flatMap((claim) => claim.evidence.map((item) => item.path)),
@@ -298,6 +308,14 @@ export function assessMapCoverage(
         .filter((moduleId): moduleId is string => Boolean(moduleId)),
     ),
   );
+  const behavioralModuleIds = new Set(
+    inventory.files
+      .filter((file) => ['code', 'test', 'configuration', 'migration', 'script'].includes(file.kind))
+      .map((file) => file.module_id),
+  );
+  const uncoveredBehavioralModules = [...behavioralModuleIds].filter(
+    (moduleId) => !modulesCovered.has(moduleId),
+  );
   const exportedSymbols = inventory.files.flatMap((file) =>
     file.exports.map((name) => `${file.path}\0${name}`),
   );
@@ -310,11 +328,30 @@ export function assessMapCoverage(
   const testsOperations = inventory.files.filter(
     (file) => file.kind === 'test' || file.kind === 'script' || /Dockerfile|\.github\//i.test(file.path),
   );
-  const baselinePassed = options.baselineStatus === 'PASSED';
+  const baselinePassed =
+    options.baselineStatus === 'PASSED' ||
+    (options.baselineStatus === 'WAIVED' && options.baselineWaiverSafe === true);
+  const receiptsByClaim = new Map((options.claimReceipts ?? []).map((receipt) => [receipt.claim_id, receipt]));
+  const candidateClaimIds = new Set([
+    ...claims.map((claim, index) => claim.claim_id ?? `unidentified-${index}`),
+    ...(options.claimReceipts ?? []).map((receipt) => receipt.claim_id),
+  ]);
+  const approvedClaims = [...candidateClaimIds].filter((claimId) => {
+    const receipt = receiptsByClaim.get(claimId);
+    return (
+      receipt?.structural_status === 'PASSED' &&
+      receipt.semantic_status === 'APPROVED' &&
+      receipt.final_disposition === 'APPROVED'
+    );
+  }).length;
   const coverage = {
     relevant_files_classified: ratio(inventory.files.length, inventory.files.length + relevantExclusions.length),
     entrypoints_covered: ratio(entrypoints.filter((file) => analyzedEvidence.has(file.path)).length, entrypoints.length),
-    modules_covered: ratio(modulesCovered.size, graph.modules.length, 0),
+    modules_covered: ratio(
+      [...behavioralModuleIds].filter((moduleId) => modulesCovered.has(moduleId)).length,
+      behavioralModuleIds.size,
+      1,
+    ),
     public_contracts_covered: ratio(
       exportedSymbols.filter((key) => coveredSymbols.has(key)).length,
       exportedSymbols.length,
@@ -328,27 +365,106 @@ export function assessMapCoverage(
       testsOperations.filter((file) => baselinePassed || analyzedEvidence.has(file.path)).length,
       testsOperations.length,
     ),
-    claims_verified: ratio(claims.length, claims.length, 0),
+    claims_verified: ratio(approvedClaims, candidateClaimIds.size, 0),
   } satisfies CodebaseCoverage;
   const derivedGaps = [...options.gaps];
+  const gapRecords: MapGap[] = [...(options.gapRecords ?? [])];
   if (relevantExclusions.length > 0) {
-    derivedGaps.push(
-      `${relevantExclusions.length} relevant file(s) were not analyzed: ${relevantExclusions
-        .slice(0, 20)
-        .map((item) => item.path)
-        .join(', ')}`,
-    );
+    const message = `${relevantExclusions.length} relevant file(s) were not analyzed: ${relevantExclusions
+      .slice(0, 20)
+      .map((item) => item.path)
+      .join(', ')}`;
+    derivedGaps.push(message);
+    gapRecords.push({
+      code: 'RELEVANT_FILE_UNANALYZED',
+      category: 'coverage',
+      severity: 'critical',
+      message,
+      affected_paths: relevantExclusions.map((item) => item.path),
+      affected_modules: [],
+    });
   }
   for (const [area, value] of Object.entries(coverage)) {
-    if (value < 1) derivedGaps.push(`Coverage gap in ${area}: ${(value * 100).toFixed(1)}%`);
+    if (value < 1) {
+      const message = `Coverage gap in ${area}: ${(value * 100).toFixed(1)}%`;
+      const affectedPaths =
+        area === 'relevant_files_classified'
+          ? relevantExclusions.map((item) => item.path)
+          : area === 'entrypoints_covered'
+            ? entrypoints.filter((file) => !analyzedEvidence.has(file.path)).map((file) => file.path)
+            : area === 'public_contracts_covered'
+              ? inventory.files
+                  .filter((file) =>
+                    file.exports.some((name) => !coveredSymbols.has(`${file.path}\0${name}`)),
+                  )
+                  .map((file) => file.path)
+              : area === 'surfaces_covered'
+                ? surfaces.surfaces
+                    .filter((surface) => !analyzedEvidence.has(surface.evidence.path))
+                    .map((surface) => surface.evidence.path)
+                : area === 'data_covered'
+                  ? dataFiles.filter((file) => !analyzedEvidence.has(file.path)).map((file) => file.path)
+                  : area === 'tests_operations_covered'
+                    ? testsOperations
+                        .filter((file) => !baselinePassed && !analyzedEvidence.has(file.path))
+                        .map((file) => file.path)
+                    : [];
+      const affectedModules =
+        area === 'modules_covered'
+          ? uncoveredBehavioralModules
+          : [
+              ...new Set(
+                affectedPaths
+                  .map((affected) => inventory.files.find((file) => file.path === affected)?.module_id)
+                  .filter((moduleId): moduleId is string => Boolean(moduleId)),
+              ),
+            ];
+      derivedGaps.push(message);
+      gapRecords.push({
+        code: area === 'claims_verified' ? 'REVIEW_INCOMPLETE' : 'COVERAGE_INCOMPLETE',
+        category: area === 'claims_verified' ? 'semantic' : 'coverage',
+        severity: area === 'claims_verified' ? 'critical' : 'non_critical',
+        message,
+        affected_paths: affectedPaths,
+        affected_modules: affectedModules,
+      });
+    }
   }
-  if (['FAILED', 'BLOCKED_BY_SANDBOX', 'DETECTED_NOT_RUN'].includes(options.baselineStatus)) {
-    derivedGaps.push(`Brownfield baseline status is ${options.baselineStatus}.`);
+  if (
+    ['FAILED', 'BLOCKED_BY_SANDBOX', 'DETECTED_NOT_RUN'].includes(options.baselineStatus) ||
+    (options.baselineStatus === 'WAIVED' && options.baselineWaiverSafe !== true)
+  ) {
+    const message = `Brownfield baseline status is ${options.baselineStatus}.`;
+    derivedGaps.push(message);
+    gapRecords.push({
+      code: 'BASELINE_UNSAFE',
+      category: 'baseline',
+      severity: 'critical',
+      message,
+      affected_paths: [],
+      affected_modules: [],
+    });
+  }
+  const behavioralFiles = inventory.files.filter((file) =>
+    ['code', 'test', 'configuration', 'migration', 'script'].includes(file.kind),
+  );
+  if (behavioralFiles.length > 0 && options.runtimeAvailable === false) {
+    const message = 'No agent runtime was bound for required semantic analysis.';
+    derivedGaps.push(message);
+    gapRecords.push({
+      code: 'RUNTIME_REQUIRED',
+      category: 'runtime',
+      severity: 'critical',
+      message,
+      affected_paths: behavioralFiles.map((file) => file.path),
+      affected_modules: [...new Set(behavioralFiles.map((file) => file.module_id))],
+    });
   }
   const uniqueGaps = [...new Set(derivedGaps)];
-  const criticalGap = uniqueGaps.some((gap) =>
-    /\b(?:critical|unsafe|contradiction|conflicting owners?|ownership conflict|invented path|invented symbol)\b/i.test(gap),
-  );
+  const uniqueGapRecords = [
+    ...new Map(gapRecords.map((gap) => [`${gap.code}\0${gap.message}`, gap])).values(),
+  ];
+  const criticalGap = uniqueGapRecords.some((gap) => gap.severity === 'critical');
   const mandatoryPass = Object.values(coverage).every((value) => value === 1);
   const status =
     criticalGap || inventory.files.length === 0 || graph.modules.length === 0
@@ -356,7 +472,7 @@ export function assessMapCoverage(
       : uniqueGaps.length === 0 && mandatoryPass
         ? 'COMPLETE'
         : 'PARTIAL';
-  return { coverage, status, gaps: uniqueGaps };
+  return { coverage, status, gaps: uniqueGaps, gapRecords: uniqueGapRecords };
 }
 
 export function deterministicClaims(inventory: InventoryDocument, graph: DependencyGraph): MapClaim[] {
@@ -372,13 +488,6 @@ export function deterministicClaims(inventory: InventoryDocument, graph: Depende
     const anchor = files.find((f) => f.kind === 'code') ?? files[0];
     if (!anchor) continue;
     const exported = files.flatMap((f) => f.exports);
-    claims.push(
-      MapClaimSchema.parse({
-        kind: 'responsibility',
-        statement: `Module ${module.id} owns ${files.length} mapped file(s) under ${module.paths.slice(0, 4).join(', ')}.`,
-        evidence: [evidence(anchor)],
-      }),
-    );
     if (exported.length > 0) {
       claims.push(
         MapClaimSchema.parse({
@@ -396,9 +505,10 @@ export function validateFragment(
   projectRoot: string,
   inventory: InventoryDocument,
   raw: unknown,
-  allowedModules: string[],
+  allowedPaths: Set<string>,
+  neighborContractPaths: Set<string> = new Set(),
 ): MapAgentFragment | null {
-  return validateFragmentDetailed(projectRoot, inventory, raw, allowedModules).fragment;
+  return validateFragmentDetailed(projectRoot, inventory, raw, allowedPaths, neighborContractPaths).fragment;
 }
 
 function evidenceSymbolExists(fileText: string, symbol: string): boolean {
@@ -414,53 +524,289 @@ export function validateFragmentDetailed(
   projectRoot: string,
   inventory: InventoryDocument,
   raw: unknown,
-  allowedModules: string[],
-): { fragment: MapAgentFragment | null; errors: string[] } {
+  allowedPaths: Set<string>,
+  neighborContractPaths: Set<string> = new Set(),
+): {
+  fragment: MapAgentFragment | null;
+  errors: string[];
+  receipt: {
+    shard_id: string;
+    allowed_paths: string[];
+    neighbor_contract_paths: string[];
+    accepted_evidence: Array<{ path: string; ownership: 'primary' | 'external_contract' }>;
+    rejected_evidence: Array<{ path: string; reason: string }>;
+    semantic_coverage: MapAgentFragment['semantic_coverage'];
+  };
+} {
+  const receipt = {
+    shard_id:
+      raw && typeof raw === 'object' && !Array.isArray(raw) && typeof (raw as Record<string, unknown>)['shard_id'] === 'string'
+        ? String((raw as Record<string, unknown>)['shard_id'])
+        : 'invalid',
+    allowed_paths: [...allowedPaths].sort(),
+    neighbor_contract_paths: [...neighborContractPaths].sort(),
+    accepted_evidence: [] as Array<{ path: string; ownership: 'primary' | 'external_contract' }>,
+    rejected_evidence: [] as Array<{ path: string; reason: string }>,
+    semantic_coverage: [] as MapAgentFragment['semantic_coverage'],
+  };
   const parsed = MapAgentFragmentSchema.safeParse(expandCombinedEvidenceSymbols(raw));
   if (!parsed.success) {
     return {
       fragment: null,
       errors: parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`),
+      receipt,
     };
   }
-  const wrongModules = parsed.data.module_ids.filter((id) => !allowedModules.includes(id));
+  receipt.shard_id = parsed.data.shard_id;
+  receipt.semantic_coverage = parsed.data.semantic_coverage;
+  const allowedModules = new Set(
+    inventory.files.filter((entry) => allowedPaths.has(entry.path)).map((entry) => entry.module_id),
+  );
+  const wrongModules = parsed.data.module_ids.filter((id) => !allowedModules.has(id));
   if (wrongModules.length > 0) {
-    return { fragment: null, errors: [`modules outside assigned shard: ${wrongModules.join(', ')}`] };
+    return { fragment: null, errors: [`modules outside assigned shard: ${wrongModules.join(', ')}`], receipt };
   }
   const byPath = new Map(inventory.files.map((f) => [f.path, f]));
   for (const claim of parsed.data.claims) {
+    const evidenced = new Set(claim.evidence.map((item) => item.path));
+    for (const entry of inventory.files) {
+      if (
+        claim.statement.includes(entry.path) &&
+        !evidenced.has(entry.path) &&
+        (allowedPaths.has(entry.path) || neighborContractPaths.has(entry.path))
+      ) {
+        claim.evidence.push({
+          path: entry.path,
+          file_hash: entry.file_hash,
+          ownership: neighborContractPaths.has(entry.path) ? 'external_contract' : 'primary',
+        });
+        evidenced.add(entry.path);
+      }
+    }
+  }
+  const behavioralPaths = [...allowedPaths].filter((allowedPath) => {
+    const entry = byPath.get(allowedPath);
+    return entry && ['code', 'test', 'configuration', 'migration', 'script'].includes(entry.kind);
+  });
+  const genericClaims = parsed.data.claims.filter((claim) =>
+    /^Module\s+\S+\s+(?:owns|has|contains)\s+\d+\s+(?:mapped\s+)?file/i.test(claim.statement),
+  );
+  if (
+    behavioralPaths.length > 0 &&
+    parsed.data.gaps.length === 0 &&
+    (parsed.data.claims.length === 0 || genericClaims.length === parsed.data.claims.length)
+  ) {
+    return {
+      fragment: null,
+      errors: [
+        `semantic analysis is insufficient for behavioral shard ${parsed.data.shard_id}: provide at least one non-generic semantic claim or a factual gap`,
+      ],
+      receipt,
+    };
+  }
+  const errors: string[] = [];
+  for (const [index, claim] of parsed.data.claims.entries()) {
+    const outsideMentions = inventory.files
+      .filter(
+        (file) =>
+          claim.statement.includes(file.path) &&
+          !allowedPaths.has(file.path) &&
+          !neighborContractPaths.has(file.path),
+      )
+      .map((file) => file.path);
+    if (outsideMentions.length > 0) {
+      errors.push(
+        `claim ${index}: statement cites path(s) outside exact shard ownership: ${outsideMentions.join(', ')}; delete or rewrite this claim without those paths`,
+      );
+    }
+  }
+  errors.push(...validateClaims(projectRoot, inventory, parsed.data.claims));
+  if (behavioralPaths.length > 0) {
+    const categories = [
+      'responsibility',
+      'entrypoints',
+      'contracts',
+      'invariants',
+      'dependencies',
+      'consumers',
+      'data_flow',
+      'conventions',
+      'tests',
+      'operations',
+      'risks',
+      'placement',
+    ] as const;
+    const claimKinds: Record<(typeof categories)[number], MapClaim['kind'][]> = {
+      responsibility: ['responsibility'],
+      entrypoints: ['entrypoint', 'contract'],
+      contracts: ['contract'],
+      invariants: ['invariant'],
+      dependencies: ['dependency', 'data_flow', 'contract', 'responsibility'],
+      consumers: ['consumer', 'data_flow', 'contract', 'responsibility'],
+      data_flow: ['data_flow'],
+      conventions: ['convention'],
+      tests: ['test', 'operation', 'invariant'],
+      operations: ['operation'],
+      risks: ['risk'],
+      placement: ['placement', 'convention'],
+    };
+    const gapCodes: Record<(typeof categories)[number], MapAgentFragment['gaps'][number]['code']> = {
+      responsibility: 'RESPONSIBILITY_UNKNOWN',
+      entrypoints: 'ENTRYPOINT_UNKNOWN',
+      contracts: 'CONTRACT_UNKNOWN',
+      invariants: 'INVARIANT_UNKNOWN',
+      dependencies: 'DEPENDENCY_UNKNOWN',
+      consumers: 'CONSUMER_UNKNOWN',
+      data_flow: 'DATA_FLOW_UNKNOWN',
+      conventions: 'CONVENTION_UNKNOWN',
+      tests: 'TEST_COVERAGE_UNKNOWN',
+      operations: 'OPERATION_UNKNOWN',
+      risks: 'RISK_UNKNOWN',
+      placement: 'PLACEMENT_UNKNOWN',
+    };
+    const semanticModuleIds = new Set(
+      inventory.files
+        .filter(
+          (file) =>
+            allowedPaths.has(file.path) &&
+            ['code', 'test', 'migration', 'script'].includes(file.kind),
+        )
+        .map((file) => file.module_id),
+    );
+    for (const moduleId of semanticModuleIds) {
+      const moduleFiles = inventory.files.filter(
+        (file) => file.module_id === moduleId && allowedPaths.has(file.path),
+      );
+      const assignedModulePaths = new Set(moduleFiles.map((file) => file.path));
+      const applicable = new Set<(typeof categories)[number]>(['responsibility', 'conventions', 'placement']);
+      if (moduleFiles.some((file) => file.kind === 'code' && file.exports.length > 0)) {
+        applicable.add('entrypoints');
+        applicable.add('contracts');
+      }
+      if (moduleFiles.some((file) => file.kind === 'code' && file.imports.length > 0)) applicable.add('dependencies');
+      if (moduleFiles.some((file) => file.kind === 'test')) applicable.add('tests');
+      if (moduleFiles.some((file) => file.kind === 'configuration' || file.kind === 'script')) applicable.add('operations');
+      if (moduleFiles.some((file) => file.kind === 'migration')) applicable.add('data_flow');
+      for (const category of categories) {
+        const records = parsed.data.semantic_coverage.filter(
+          (record) => record.module_id === moduleId && record.category === category,
+        );
+        if (records.length !== 1) {
+          errors.push(
+            `semantic coverage for ${moduleId}/${category} must have exactly one explicit disposition; received ${records.length}`,
+          );
+          continue;
+        }
+        const record = records[0]!;
+        if (record.status === 'NOT_APPLICABLE' && applicable.has(category)) {
+          errors.push(`${moduleId}/${category} is deterministically applicable and cannot be NOT_APPLICABLE`);
+        }
+        if (
+          record.status === 'COVERED' &&
+          !parsed.data.claims.some(
+            (claim) =>
+              claimKinds[category].includes(claim.kind) &&
+              claim.evidence.some((evidence) => assignedModulePaths.has(evidence.path)),
+          )
+        ) {
+          errors.push(`${moduleId}/${category} is COVERED without a matching primary semantic claim`);
+        }
+        if (
+          record.status === 'GAP' &&
+          !parsed.data.gaps.some(
+            (gap) =>
+              gap.code === gapCodes[category] &&
+              gap.affected_paths.some((affected) => assignedModulePaths.has(affected)),
+          )
+        ) {
+          errors.push(`${moduleId}/${category} is GAP without a matching factual gap`);
+        }
+      }
+    }
+    const unexpectedCoverage = parsed.data.semantic_coverage.filter(
+      (record) => !parsed.data.module_ids.includes(record.module_id),
+    );
+    if (unexpectedCoverage.length > 0) {
+      errors.push(
+        `semantic coverage attributes modules outside the fragment: ${[
+          ...new Set(unexpectedCoverage.map((record) => record.module_id)),
+        ].join(', ')}`,
+      );
+    }
+  }
+  for (const gap of parsed.data.gaps) {
+    for (const affectedPath of gap.affected_paths) {
+      if (!allowedPaths.has(affectedPath)) {
+        errors.push(`gap ${gap.code} cites path outside the exact assigned shard: ${affectedPath}`);
+        receipt.rejected_evidence.push({ path: affectedPath, reason: 'gap path outside exact shard ownership' });
+      }
+    }
+  }
+  for (const claim of parsed.data.claims) {
     for (const ev of claim.evidence) {
       const entry = byPath.get(ev.path);
-      if (!entry) return { fragment: null, errors: [`unmapped evidence path: ${ev.path}`] };
-      if (!allowedModules.includes(entry.module_id)) {
-        return {
-          fragment: null,
-          errors: [`evidence path ${ev.path} is owned by ${entry.module_id}, outside assigned shard modules`],
-        };
+      if (!entry) {
+        errors.push(`unmapped evidence path: ${ev.path}`);
+        receipt.rejected_evidence.push({ path: ev.path, reason: 'unmapped evidence path' });
+        continue;
+      }
+      const primary = allowedPaths.has(ev.path);
+      const neighbor = neighborContractPaths.has(ev.path);
+      if (!primary && !neighbor) {
+        errors.push(`evidence path ${ev.path} is outside the exact assigned shard paths`);
+        receipt.rejected_evidence.push({ path: ev.path, reason: 'outside exact shard ownership' });
+        continue;
+      }
+      if (neighbor && ev.ownership !== 'external_contract') {
+        errors.push(`neighbor contract ${ev.path} must be marked external_contract`);
+        receipt.rejected_evidence.push({ path: ev.path, reason: 'neighbor contract not marked external_contract' });
+        continue;
+      }
+      if (primary && ev.ownership === 'external_contract') {
+        errors.push(`primary shard evidence ${ev.path} cannot be marked external_contract`);
+        receipt.rejected_evidence.push({ path: ev.path, reason: 'primary evidence mislabeled external_contract' });
+        continue;
+      }
+      if (neighbor && ['responsibility', 'placement'].includes(claim.kind)) {
+        errors.push(`${claim.kind} claim cannot attribute ownership to neighbor contract ${ev.path}`);
+        receipt.rejected_evidence.push({ path: ev.path, reason: `${claim.kind} attributed to external contract` });
+        continue;
       }
       if (entry.file_hash !== ev.file_hash) {
-        return { fragment: null, errors: [`hash mismatch for ${ev.path}`] };
+        errors.push(`hash mismatch for ${ev.path}`);
+        receipt.rejected_evidence.push({ path: ev.path, reason: 'hash mismatch' });
+        continue;
       }
       const absolute = path.join(projectRoot, ev.path);
       if (!fs.existsSync(absolute) || sha256(fs.readFileSync(absolute)) !== ev.file_hash) {
-        return { fragment: null, errors: [`live file mismatch for ${ev.path}`] };
+        errors.push(`live file mismatch for ${ev.path}`);
+        receipt.rejected_evidence.push({ path: ev.path, reason: 'live file mismatch' });
+        continue;
       }
       if (ev.lines) {
         const [start, end = start] = ev.lines.split('-').map(Number);
         const count = fs.readFileSync(absolute, 'utf8').split(/\r?\n/).length;
         if (!start || !end || start > end || end > count) {
-          return { fragment: null, errors: [`invalid line range ${ev.lines} for ${ev.path} (${count} lines)`] };
+          errors.push(`invalid line range ${ev.lines} for ${ev.path} (${count} lines)`);
+          receipt.rejected_evidence.push({ path: ev.path, reason: 'invalid line range' });
+          continue;
         }
       }
       if (ev.symbol) {
         const fileText = fs.readFileSync(absolute, 'utf8');
         if (!evidenceSymbolExists(fileText, ev.symbol)) {
-          return { fragment: null, errors: [`symbol ${ev.symbol} not found in ${ev.path}`] };
+          errors.push(`symbol ${ev.symbol} not found in ${ev.path}`);
+          receipt.rejected_evidence.push({ path: ev.path, reason: 'symbol not found' });
+          continue;
         }
       }
+      receipt.accepted_evidence.push({
+        path: ev.path,
+        ownership: neighbor ? 'external_contract' : 'primary',
+      });
     }
   }
-  return { fragment: parsed.data, errors: [] };
+  return { fragment: errors.length === 0 ? parsed.data : null, errors, receipt };
 }
 
 /**
@@ -500,11 +846,42 @@ export function validateClaims(projectRoot: string, inventory: InventoryDocument
   const errors: string[] = [];
   const byPath = new Map(inventory.files.map((f) => [f.path, f]));
   for (const [index, claim] of claims.entries()) {
+    const evidencePaths = new Set(claim.evidence.map((item) => item.path));
+    const unevidencedMentions = inventory.files
+      .filter((file) => claim.statement.includes(file.path) && !evidencePaths.has(file.path))
+      .map((file) => file.path);
+    if (unevidencedMentions.length > 0) {
+      errors.push(
+        `claim ${index}: statement cites inventoried path(s) without evidence: ${unevidencedMentions.join(', ')}`,
+      );
+    }
     for (const ev of claim.evidence) {
       const entry = byPath.get(ev.path);
       if (!entry) errors.push(`claim ${index}: missing path ${ev.path}`);
       else if (entry.file_hash !== ev.file_hash) errors.push(`claim ${index}: hash mismatch ${ev.path}`);
       else if (!fs.existsSync(path.join(projectRoot, ev.path))) errors.push(`claim ${index}: path vanished ${ev.path}`);
+    }
+  }
+  return errors;
+}
+
+export function validateUniqueAnalysisOwnership(
+  receipts: Array<{
+    shard_id: string;
+    accepted_evidence: Array<{ path: string; ownership: 'primary' | 'external_contract' }>;
+  }>,
+): string[] {
+  const owners = new Map<string, string>();
+  const errors: string[] = [];
+  for (const receipt of receipts) {
+    for (const evidence of receipt.accepted_evidence) {
+      if (evidence.ownership !== 'primary') continue;
+      const owner = owners.get(evidence.path);
+      if (owner && owner !== receipt.shard_id) {
+        errors.push(`${evidence.path} has two analysis owners: ${owner} and ${receipt.shard_id}`);
+      } else {
+        owners.set(evidence.path, receipt.shard_id);
+      }
     }
   }
   return errors;

@@ -7,7 +7,7 @@ import { readManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { defaultConfig, loadConfig, saveConfig } from '../src/core/config.js';
-import { tmpProject, cleanup, writePlanFile, deps } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, EXTRACTION_PAYLOAD } from './helpers.js';
 
 describe('rijo new (greenfield)', () => {
   let root: string;
@@ -56,6 +56,44 @@ describe('rijo new (greenfield)', () => {
 
     expect(outcome.ok).toBe(true);
     expect(loadConfig(paths).context_budget_bytes).toBe(12_345);
+  });
+
+  it('feeds exact PlanExtraction schema errors into the bounded correction attempt', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id === 'new-extract',
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'invalid first extraction',
+        files_written: [],
+        payload: {
+          project_name: 'Fixture',
+          project_summary: 'Fixture summary',
+          requirements: [{ description: 'Requirement', acceptance: 'Accepted', non_functional: false }],
+          phases: [{ name: 'Phase', requirement_indexes: ['not-a-number'], ui_surface: false }],
+        },
+        scope_requests: [],
+      }),
+    );
+    d.runner.on(
+      (task) => task.id.startsWith('new-extract-r'),
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'corrected extraction',
+        files_written: [],
+        payload: EXTRACTION_PAYLOAD,
+        scope_requests: [],
+      }),
+    );
+
+    const outcome = await newWorkflow(root, { planFile: '@PLANO.md' }, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const correction = d.runner.executed.find((task) => task.id === 'new-extract-r1');
+    expect(correction?.notes).toContain('CORRECT THESE EXACT ERRORS');
+    expect(correction?.notes).toContain('phases.0.requirement_indexes.0');
   });
 
   it('refuses re-initialization without --next (non-destructive)', async () => {

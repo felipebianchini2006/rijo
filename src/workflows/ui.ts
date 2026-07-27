@@ -17,6 +17,7 @@ import {
   failed,
   dispatch,
   dispatchReadOnly,
+  commitDecisionProposals,
   replaceableAttempt,
   guardSchema,
   type WorkflowContext,
@@ -112,7 +113,6 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         invSummary,
       ),
     );
-
     // ---- 5: detect target stack
     const stackNote = readTextIfExists(paths.stack) ?? '';
     const pkgRaw = readTextIfExists(path.join(projectRoot, 'package.json'));
@@ -199,6 +199,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         ].join('\n'),
       ),
     );
+    commitDecisionProposals(ctx, mapRes);
 
     // ---- conversion in an ISOLATED workspace, bounded by the derived scope
     bus.emit('ui.convert_exec', { stage: 'IMPORT', message: `convertendo em workspace isolado (${writeScope.length} destinos)` });
@@ -220,8 +221,11 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     };
     const attemptH = replaceableAttempt(ctx, convertTask, {}, { stage: 'UI_SMOKE' });
     let deltaFiles: string[] = [];
+    let conversionEnvelope: import('./shared.js').ValidatedAgentEnvelope | null = null;
+    let validationEnvelope: import('./shared.js').ValidatedAgentEnvelope | null = null;
     try {
       const res = await dispatch(ctx, attemptH.attempt.task, { stage: 'UI_SMOKE' }, { prepareReplacement: attemptH.prepareReplacement });
+      conversionEnvelope = res;
       const conv = z.object({ converted: z.boolean(), components_created: z.array(z.string()).default([]), notes: z.string().default('') }).safeParse(res.payload);
       if (!res.ok || !conv.success || !conv.data.converted) {
         return blocked(ctx, 'UI conversion failed.', [res.summary]);
@@ -287,6 +291,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
           notes: `Routes to validate: ${mapping.data.routes.map((r) => r.to).join(', ') || 'from MAPPING.md'}`,
         };
         const vres = await dispatch(ctx, { ...validateTask, workspace: { id: attemptH.attempt.workspace.id, root: attemptH.attempt.workspace.root } }, { stage: 'UI_SMOKE' });
+        validationEnvelope = vres;
         const vparsed = z
           .object({ passed: z.boolean(), routes_checked: z.array(z.string()).default([]), states_checked: z.array(z.string()).default([]), notes: z.string().default('') })
           .safeParse(vres.payload);
@@ -298,6 +303,8 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
 
       // ---- ALL gates passed: only now the patch reaches the checkout
       attemptH.attempt.workspace.applyVerifiedPatch();
+      if (validationEnvelope) commitDecisionProposals(ctx, validationEnvelope);
+      if (conversionEnvelope) commitDecisionProposals(ctx, conversionEnvelope);
     } catch (err) {
       if (err instanceof Error && ['WorkspaceScopeError', 'CanonicalWriteError', 'SymlinkEscapeError', 'PatchConflictError'].includes(err.name)) {
         return blocked(ctx, `UI conversion discarded — ${err.message}`, []);

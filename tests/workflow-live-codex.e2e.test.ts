@@ -114,7 +114,17 @@ describe('LIVE full-workflow E2E (Codex)', () => {
         expect(mapState.mapped_commit).toBe(externalCommit);
         expect(mapState.changed_paths_since_map).toContain('src/counter.mjs');
         execute(['run', '02'], 'Codex phase 02');
-        assertPhaseConsumedMap(fixture, '02', externalCommit);
+        const phaseTwoMapState = JSON.parse(
+          fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
+        );
+        expect(
+          execFileSync(
+            'git',
+            ['merge-base', '--is-ancestor', externalCommit, phaseTwoMapState.mapped_commit],
+            { cwd: fixture.root },
+          ),
+        ).toBeDefined();
+        assertPhaseConsumedMap(fixture, '02', phaseTwoMapState.mapped_commit);
         execFileSync('npm', ['test'], { cwd: fixture.root, encoding: 'utf8' });
         expect(trackedDirty(fixture)).toEqual([]);
       } finally {

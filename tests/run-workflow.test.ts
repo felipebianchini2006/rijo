@@ -90,12 +90,12 @@ describe('rijo run', () => {
         tasks: [
           {
             id: 'T01', name: 'bad', requirement_ids: [], technical_justification: null,
-            files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: ['T99'],
+            files: ['src/a.ts'], mapped_references: [{ path: 'src/a.ts', intent: 'new', parent_module: 'greenfield-root', placement_evidence: [{ path: '.', reason: 'fixture root' }] }], write_scope: ['src/a.ts'], depends_on: ['T99'],
             parallel: false, tdd: false, tests: [], evidence_expected: 'x', done: false,
           },
           {
             id: 'T02', name: 'bad2', requirement_ids: ['M001-REQ-999'], technical_justification: null,
-            files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: [],
+            files: ['src/b.ts'], mapped_references: [{ path: 'src/b.ts', intent: 'new', parent_module: 'greenfield-root', placement_evidence: [{ path: '.', reason: 'fixture root' }] }], write_scope: ['src/b.ts'], depends_on: [],
             parallel: false, tdd: false, tests: [], evidence_expected: 'x', done: false,
           },
         ],
@@ -291,8 +291,8 @@ describe('rijo run', () => {
       planPayload: (phaseId) => ({
         phase: phaseId,
         tasks: [
-          { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
-          { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
+          { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], mapped_references: [{ path: 'src/a.ts', intent: 'new', parent_module: 'greenfield-root', placement_evidence: [{ path: '.', reason: 'fixture root' }] }], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
+          { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], mapped_references: [{ path: 'src/b.ts', intent: 'new', parent_module: 'greenfield-root', placement_evidence: [{ path: '.', reason: 'fixture root' }] }], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
         ],
       }),
     });

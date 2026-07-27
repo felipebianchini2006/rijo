@@ -36,6 +36,7 @@ export const EvidenceSchema = z.object({
     z.string().regex(/^\d+(?:-\d+)?$/).optional(),
   ),
   file_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  ownership: z.enum(['primary', 'external_contract']).default('primary'),
 });
 export type Evidence = z.infer<typeof EvidenceSchema>;
 
@@ -167,6 +168,15 @@ export const BaselineDocumentSchema = z.object({
   schema_version: z.number().int().default(CODEBASE_SCHEMA_VERSION),
   overall_status: BaselineStatusSchema,
   commands: z.array(BaselineCommandSchema),
+  waiver: z
+    .object({
+      reason: z.string().min(1),
+      approved_at: z.string().datetime(),
+      safe: z.literal(true),
+      evidence: z.array(EvidenceSchema).min(1),
+    })
+    .nullable()
+    .default(null),
 });
 export type BaselineDocument = z.infer<typeof BaselineDocumentSchema>;
 
@@ -186,8 +196,7 @@ const CLAIM_KIND_ALIASES: Record<string, string> = {
   architecture: 'responsibility',
   public_contract: 'contract',
   api: 'contract',
-  test: 'operation',
-  testing: 'operation',
+  testing: 'test',
   operations: 'operation',
   devops: 'operation',
   integration: 'contract',
@@ -200,14 +209,95 @@ const CLAIM_KIND_ALIASES: Record<string, string> = {
 };
 
 export const MapClaimSchema = z.object({
+  claim_id: z.string().min(1).optional(),
+  source_shard: z.string().min(1).optional(),
   kind: z.preprocess(
     (value) => (typeof value === 'string' ? (CLAIM_KIND_ALIASES[value.toLowerCase()] ?? value.toLowerCase()) : value),
-    z.enum(['responsibility', 'contract', 'invariant', 'risk', 'convention', 'operation', 'data_flow']),
+    z.enum([
+      'responsibility',
+      'entrypoint',
+      'contract',
+      'invariant',
+      'dependency',
+      'consumer',
+      'data_flow',
+      'convention',
+      'test',
+      'operation',
+      'risk',
+      'placement',
+    ]),
   ),
   statement: z.string().min(1),
   evidence: z.array(EvidenceSchema).min(1),
 });
 export type MapClaim = z.infer<typeof MapClaimSchema>;
+
+export const ClaimFinalDispositionSchema = z.enum([
+  'APPROVED',
+  'REJECTED',
+  'SUPERSEDED',
+  'PARTIAL',
+  'NOT_APPLICABLE',
+]);
+export type ClaimFinalDisposition = z.infer<typeof ClaimFinalDispositionSchema>;
+
+export const ClaimReceiptSchema = z.object({
+  claim_id: z.string().min(1),
+  source_shard: z.string().min(1),
+  structural_status: z.enum(['PASSED', 'FAILED']),
+  semantic_status: z.enum(['APPROVED', 'REJECTED', 'NOT_REVIEWED']),
+  reviewer_attempt: z.string().min(1).nullable(),
+  reviewed_at: z.string().datetime(),
+  evidence_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  final_disposition: ClaimFinalDispositionSchema,
+});
+export type ClaimReceipt = z.infer<typeof ClaimReceiptSchema>;
+
+export const MapGapSchema = z.object({
+  code: z.enum([
+    'MAPPER_INSUFFICIENT',
+    'MAPPER_REPORTED',
+    'RELEVANT_FILE_UNANALYZED',
+    'COVERAGE_INCOMPLETE',
+    'BASELINE_UNSAFE',
+    'OWNERSHIP_CONFLICT',
+    'EVIDENCE_INVALID',
+    'CONTRADICTION',
+    'RUNTIME_REQUIRED',
+    'REVIEW_INCOMPLETE',
+  ]),
+  category: z.enum(['semantic', 'coverage', 'baseline', 'ownership', 'evidence', 'runtime', 'contradiction']),
+  severity: z.enum(['non_critical', 'critical']),
+  message: z.string().min(1),
+  affected_paths: z.array(z.string()).default([]),
+  affected_modules: z.array(z.string()).default([]),
+});
+export type MapGap = z.infer<typeof MapGapSchema>;
+
+export const SemanticCoverageCategorySchema = z.enum([
+  'responsibility',
+  'entrypoints',
+  'contracts',
+  'invariants',
+  'dependencies',
+  'consumers',
+  'data_flow',
+  'conventions',
+  'tests',
+  'operations',
+  'risks',
+  'placement',
+]);
+export type SemanticCoverageCategory = z.infer<typeof SemanticCoverageCategorySchema>;
+
+export const SemanticCoverageRecordSchema = z.object({
+  module_id: z.string().min(1),
+  category: SemanticCoverageCategorySchema,
+  status: z.enum(['COVERED', 'GAP', 'NOT_APPLICABLE']),
+  rationale: z.string().min(1),
+});
+export type SemanticCoverageRecord = z.infer<typeof SemanticCoverageRecordSchema>;
 
 export const ClaimsDocumentSchema = z.object({
   schema_version: z.number().int().default(CODEBASE_SCHEMA_VERSION),
@@ -219,7 +309,29 @@ export const MapAgentFragmentSchema = z.object({
   shard_id: z.string(),
   module_ids: z.array(z.string()).min(1),
   claims: z.array(MapClaimSchema),
-  gaps: z.array(z.string()).default([]),
+  semantic_coverage: z.array(SemanticCoverageRecordSchema).default([]),
+  gaps: z
+    .array(
+      z.object({
+        code: z.enum([
+          'RESPONSIBILITY_UNKNOWN',
+          'ENTRYPOINT_UNKNOWN',
+          'CONTRACT_UNKNOWN',
+          'INVARIANT_UNKNOWN',
+          'DEPENDENCY_UNKNOWN',
+          'CONSUMER_UNKNOWN',
+          'DATA_FLOW_UNKNOWN',
+          'CONVENTION_UNKNOWN',
+          'TEST_COVERAGE_UNKNOWN',
+          'OPERATION_UNKNOWN',
+          'RISK_UNKNOWN',
+          'PLACEMENT_UNKNOWN',
+        ]),
+        message: z.string().min(1),
+        affected_paths: z.array(z.string()).min(1),
+      }),
+    )
+    .default([]),
 });
 export type MapAgentFragment = z.infer<typeof MapAgentFragmentSchema>;
 
@@ -252,6 +364,7 @@ export const MapStateSchema = z.object({
   changed_paths_since_map: z.array(z.string()),
   stale_reasons: z.array(z.string()),
   gaps: z.array(z.string()).default([]),
+  gap_records: z.array(MapGapSchema).default([]),
   last_operation: z.enum(['full', 'incremental', 'paths', 'no-op']).default('full'),
 });
 export type CodebaseMapState = z.infer<typeof MapStateSchema>;

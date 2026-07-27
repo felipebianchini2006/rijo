@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * A boolean field an LLM fills that may arrive as a string ("true"/"false"/
@@ -466,6 +466,33 @@ export function assertTaskTransition(taskId: string, from: TaskStatus, to: TaskS
   if (!TASK_TRANSITIONS[from].includes(to)) throw new InvalidTaskTransitionError(taskId, from, to);
 }
 
+export const ExistingMappedReferenceSchema = z.object({
+  path: z.string().min(1),
+  intent: z.literal('existing'),
+  file_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  symbol: z.string().min(1).optional(),
+});
+
+export const NewMappedReferenceSchema = z.object({
+  path: z.string().min(1),
+  intent: z.literal('new'),
+  parent_module: z.string().min(1),
+  placement_evidence: z
+    .array(
+      z.object({
+        path: z.string().min(1),
+        reason: z.string().min(1),
+      }),
+    )
+    .min(1),
+});
+
+export const MappedReferenceSchema = z.discriminatedUnion('intent', [
+  ExistingMappedReferenceSchema,
+  NewMappedReferenceSchema,
+]);
+export type MappedReference = z.infer<typeof MappedReferenceSchema>;
+
 export const PlanTaskSchema = z.object({
   id: z.string().regex(/^T\d{2}$/),
   name: z.string().min(1),
@@ -473,19 +500,12 @@ export const PlanTaskSchema = z.object({
   technical_justification: z.string().nullable().default(null),
   files: z.array(z.string()).min(1),
   /**
-   * Evidence for existing code paths/symbols used by the plan. New files do
-   * not need an entry; every claimed existing contract does. The codebase-map
-   * gate verifies these references before any worker is dispatched.
+   * Explicit intent for every task file. This field deliberately has no
+   * default: a planner must prove an existing path/hash (and optional symbol)
+   * or prove placement for a new file. Legacy plans are migrated/invalidate
+   * explicitly by the workflow and never parsed through a permissive default.
    */
-  mapped_references: z
-    .array(
-      z.object({
-        path: z.string().min(1),
-        symbol: z.string().min(1).optional(),
-        file_hash: z.string().regex(/^[a-f0-9]{64}$/),
-      }),
-    )
-    .default([]),
+  mapped_references: z.array(MappedReferenceSchema).min(1),
   write_scope: z.array(z.string()).min(1),
   depends_on: z.array(z.string()).default([]),
   parallel: looseBool(false),
@@ -505,10 +525,25 @@ export const PlanTaskSchema = z.object({
 });
 export type PlanTask = z.infer<typeof PlanTaskSchema>;
 
-export const PhasePlanSchema = z.object({
+export const PlanFreshnessSchema = z.object({
+  mapped_commit: z.string().min(1),
+  mapped_tree_hash: z.string().min(1),
+  planned_at: z.string().datetime(),
+  context_packet_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  mapped_reference_hashes: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
+  decision_context_hash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type PlanFreshness = z.infer<typeof PlanFreshnessSchema>;
+
+/** Planner-authored shape. Freshness is stamped by the deterministic core. */
+export const PhasePlanDraftSchema = z.object({
   phase: z.string(),
   tasks: z.array(PlanTaskSchema).min(2).max(4),
 });
+export type PhasePlanDraft = z.infer<typeof PhasePlanDraftSchema>;
+
+/** Persisted PLAN.md shape. Every plan is tied to one exact map/context. */
+export const PhasePlanSchema = PhasePlanDraftSchema.merge(PlanFreshnessSchema);
 export type PhasePlan = z.infer<typeof PhasePlanSchema>;
 
 export const PhaseStatusSchema = z.enum(['PENDING', 'IN_PROGRESS', 'DONE', 'BLOCKED']);

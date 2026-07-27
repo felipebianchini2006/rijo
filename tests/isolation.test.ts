@@ -8,7 +8,7 @@ import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readPlan } from '../src/core/plan.js';
 import { readState } from '../src/core/state.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, newMappedReference, ok, phaseReqIds } from './helpers.js';
 
 function milestoneDir(root: string): string {
   const paths = new RijoPaths(root);
@@ -22,8 +22,8 @@ function parallelPlan(root: string) {
   return (phaseId: string) => ({
     phase: phaseId,
     tasks: [
-      { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
-      { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
+      { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], mapped_references: [newMappedReference('src/a.ts')], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
+      { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], mapped_references: [newMappedReference('src/b.ts')], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
     ],
   });
 }

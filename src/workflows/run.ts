@@ -1,8 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
-import { exists, readText, readTextIfExists, writeFileAtomic, ensureDir } from '../core/fsx.js';
-import { serializeFrontmatter } from '../core/frontmatter.js';
+import { exists, readJsonIfExists, readText, readTextIfExists, sha256File, writeFileAtomic, writeJsonAtomic, ensureDir } from '../core/fsx.js';
+import { parseFrontmatter, serializeFrontmatter } from '../core/frontmatter.js';
 import { phasePaths, type PhasePaths } from '../core/paths.js';
 import { readState } from '../core/state.js';
 import { touchManifest, canonicalBaselineHash } from '../core/manifest.js';
@@ -23,7 +23,7 @@ import {
   PatchConflictError,
 } from '../core/workspace.js';
 import { redact } from '../security/redact.js';
-import { PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, looseBool, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
+import { PhasePlanDraftSchema, PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, looseBool, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
 import type { CommandEvidence } from '../core/commands.js';
 import type { AgentTask, AgentTaskDraft, AgentResult } from '../agents/protocol.js';
 import {
@@ -37,15 +37,23 @@ import {
   guardSchema,
   replaceableAttempt,
   dispatchReadOnly,
+  commitDecisionProposals,
+  discardDecisionProposals,
   isWorkflowCancellation,
   type ReplaceableAttempt,
   type WorkflowContext,
   type WorkflowDeps,
   type WorkflowOutcome,
+  type ValidatedAgentEnvelope,
 } from './shared.js';
 import { inferSecurityTag, inferHighRisk } from './routing.js';
 import { stageFinalization } from './finalize.js';
-import { buildContextPacket, gapsAffectingScope, validatePlanMapReferences } from '../codebase/context.js';
+import {
+  buildContextPacket,
+  gapsAffectingScope,
+  structuredGapsAffectingScope,
+  validatePlanMapReferences,
+} from '../codebase/context.js';
 import { readMapState } from '../codebase/state.js';
 import { ensureCodebaseMap } from './map.js';
 
@@ -74,6 +82,66 @@ const PhaseRecoveryBaselineSchema = z.object({
   controlled_snapshot: z.array(z.tuple([z.string(), z.string()])),
   dirty_at_start: z.array(z.string()),
 });
+
+const PlanInvalidationSchema = z.object({
+  schema_version: z.literal(1),
+  milestone: z.string(),
+  phase: z.string(),
+  plan_path: z.string(),
+  status: z.enum(['INVALIDATED', 'REPLANNED']),
+  reasons: z.array(z.string()).min(1),
+  old_plan_hash: z.string().nullable(),
+  new_plan_hash: z.string().nullable(),
+  invalidated_at: z.string().datetime(),
+  replanned_at: z.string().datetime().nullable(),
+});
+
+function planInvalidationPath(ctx: WorkflowContext, milestone: string, phase: string): string {
+  return path.join(ctx.paths.runtimeDir, 'plan-invalidations', `${milestone}-${phase}.json`);
+}
+
+function writePlanInvalidation(
+  ctx: WorkflowContext,
+  milestone: string,
+  phase: string,
+  planPath: string,
+  reasons: string[],
+): void {
+  writeJsonAtomic(
+    planInvalidationPath(ctx, milestone, phase),
+    PlanInvalidationSchema.parse({
+      schema_version: 1,
+      milestone,
+      phase,
+      plan_path: path.relative(ctx.projectRoot, planPath).split(path.sep).join('/'),
+      status: 'INVALIDATED',
+      reasons,
+      old_plan_hash: exists(planPath) ? sha256File(planPath) : null,
+      new_plan_hash: null,
+      invalidated_at: ctx.now().toISOString(),
+      replanned_at: null,
+    }),
+  );
+  ctx.planHooks.afterInvalidated?.();
+}
+
+function markPlanReplanned(
+  ctx: WorkflowContext,
+  milestone: string,
+  phase: string,
+  planPath: string,
+): void {
+  const target = planInvalidationPath(ctx, milestone, phase);
+  const marker = PlanInvalidationSchema.safeParse(readJsonIfExists<unknown>(target));
+  if (!marker.success || marker.data.status !== 'INVALIDATED') return;
+  writeJsonAtomic(target, {
+    ...marker.data,
+    status: 'REPLANNED',
+    new_plan_hash: sha256File(planPath),
+    replanned_at: ctx.now().toISOString(),
+  });
+  ctx.planHooks.afterReplanned?.();
+}
 
 function phaseRecoveryBaselinePath(ctx: WorkflowContext, milestone: string, phase: string): string {
   return path.join(ctx.paths.runtimeDir, 'phase-baselines', `${milestone}-${phase}.json`);
@@ -270,9 +338,58 @@ async function executePhase(
     touchManifest(paths, () => {}, now);
   };
 
-  if (!exists(pp.plan) && readMapState(paths)) {
-    stage('LOAD', 'verificando freshness do mapa antes do planejamento da fase');
-    const ensured = await ensureCodebaseMap(ctx, { commit: true });
+  let forceReplan = false;
+  let appliedPlanAtEntry = false;
+  if (readMapState(paths)) {
+    stage('LOAD', 'verificando freshness do mapa e do plano antes de entrar na fase');
+    const rawPlanData = exists(pp.plan)
+      ? parseFrontmatter<Record<string, unknown>>(readText(pp.plan)).data
+      : null;
+    const rawTasks = Array.isArray(rawPlanData?.['tasks'])
+      ? (rawPlanData!['tasks'] as Array<Record<string, unknown>>)
+      : [];
+    const hasAppliedProgress = rawTasks.some((task) =>
+      ['IMPLEMENTED', 'VERIFYING', 'VERIFIED', 'DONE'].includes(String(task['status'] ?? 'PENDING')),
+    );
+    appliedPlanAtEntry = hasAppliedProgress;
+    let allowedDirtyPaths = ctx.git
+      .status(ctx.projectRoot)
+      .dirtyFiles.filter((dirtyPath) => dirtyPath === '.rijo' || dirtyPath.startsWith('.rijo/'));
+    if (hasAppliedProgress) {
+      const recovery = readPhaseRecoveryBaseline(
+        phaseRecoveryBaselinePath(ctx, milestone.id, phase.id),
+      );
+      if (!recovery) {
+        return blocked(ctx, `Phase ${phase.id}: source baseline needed for safe freshness recovery is missing.`, [
+          'The existing plan records applied tasks, but RIJO cannot distinguish controlled work from external changes.',
+        ]);
+      }
+      const externalDelta = diffSnapshots(recovery.controlledSnapshot, snapshotFiles(ctx.projectRoot));
+      const writeScopes = rawTasks.flatMap((task) =>
+        Array.isArray(task['write_scope']) ? (task['write_scope'] as string[]) : [],
+      );
+      const overlapping = externalDelta.changed.filter((changed) =>
+        writeScopes.some((scope) => pathInScope(changed, [scope])),
+      );
+      if (overlapping.length > 0) {
+        return blocked(ctx, `Phase ${phase.id}: external changes overlap the existing plan.`, [
+          `Conflicting paths: ${overlapping.join(', ')}`,
+          'RIJO did not appropriate, overwrite, or revert these paths.',
+        ]);
+      }
+      allowedDirtyPaths = ctx.git.status(ctx.projectRoot).dirtyFiles;
+      if (externalDelta.changed.length > 0) {
+        bus.emit(
+          'run.external_change_non_overlapping',
+          { message: `mudança externa não relacionada registrada para a fase ${phase.id}` },
+          { phase: phase.id, paths: externalDelta.changed },
+        );
+      }
+    }
+    const ensured = await ensureCodebaseMap(ctx, {
+      commit: true,
+      ...(allowedDirtyPaths.length > 0 ? { allowedDirtyPaths } : {}),
+    });
     if (!ensured.outcome.ok) return ensured.outcome;
     if (!ensured.state || ensured.state.status === 'BLOCKED') {
       return blocked(ctx, `Phase ${phase.id}: current codebase map is not safe for planning.`, [
@@ -287,9 +404,92 @@ async function executePhase(
       phase.name,
       ...phaseRequirements.flatMap((requirement) => [requirement.description, requirement.acceptance]),
     ].join('\n');
-    const affectingGaps = gapsAffectingScope(ensured.state.gaps, phaseScope);
+    const affectingGaps =
+      ensured.state.gap_records.length > 0
+        ? structuredGapsAffectingScope(ensured.state.gap_records, phaseScope)
+        : gapsAffectingScope(ensured.state.gaps, phaseScope);
     if (ensured.state.status === 'PARTIAL' && affectingGaps.length > 0) {
       return blocked(ctx, `Phase ${phase.id}: codebase map gaps intersect the phase scope.`, affectingGaps);
+    }
+    if (exists(pp.plan)) {
+      const marker = PlanInvalidationSchema.safeParse(
+        readJsonIfExists<unknown>(planInvalidationPath(ctx, milestone.id, phase.id)),
+      );
+      if (marker.success && marker.data.status === 'INVALIDATED') {
+        forceReplan = true;
+      } else {
+        let existingPlan: PhasePlan | null = null;
+        try {
+          existingPlan = readPlan(pp.plan);
+        } catch (error) {
+          if (hasAppliedProgress) {
+            return blocked(ctx, `Phase ${phase.id}: an applied legacy plan cannot be migrated safely.`, [
+              error instanceof Error ? error.message : String(error),
+            ]);
+          }
+          writePlanInvalidation(ctx, milestone.id, phase.id, pp.plan, [
+            'LEGACY_PLAN_SCHEMA: mapped references or freshness metadata are missing',
+          ]);
+          forceReplan = true;
+        }
+        if (existingPlan) {
+          const packet = buildContextPacket(ctx.projectRoot, phaseScope, config.context_budget_bytes, now);
+          const referenceIssues = validatePlanMapReferences(ctx.projectRoot, existingPlan).filter((issue) => {
+            if (!hasAppliedProgress) return true;
+            const task = existingPlan!.tasks.find((candidate) => candidate.id === issue.task_id);
+            if (!task || !['IMPLEMENTED', 'VERIFYING', 'VERIFIED', 'DONE'].includes(task.status)) return true;
+            return !task.write_scope.some((scope) => issue.message.includes(scope));
+          });
+          const declaredReferenceHashes = Object.fromEntries(
+            existingPlan.tasks.flatMap((task) =>
+              task.mapped_references
+                .filter((reference) => reference.intent === 'existing')
+                .map((reference) => [reference.path, reference.file_hash]),
+            ),
+          );
+          const freshnessReasons = [
+            ...(existingPlan.mapped_commit !== ensured.state.mapped_commit
+              ? [`mapped_commit changed (${existingPlan.mapped_commit} -> ${ensured.state.mapped_commit})`]
+              : []),
+            ...(existingPlan.mapped_tree_hash !== ensured.state.mapped_tree_hash
+              ? ['mapped_tree_hash changed']
+              : []),
+            ...(existingPlan.context_packet_hash !== packet.packet_hash
+              ? ['context_packet_hash changed']
+              : []),
+            ...(existingPlan.decision_context_hash !== packet.decision_context_hash
+              ? ['decision_context_hash changed']
+              : []),
+            ...(JSON.stringify(existingPlan.mapped_reference_hashes) !== JSON.stringify(declaredReferenceHashes)
+              ? ['mapped_reference_hashes do not match the plan references']
+              : []),
+            ...referenceIssues.map((issue) => `${issue.code}: ${issue.message}`),
+          ];
+          if (freshnessReasons.length > 0) {
+            const overlappingReferences = referenceIssues.filter((issue) =>
+              ['MAP_HASH_MISMATCH', 'MAP_SYMBOL_NOT_FOUND', 'MAP_PATH_NOT_FOUND', 'MAP_INTENT_MISMATCH'].includes(
+                issue.code,
+              ),
+            );
+            if (hasAppliedProgress && overlappingReferences.length > 0) {
+              return blocked(ctx, `Phase ${phase.id}: mapped references changed after tasks were applied.`, [
+                ...overlappingReferences.map((issue) => issue.message),
+                'Recovery is not deterministic; the controlled checkout was left unchanged.',
+              ]);
+            }
+            if (!hasAppliedProgress) {
+              writePlanInvalidation(ctx, milestone.id, phase.id, pp.plan, freshnessReasons);
+              forceReplan = true;
+            } else {
+              bus.emit(
+                'run.plan_freshness_reconciled',
+                { message: `plano aplicado da fase ${phase.id} reconciliado com mudança externa não sobreposta` },
+                { reasons: freshnessReasons },
+              );
+            }
+          }
+        }
+      }
     }
     bus.emit(
       'run.map_context_fresh',
@@ -353,6 +553,7 @@ async function executePhase(
       }
       spec.attempt.workspace.applyVerifiedPatch();
       touchManifest(paths, () => {}, now);
+      commitDecisionProposals(ctx, res);
     } catch (err) {
       return blocked(ctx, `Phase ${phase.id}: spec generation violated workspace boundaries.`, [String((err as Error).message)]);
     } finally {
@@ -375,9 +576,11 @@ async function executePhase(
     ].join('\n'),
     config.context_budget_bytes,
   );
-  let plan: PhasePlan | null = exists(pp.plan) ? readPlan(pp.plan) : null;
+  let plan: PhasePlan | null = exists(pp.plan) && !forceReplan ? readPlan(pp.plan) : null;
   let revisions = 0;
   let reviewNotes: string[] = [];
+  let planEnvelope: ValidatedAgentEnvelope | null = null;
+  let planReviewEnvelope: ValidatedAgentEnvelope | null = null;
   while (true) {
     if (!plan) {
       stage('PLAN', `planejando tarefas (revisão ${revisions})`);
@@ -391,7 +594,7 @@ async function executePhase(
         acceptance_criteria: ['2-4 tasks', 'every task writes at least one concrete file (non-empty files[] and write_scope[])', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
         verification_commands: [],
         return_format:
-          'JSON payload matching PhasePlan: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 real path*/], mapped_references:[{path,symbol?,file_hash}] /* required for every existing file/contract; omit only for genuinely new files */, write_scope[/*>=1 real path*/], depends_on[], parallel, tdd, tests[/*executable command strings only, e.g. "npm test"*/], evidence_expected}]}. Never leave files[] or write_scope[] empty. Copy hashes and symbols exactly from the supplied codebase map context. Put behavioral scenarios in evidence_expected, not tests[].',
+          'JSON payload matching PhasePlanDraft: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 exact path*/], mapped_references:[{path,intent:"existing",file_hash,symbol?}|{path,intent:"new",parent_module,placement_evidence:[{path,reason}]}] /* required and must cover every task file */, write_scope[/*only exact declared files*/], depends_on[], parallel, tdd, tests[/*executable command strings only, e.g. "npm test"*/], evidence_expected}]}. Existing paths must use current hashes; new paths must extend a mapped module and cite real placement evidence. Never omit mapped_references. Put behavioral scenarios in evidence_expected, not tests[].',
         notes: [
           planningMapContext.text,
           reviewNotes.length ? `Previous review issues to address:\n${reviewNotes.join('\n')}` : '',
@@ -402,6 +605,7 @@ async function executePhase(
         canonical_baseline: null,
       };
       const { result: res, violation } = await dispatchReadOnly(ctx, planTask, { stage: 'PLAN' });
+      planEnvelope = res;
       if (violation.length > 0) {
         return blocked(ctx, `Phase ${phase.id}: planner (read-only) modified the checkout.`, violation);
       }
@@ -411,6 +615,7 @@ async function executePhase(
       // plan_revisions budget rather than abandoning the phase on a transient
       // host blip. Only an exhausted budget blocks.
       if (!res.ok) {
+        discardDecisionProposals(ctx, res);
         if (isWorkflowCancellation(res) || revisions >= config.limits.plan_revisions) {
           return blocked(ctx, `Phase ${phase.id}: planning failed after ${revisions} revisions.`, [res.summary]);
         }
@@ -421,8 +626,9 @@ async function executePhase(
         plan = null;
         continue;
       }
-      const parsed = PhasePlanSchema.safeParse(res.payload);
+      const parsed = PhasePlanDraftSchema.safeParse(res.payload);
       if (!parsed.success) {
+        discardDecisionProposals(ctx, res);
         // A schema-invalid plan (e.g. a task missing files/write_scope) is a
         // RECOVERABLE planner error, not a fatal one: feed the precise shape
         // violations back and re-plan within the same plan_revisions budget the
@@ -440,24 +646,52 @@ async function executePhase(
         plan = null;
         continue;
       }
-      plan = parsed.data;
-      plan.phase = phase.id;
+      plan = {
+        ...parsed.data,
+        phase: phase.id,
+        mapped_commit: planningMapContext.mapped_commit || 'GREENFIELD',
+        mapped_tree_hash: planningMapContext.mapped_tree_hash || 'GREENFIELD',
+        planned_at: now().toISOString(),
+        context_packet_hash: planningMapContext.packet_hash,
+        mapped_reference_hashes: Object.fromEntries(
+          parsed.data.tasks.flatMap((task) =>
+            task.mapped_references
+              .filter((reference) => reference.intent === 'existing')
+              .map((reference) => [reference.path, reference.file_hash]),
+          ),
+        ),
+        decision_context_hash: planningMapContext.decision_context_hash,
+      };
       // The PLAN is a canonical artifact written by the CORE from the planner's
       // validated payload — the agent never touches the plan file itself.
       writePlan(pp.plan, plan, `Generated for ${phase.name}.`);
+      ctx.planHooks.afterPlanWritten?.();
+      markPlanReplanned(ctx, milestone.id, phase.id, pp.plan);
       touchManifest(paths, () => {}, now);
     }
 
     stage('PLAN_LINT', 'validação determinística do plano');
     const phaseRequirements = reqDoc.requirements.filter((r) => r.phase === phase.id).map((r) => r.id);
     const lintIssues = lintPlan(plan, { knownRequirements: knownReqs, phaseRequirements });
-    const mapReferenceIssues = validatePlanMapReferences(ctx.projectRoot, plan).map((issue) => ({
+    const mapReferenceIssues = (readMapState(paths) ? validatePlanMapReferences(ctx.projectRoot, plan) : [])
+      .filter((issue) => {
+        if (!appliedPlanAtEntry) return true;
+        const task = plan!.tasks.find((candidate) => candidate.id === issue.task_id);
+        return (
+          !task ||
+          !['IMPLEMENTED', 'VERIFYING', 'VERIFIED', 'DONE'].includes(task.status) ||
+          !task.write_scope.some((scope) => issue.message.includes(scope))
+        );
+      })
+      .map((issue) => ({
       code: issue.code,
       message: `${issue.task_id}: ${issue.message}`,
       fix: 'Use an existing path/symbol/hash from the current codebase map, or declare a genuinely new file below an existing directory.',
-    }));
+      }));
     lintIssues.push(...mapReferenceIssues);
     if (lintIssues.length > 0) {
+      if (planEnvelope) discardDecisionProposals(ctx, planEnvelope);
+      planEnvelope = null;
       if (revisions >= config.limits.plan_revisions) {
         return blocked(ctx, `Phase ${phase.id}: plan lint failed after ${revisions} revisions.`, lintIssues.map((i) => `${i.code}: ${i.message} — ${i.fix}`));
       }
@@ -487,6 +721,7 @@ async function executePhase(
       stage: 'PLAN_REVIEW',
       authorProfiles: ['product-manager', 'system-architect'],
     });
+    planReviewEnvelope = reviewRes;
     if (reviewViolation.length > 0) {
       return blocked(ctx, `Phase ${phase.id}: plan reviewer (read-only) modified the checkout.`, reviewViolation);
     }
@@ -494,6 +729,7 @@ async function executePhase(
     // glitch) is RECOVERABLE: re-run the plan/review cycle within the
     // plan_revisions budget rather than abandoning the phase on a transient blip.
     if (!reviewRes.ok) {
+      discardDecisionProposals(ctx, reviewRes);
       if (isWorkflowCancellation(reviewRes) || revisions >= config.limits.plan_revisions) {
         return blocked(ctx, `Phase ${phase.id}: plan review failed to produce a verdict after ${revisions} revisions.`, [reviewRes.summary]);
       }
@@ -523,11 +759,17 @@ async function executePhase(
       );
     }
     revisions++;
+    discardDecisionProposals(ctx, reviewRes);
+    if (planEnvelope) discardDecisionProposals(ctx, planEnvelope);
+    planEnvelope = null;
+    planReviewEnvelope = null;
     reviewNotes = review.success
       ? blockingFindings.map((f) => `${f.type}/${f.severity}: ${f.description}`)
       : [`Reviewer verdict (unstructured): ${reviewRes.summary}`];
     plan = null;
   }
+  if (planEnvelope) commitDecisionProposals(ctx, planEnvelope);
+  if (planReviewEnvelope) commitDecisionProposals(ctx, planReviewEnvelope);
   bus.emit('run.plan_approved', { message: 'plano aprovado' });
 
   // Baseline snapshot of the working tree (excluding .rijo internals) taken
@@ -647,7 +889,7 @@ async function executePhase(
     });
 
     const discardAll = () => attempts.forEach((a) => a.attempt.workspace.discard());
-    let results: AgentResult[];
+    let results: ValidatedAgentEnvelope[];
     try {
       results = await dispatchBatch(
         ctx,
@@ -730,6 +972,7 @@ async function executePhase(
         message: `tarefa ${t.id} implementada (não verificada)`,
       });
     }
+    for (const result of results) commitDecisionProposals(ctx, result);
     checkpointControlledSnapshot();
   }
 
@@ -842,6 +1085,7 @@ async function executePhase(
     // the reviewer's summary as the finding, and run the bounded repair loop
     // below — it only blocks once the review_loops budget is exhausted.
     if (!crRes.ok) {
+      discardDecisionProposals(ctx, crRes);
       if (isWorkflowCancellation(crRes) || reviewLoops >= config.limits.review_loops) {
         return blocked(ctx, `Phase ${phase.id}: code review failed to produce a verdict after ${config.limits.review_loops} cycles.`, [crRes.summary]);
       }
@@ -850,6 +1094,7 @@ async function executePhase(
     }
     const cr = ReviewPayloadSchema.safeParse(crRes.payload);
     if (!cr.success) {
+      discardDecisionProposals(ctx, crRes);
       if (reviewLoops >= config.limits.review_loops) {
         return blocked(ctx, `Phase ${phase.id}: code review produced no usable verdict after ${config.limits.review_loops} cycles.`, [crRes.summary]);
       }
@@ -885,7 +1130,10 @@ async function executePhase(
     const actionable = cr.data.findings.filter(
       (f) => !['defer', 'reject'].includes(f.type) && blockingSeverities.has(f.severity),
     );
-    if (cr.data.approved || actionable.length === 0) break;
+    if (cr.data.approved || actionable.length === 0) {
+      commitDecisionProposals(ctx, crRes);
+      break;
+    }
     if (reviewLoops >= config.limits.review_loops) {
       return blocked(
         ctx,
@@ -894,6 +1142,7 @@ async function executePhase(
       );
     }
     reviewLoops++;
+    discardDecisionProposals(ctx, crRes);
     const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
       id: `review-fix-${phase.id}-l${reviewLoops}`,
       objective: 'Address the valid review findings below with minimal coherent changes.',
@@ -939,6 +1188,7 @@ async function executePhase(
           ]);
         }
         smokeHandle.attempt.workspace.applyVerifiedPatch();
+        commitDecisionProposals(ctx, smokeRes);
       } catch (err) {
         return blocked(ctx, `Phase ${phase.id}: UI smoke violated workspace boundaries.`, [String((err as Error).message)]);
       } finally {
@@ -1004,6 +1254,7 @@ async function runRepairAttempt(
       return blocked(ctx, `Phase ${phaseId}: repair worker failed.`, [res.summary]);
     }
     handle.attempt.workspace.applyVerifiedPatch();
+    commitDecisionProposals(ctx, res);
     return null;
   } catch (err) {
     if (

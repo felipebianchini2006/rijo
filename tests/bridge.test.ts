@@ -7,7 +7,7 @@ import { AgentResultSchema, type AgentTask, type AgentResult } from '../src/agen
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRoadmap } from '../src/core/roadmap.js';
-import { tmpProject, cleanup, writePlanFile, EXTRACTION_PAYLOAD, mapFragmentFor } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, EXTRACTION_PAYLOAD, mapFragmentFor, newMappedReference } from './helpers.js';
 
 /**
  * Phase plan payload the fake host returns — self-contained (does not depend on
@@ -26,6 +26,7 @@ function localPlanPayload(phaseId: string) {
         requirement_ids: [reqId],
         technical_justification: 'infra da fase',
         files: ['src/a.ts'],
+        mapped_references: [newMappedReference('src/a.ts')],
         write_scope: ['src/a.ts'],
         depends_on: [],
         parallel: false,
@@ -40,6 +41,7 @@ function localPlanPayload(phaseId: string) {
         requirement_ids: [reqId],
         technical_justification: 'integração',
         files: ['src/b.ts'],
+        mapped_references: [newMappedReference('src/b.ts')],
         write_scope: ['src/b.ts'],
         depends_on: ['T01'],
         parallel: false,

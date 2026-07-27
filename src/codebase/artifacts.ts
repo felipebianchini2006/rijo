@@ -10,6 +10,7 @@ import {
   type HistoryRecord,
   type InventoryDocument,
   type MapClaim,
+  type MapGap,
   type SurfacesDocument,
   type SymbolsDocument,
 } from './schemas.js';
@@ -23,7 +24,14 @@ export interface MapArtifactInput {
   baseline: BaselineDocument;
   claims: MapClaim[];
   gaps: string[];
-  observations: Array<{ shard_id: string; message: string }>;
+  gapRecords: MapGap[];
+  observations: Array<{
+    shard_id: string;
+    code?: 'MAPPER_REPORTED' | 'MAPPER_INSUFFICIENT';
+    message: string;
+    affected_paths?: string[];
+    affected_modules?: string[];
+  }>;
   commit: string;
   branch: string;
   sourceTreeHash: string;
@@ -34,15 +42,30 @@ export interface MapArtifactInput {
   status: CodebaseMapState['status'];
   reviewReceipts: {
     claim_receipts: Array<{
-      claim_hash: string;
-      review_shard: string;
-      structural: 'PASSED';
-      semantic: 'APPROVED' | 'NOT_REVIEWED';
+      claim_id: string;
+      source_shard: string;
+      structural_status: 'PASSED' | 'FAILED';
+      semantic_status: 'APPROVED' | 'REJECTED' | 'NOT_REVIEWED';
+      reviewer_attempt: string | null;
+      reviewed_at: string;
+      evidence_hash: string;
+      final_disposition: 'APPROVED' | 'REJECTED' | 'SUPERSEDED' | 'PARTIAL' | 'NOT_APPLICABLE';
     }>;
     mapper_observations: Array<{
       shard_id: string;
+      code?: 'MAPPER_REPORTED' | 'MAPPER_INSUFFICIENT';
       message: string;
+      affected_paths?: string[];
+      affected_modules?: string[];
       review_status: 'APPROVED_NON_BLOCKING';
+    }>;
+    shard_receipts: Array<{
+      shard_id: string;
+      allowed_paths: string[];
+      neighbor_contract_paths: string[];
+      accepted_evidence: Array<{ path: string; ownership: 'primary' | 'external_contract' }>;
+      rejected_evidence: Array<{ path: string; reason: string }>;
+      semantic_coverage: import('./schemas.js').SemanticCoverageRecord[];
     }>;
     consolidation: { status: 'APPROVED' | 'NOT_REVIEWED'; contradictions: string[] };
   };
@@ -204,7 +227,7 @@ export function buildMapArtifacts(input: MapArtifactInput): { artifacts: Record<
       '# Conventions',
       '',
       ...input.claims
-        .filter((claim) => claim.kind === 'convention' || claim.kind === 'invariant')
+        .filter((claim) => claim.kind === 'convention' || claim.kind === 'invariant' || claim.kind === 'placement')
         .map((claim) => `- ${claim.statement} Evidence: ${evidenceRefs(claim)}.`),
       `- Preserve the dominant module ownership recorded in \`MODULES.md\`; representative evidence: \`${firstEvidence}\`.`,
       `- Public names are extracted from actual exports in ${input.inventory.files.filter((f) => f.exports.length).slice(0, 10).map((f) => `\`${f.path}\``).join(', ') || `\`${firstEvidence}\``}.`,
@@ -311,6 +334,7 @@ export function buildMapArtifacts(input: MapArtifactInput): { artifacts: Record<
     changed_paths_since_map: input.changedPaths,
     stale_reasons: input.staleReasons,
     gaps: input.gaps,
+    gap_records: input.gapRecords,
     last_operation: input.operation,
   });
   artifacts['map-state.json'] = json(state);

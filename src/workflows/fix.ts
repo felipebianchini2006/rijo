@@ -12,6 +12,8 @@ import {
   failed,
   dispatchReadOnly,
   dispatch,
+  commitDecisionProposals,
+  discardDecisionProposals,
   replaceableAttempt,
   guardSchema,
   type WorkflowDeps,
@@ -104,10 +106,12 @@ export async function fixWorkflow(
       }
       const parsed = DiagnosisSchema.safeParse(res.payload);
       if (!res.ok || !parsed.success) {
+        discardDecisionProposals(ctx, res);
         appendLog(`diagnose attempt ${attempt} failed: ${res.summary}`);
         continue;
       }
       diagnosis = parsed.data;
+      commitDecisionProposals(ctx, res);
       appendLog(`diagnose attempt ${attempt}: reproduced=${diagnosis.reproduced} cause=${diagnosis.root_cause ?? 'unknown'}`);
       if (diagnosis.reproduced || diagnosis.escalate) break;
     }
@@ -152,27 +156,32 @@ export async function fixWorkflow(
         const res = await dispatch(ctx, attemptWs.attempt.task, { stage: 'REPAIR' }, { prepareReplacement: attemptWs.prepareReplacement });
         const parsed = RepairSchema.safeParse(res.payload);
         if (!res.ok || !parsed.success || !parsed.data.fixed) {
+          discardDecisionProposals(ctx, res);
           appendLog(`repair attempt ${attempt} failed: ${res.summary}`);
           continue;
         }
         // Evidence gate: a fix must run at least one post-fix verification
         // command. A repair claiming success with zero commands is never accepted.
         if (parsed.data.verification_commands.length === 0) {
+          discardDecisionProposals(ctx, res);
           appendLog(`repair attempt ${attempt}: rejected — no post-fix verification command (NO_VERIFICATION_EVIDENCE)`);
           continue;
         }
         const evidences = parsed.data.verification_commands.map((c) => ctx.shell.run(c, { cwd: attemptWs.attempt.workspace.root }));
         const policyBlocked = evidences.filter((e) => e.blocked);
         if (policyBlocked.length > 0) {
+          discardDecisionProposals(ctx, res);
           appendLog(`repair attempt ${attempt}: verification command blocked by policy (${policyBlocked.map((e) => e.command).join(', ')})`);
           continue;
         }
         const failures = evidences.filter((e) => e.exit_code !== 0);
         if (failures.length > 0) {
+          discardDecisionProposals(ctx, res);
           appendLog(`repair attempt ${attempt}: verification failed (${failures.map((f) => f.command).join(', ')})`);
           continue;
         }
         attemptWs.attempt.workspace.applyVerifiedPatch();
+        commitDecisionProposals(ctx, res);
         applied = true;
         repair = parsed.data;
         appendLog(`repair attempt ${attempt}: verified in isolated workspace (${parsed.data.verification_commands.length} commands exit 0)`);

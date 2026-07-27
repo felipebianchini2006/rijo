@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { tmpProject, cleanup, writePlanFile, EXTRACTION_PAYLOAD } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, EXTRACTION_PAYLOAD, newMappedReference } from './helpers.js';
 
 /**
  * Real child-process bridge test: spawns the built CLI (`node dist/cli/index.js
@@ -28,6 +28,7 @@ function localPlanPayload(phaseId: string) {
         requirement_ids: [reqId],
         technical_justification: 'infra da fase',
         files: ['src/a.ts'],
+        mapped_references: [newMappedReference('src/a.ts')],
         write_scope: ['src/a.ts'],
         depends_on: [],
         parallel: false,
@@ -42,6 +43,7 @@ function localPlanPayload(phaseId: string) {
         requirement_ids: [reqId],
         technical_justification: 'integração',
         files: ['src/b.ts'],
+        mapped_references: [newMappedReference('src/b.ts')],
         write_scope: ['src/b.ts'],
         depends_on: ['T01'],
         parallel: false,

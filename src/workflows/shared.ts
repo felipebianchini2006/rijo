@@ -12,8 +12,8 @@ import { acquireLock, RECOMMENDED_RENEW_MS } from '../core/locks.js';
 import { readState, writeState } from '../core/state.js';
 import { SchemaMismatchError, touchManifest } from '../core/manifest.js';
 import { ensureSchemaCompatible, MigrationError } from '../core/migrate.js';
-import { exists } from '../core/fsx.js';
-import type { RijoConfig, SupervisorConfig } from '../core/schemas/index.js';
+import { exists, readJsonIfExists } from '../core/fsx.js';
+import { TaskRecordSchema, type RijoConfig, type SupervisorConfig } from '../core/schemas/index.js';
 import type { AgentRunner } from '../agents/runner.js';
 import { UnboundAgentRunner } from '../agents/runner.js';
 import { AgentTaskSchema, type AgentTask, type AgentTaskDraft, type AgentResult } from '../agents/protocol.js';
@@ -25,9 +25,11 @@ import type { Clock } from '../supervisor/clock.js';
 import { defaultExecutor, type TaskExecutor, type SupervisedDispatch } from './executor.js';
 import { prepareDispatchedTask, type DispatchRouting } from './routing.js';
 import {
-  DecisionProposalSchema,
-  resolveDecision,
-  type DecisionProposal,
+  commitPendingDecision,
+  prepareDecision,
+  reconcileDecisionCommits,
+  type DecisionCommitHooks,
+  type PendingDecision,
 } from '../core/decisions.js';
 
 export type { DispatchRouting } from './routing.js';
@@ -47,8 +49,14 @@ export interface WorkflowContext {
   txnHooks: TxnHooks;
   /** Test seam: fault injection at each durable phase-finalization step. */
   finalizeHooks: FinalizeHooks;
-  /** Validated proposals are persisted only after workflow-specific read-only/workspace fences pass. */
-  pendingDecisions: DecisionProposal[];
+  /** Result-scoped proposals awaiting workflow-specific approval. */
+  openDecisionEnvelopes: Set<ValidatedAgentEnvelope>;
+  decisionHooks: DecisionCommitHooks;
+  planHooks: {
+    afterInvalidated?: () => void;
+    afterPlanWritten?: () => void;
+    afterReplanned?: () => void;
+  };
 }
 
 export interface WorkflowDeps {
@@ -67,6 +75,10 @@ export interface WorkflowDeps {
   txnHooks?: TxnHooks;
   /** test seam: fault injection at each durable phase-finalization step. */
   finalizeHooks?: FinalizeHooks;
+  /** test seam: fault injection across decision persistence phases. */
+  decisionHooks?: DecisionCommitHooks;
+  /** test seam: fault injection across durable plan invalidation/re-planning. */
+  planHooks?: WorkflowContext['planHooks'];
 }
 
 export function createContext(projectRoot: string, deps: WorkflowDeps = {}): WorkflowContext {
@@ -102,7 +114,9 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     now,
     txnHooks: deps.txnHooks ?? {},
     finalizeHooks: deps.finalizeHooks ?? {},
-    pendingDecisions: [],
+    openDecisionEnvelopes: new Set(),
+    decisionHooks: deps.decisionHooks ?? {},
+    planHooks: deps.planHooks ?? {},
   };
 }
 
@@ -191,6 +205,11 @@ export async function withLock<T>(
     for (const id of rec.rolledForward) {
       ctx.bus.emit('txn.rolled_forward', { message: `transação confirmada reaplicada: ${id}` }, { txn: id });
     }
+    for (const key of reconcileDecisionCommits(ctx.paths, ctx.config.decisions, ctx.now)) {
+      ctx.bus.emit('decision.reconciled', {
+        message: `decisão transacional recuperada: ${key.slice(0, 12)}`,
+      });
+    }
 
     const recovery = await reconcileSupervisedTasks(ctx.paths, {
       maxReplacements: ctx.config.supervisor.max_replacements_per_task,
@@ -240,7 +259,7 @@ export async function dispatch(
   task: AgentTaskDraft,
   routing: DispatchRouting = {},
   options: { prepareReplacement?: SupervisedDispatch['prepareReplacement'] } = {},
-): Promise<AgentResult> {
+): Promise<ValidatedAgentEnvelope> {
   const routed = prepareDispatchedTask(ctx.config, task, routing);
   const full: AgentTask = AgentTaskSchema.parse(routed);
   const result = await ctx.executor.run({
@@ -262,7 +281,7 @@ export async function dispatchBatch(
   max?: number,
   routing?: (task: AgentTaskDraft, index: number) => DispatchRouting,
   replacement?: (task: AgentTaskDraft, index: number) => SupervisedDispatch['prepareReplacement'],
-): Promise<AgentResult[]> {
+): Promise<ValidatedAgentEnvelope[]> {
   const reqs: SupervisedDispatch[] = tasks.map((t, i) => {
     const routed = prepareDispatchedTask(ctx.config, t, routing ? routing(t, i) : {});
     const full: AgentTask = AgentTaskSchema.parse(routed);
@@ -273,39 +292,103 @@ export async function dispatchBatch(
   return results.map((result) => validateAgentDecisions(ctx, result));
 }
 
-function validateAgentDecisions(ctx: WorkflowContext, result: AgentResult): AgentResult {
+export type ValidatedAgentEnvelope = AgentResult & {
+  result: AgentResult;
+  pending_decisions: PendingDecision[];
+  dispatch_id: string;
+  attempt_id: string;
+  generation: number;
+  lease_id: string;
+  decision_state: 'PENDING' | 'COMMITTED' | 'DISCARDED';
+};
+
+function validateAgentDecisions(ctx: WorkflowContext, result: AgentResult): ValidatedAgentEnvelope {
+  const attemptId = result.attempt_id ?? `unsupervised-${result.task_id}`;
+  const generation = result.generation ?? 1;
+  const leaseId = result.lease_id ?? `unsupervised-${result.task_id}`;
+  const pending: PendingDecision[] = [];
+  let validatedResult = result;
   for (const raw of result.decision_proposals ?? []) {
     try {
-      const proposal = DecisionProposalSchema.parse(raw);
-      const outcome = resolveDecision(
+      const prepared = prepareDecision(
         ctx.paths,
-        { ...ctx.config.decisions, record_material_decisions: false },
-        proposal,
+        ctx.config.decisions,
+        raw,
+        { task_id: result.task_id, attempt_id: attemptId, generation },
         ctx.now,
       );
-      if (outcome.status === 'BLOCKED') {
-        return {
+      if ('status' in prepared && prepared.status === 'BLOCKED') {
+        validatedResult = {
           ...result,
           ok: false,
-          summary: `BLOCKED (${outcome.category}): ${outcome.missing_fact}. ${outcome.question}`,
+          summary: `BLOCKED (${prepared.category}): ${prepared.missing_fact}. ${prepared.question}`,
         };
+        pending.length = 0;
+        break;
       }
-      ctx.pendingDecisions.push(proposal);
+      pending.push(prepared as PendingDecision);
     } catch (error) {
-      return {
+      validatedResult = {
         ...result,
         ok: false,
         summary: `Decision proposal rejected by core: ${error instanceof Error ? error.message : String(error)}`,
       };
+      pending.length = 0;
+      break;
     }
   }
-  return result;
+  const envelope: ValidatedAgentEnvelope = {
+    ...validatedResult,
+    result: validatedResult,
+    pending_decisions: pending,
+    dispatch_id: `${result.task_id}:${attemptId}:${generation}`,
+    attempt_id: attemptId,
+    generation,
+    lease_id: leaseId,
+    decision_state: 'PENDING',
+  };
+  ctx.openDecisionEnvelopes.add(envelope);
+  return envelope;
 }
 
-function flushPendingDecisions(ctx: WorkflowContext): void {
-  const pending = ctx.pendingDecisions.splice(0);
-  for (const proposal of pending) resolveDecision(ctx.paths, ctx.config.decisions, proposal, ctx.now);
-  if (pending.length > 0 && exists(ctx.paths.manifest)) touchManifest(ctx.paths, () => {}, ctx.now);
+export function commitDecisionProposals(ctx: WorkflowContext, envelope: ValidatedAgentEnvelope): void {
+  if (envelope.decision_state === 'COMMITTED') return;
+  if (envelope.decision_state === 'DISCARDED') {
+    throw new Error(`Dispatch ${envelope.dispatch_id}: discarded decisions cannot be committed`);
+  }
+  const taskFile = path.join(
+    ctx.paths.runtimeDir,
+    'tasks',
+    `${envelope.task_id.replace(/[^A-Za-z0-9._-]/g, '_')}.json`,
+  );
+  const current = TaskRecordSchema.safeParse(readJsonIfExists<unknown>(taskFile));
+  if (
+    current.success &&
+    (current.data.state !== 'SUCCEEDED' ||
+      current.data.attempt_id !== envelope.attempt_id ||
+      current.data.generation !== envelope.generation ||
+      current.data.lease_id !== envelope.lease_id ||
+      current.data.revoked_leases.includes(envelope.lease_id))
+  ) {
+    discardDecisionProposals(ctx, envelope);
+    throw new Error(`Dispatch ${envelope.dispatch_id}: stale or revoked result decisions were discarded`);
+  }
+  for (const pending of envelope.pending_decisions) {
+    commitPendingDecision(ctx.paths, ctx.config.decisions, pending, ctx.now, ctx.decisionHooks);
+  }
+  envelope.decision_state = 'COMMITTED';
+  ctx.openDecisionEnvelopes.delete(envelope);
+}
+
+export function discardDecisionProposals(ctx: WorkflowContext, envelope: ValidatedAgentEnvelope): void {
+  if (envelope.decision_state === 'COMMITTED') return;
+  envelope.pending_decisions.length = 0;
+  envelope.decision_state = 'DISCARDED';
+  ctx.openDecisionEnvelopes.delete(envelope);
+}
+
+function discardAllDecisionProposals(ctx: WorkflowContext): void {
+  for (const envelope of [...ctx.openDecisionEnvelopes]) discardDecisionProposals(ctx, envelope);
 }
 
 /** Attempt bundle: the dispatched task plus its isolated workspace. */
@@ -414,7 +497,7 @@ export async function dispatchReadOnly(
   ctx: WorkflowContext,
   task: AgentTaskDraft,
   routing: DispatchRouting = {},
-): Promise<{ result: AgentResult; violation: string[] }> {
+): Promise<{ result: ValidatedAgentEnvelope; violation: string[] }> {
   const before = snapshotTree(ctx.projectRoot);
   const result = await dispatch(
     ctx,
@@ -441,7 +524,7 @@ export function isWorkflowCancellation(result: AgentResult): boolean {
 }
 
 export function blocked(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
-  flushPendingDecisions(ctx);
+  discardAllDecisionProposals(ctx);
   ctx.bus.emit('workflow.blocked', { status: 'blocked', message }, { details });
   // Persist the blocked state durably ONLY when a run is actually in progress
   // (a phase is active) — so a later `rijo --status` and the next run see the
@@ -473,19 +556,19 @@ export function blocked(ctx: WorkflowContext, message: string, details: string[]
  * the RIJO metadata dirty too and could prevent a clean retry.
  */
 export function blockedReadOnly(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
-  flushPendingDecisions(ctx);
+  discardAllDecisionProposals(ctx);
   ctx.bus.emit('workflow.blocked', { status: 'blocked', message }, { details });
   return { ok: false, status: 'blocked', message, details };
 }
 
 export function failed(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
-  flushPendingDecisions(ctx);
+  discardAllDecisionProposals(ctx);
   ctx.bus.emit('workflow.failed', { status: 'failed', message }, { details });
   return { ok: false, status: 'failed', message, details };
 }
 
 export function completed(ctx: WorkflowContext, message: string, details: string[] = []): WorkflowOutcome {
-  flushPendingDecisions(ctx);
+  discardAllDecisionProposals(ctx);
   ctx.bus.emit('workflow.completed', { status: 'completed', message }, { details });
   return { ok: true, status: 'completed', message, details };
 }

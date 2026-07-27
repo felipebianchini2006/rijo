@@ -226,7 +226,17 @@ describe('LIVE full-workflow E2E (Claude)', () => {
 
         const phaseTwo = runRijo(fixture, ['run', '02', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
         expect(phaseTwo.status, `Claude phase 02 failed:\n${phaseTwo.combined}`).toBe(0);
-        assertPhaseConsumedMap(fixture, '02', externalCommit);
+        const phaseTwoMapState = JSON.parse(
+          fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
+        );
+        expect(
+          execFileSync(
+            'git',
+            ['merge-base', '--is-ancestor', externalCommit, phaseTwoMapState.mapped_commit],
+            { cwd: fixture.root },
+          ),
+        ).toBeDefined();
+        assertPhaseConsumedMap(fixture, '02', phaseTwoMapState.mapped_commit);
         execFileSync('npm', ['test'], { cwd: fixture.root, encoding: 'utf8' });
         expect(trackedDirty(fixture)).toEqual([]);
       } finally {

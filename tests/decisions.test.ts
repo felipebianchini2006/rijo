@@ -5,12 +5,20 @@ import {
   DecisionProposalSchema,
   DecisionRecordSchema,
   decisionPolicyBrief,
+  reconcileDecisionCommits,
   resolveDecision,
 } from '../src/core/decisions.js';
 import { defaultConfig } from '../src/core/config.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { FakeAgentRunner } from '../src/agents/runner.js';
-import { completed, createContext, dispatch } from '../src/workflows/shared.js';
+import {
+  commitDecisionProposals,
+  completed,
+  createContext,
+  discardDecisionProposals,
+  dispatch,
+  prepareAttempt,
+} from '../src/workflows/shared.js';
 import { cleanup, tmpProject } from './helpers.js';
 
 describe('autonomous decision policy', () => {
@@ -178,6 +186,7 @@ describe('autonomous decision policy', () => {
     expect(result.ok).toBe(true);
     expect(fs.existsSync(paths.decisions)).toBe(false);
 
+    commitDecisionProposals(ctx, result);
     completed(ctx, 'workflow terminal');
     expect(fs.readFileSync(paths.decisions, 'utf8')).toContain('DEC-dispatched-location');
   });
@@ -223,8 +232,134 @@ describe('autonomous decision policy', () => {
     expect(result.summary).toMatch(/decision proposal rejected|material decisions require evidence/i);
     expect(fs.existsSync(paths.decisions)).toBe(false);
   });
+
+  it('does not persist a valid decision when the caller rejects the payload', async () => {
+    fs.writeFileSync(`${root}/package.json`, '{"name":"fixture"}\n');
+    const runner = decisionRunner(root, 'payload-rejected', { invalid: true });
+    const ctx = createContext(root, { runner });
+    const envelope = await dispatch(ctx, {
+      id: 'payload-rejected',
+      role: 'planner',
+      objective: 'Return a payload for caller validation.',
+      return_format: 'JSON payload',
+    });
+    expect(envelope.ok).toBe(true);
+    expect(envelope.payload).toEqual({ invalid: true });
+    discardDecisionProposals(ctx, envelope);
+    expect(fs.existsSync(paths.decisions)).toBe(false);
+  });
+
+  it('does not persist a valid decision when workspace validation rejects the result', async () => {
+    fs.writeFileSync(`${root}/package.json`, '{"name":"fixture"}\n');
+    const runner = decisionRunner(root, 'workspace-rejected', { done: true }, (task) => {
+      fs.mkdirSync(`${task.workspace!.root}/src`, { recursive: true });
+      fs.writeFileSync(`${task.workspace!.root}/src/outside.ts`, 'outside\n');
+    });
+    const ctx = createContext(root, { runner });
+    const attempt = prepareAttempt(ctx, {
+      id: 'workspace-rejected',
+      role: 'worker',
+      objective: 'Write only the approved file.',
+      write_scope: ['src/approved.ts'],
+      return_format: 'JSON payload',
+    });
+    const envelope = await dispatch(ctx, attempt.task);
+    expect(() => attempt.workspace.validate()).toThrow(/outside/i);
+    discardDecisionProposals(ctx, envelope);
+    attempt.workspace.discard();
+    expect(fs.existsSync(paths.decisions)).toBe(false);
+  });
+
+  it('rejects decisions from a revoked generation', async () => {
+    fs.writeFileSync(`${root}/package.json`, '{"name":"fixture"}\n');
+    const ctx = createContext(root, { runner: decisionRunner(root, 'revoked-result', { done: true }) });
+    const envelope = await dispatch(ctx, {
+      id: 'revoked-result',
+      role: 'planner',
+      objective: 'Return a valid result.',
+      return_format: 'JSON payload',
+    });
+    const taskFile = `${paths.runtimeDir}/tasks/revoked-result.json`;
+    const taskRecord = JSON.parse(fs.readFileSync(taskFile, 'utf8'));
+    taskRecord.revoked_leases = [...taskRecord.revoked_leases, envelope.lease_id];
+    fs.writeFileSync(taskFile, `${JSON.stringify(taskRecord, null, 2)}\n`);
+    expect(() => commitDecisionProposals(ctx, envelope)).toThrow(/stale or revoked/i);
+    expect(fs.existsSync(paths.decisions)).toBe(false);
+  });
+
+  it('recovers a crash after decision append without duplicating DECISIONS.md', async () => {
+    fs.writeFileSync(`${root}/package.json`, '{"name":"fixture"}\n');
+    let injected = false;
+    const ctx = createContext(root, {
+      runner: decisionRunner(root, 'decision-crash', { done: true }),
+      decisionHooks: {
+        afterAppend: () => {
+          if (!injected) {
+            injected = true;
+            throw new Error('simulated crash after append');
+          }
+        },
+      },
+    });
+    const envelope = await dispatch(ctx, {
+      id: 'decision-crash',
+      role: 'planner',
+      objective: 'Return a valid result.',
+      return_format: 'JSON payload',
+    });
+    expect(() => commitDecisionProposals(ctx, envelope)).toThrow(/simulated crash/);
+    // Once DECISIONS.md was appended, recovery must finish the manifest
+    // transaction even if the evidence file changes before restart. The
+    // decision was already fully approved and must not be appended twice.
+    fs.writeFileSync(`${root}/package.json`, '{"name":"fixture","revision":2}\n');
+    expect(reconcileDecisionCommits(paths, ctx.config.decisions)).toHaveLength(1);
+    const decisions = fs.readFileSync(paths.decisions, 'utf8');
+    expect((decisions.match(/## DEC-decision-crash/g) ?? [])).toHaveLength(1);
+    const journals = fs.readdirSync(`${paths.runtimeDir}/decision-commits`);
+    expect(journals).toHaveLength(1);
+    const journal = JSON.parse(fs.readFileSync(`${paths.runtimeDir}/decision-commits/${journals[0]}`, 'utf8'));
+    expect(journal.status).toBe('MANIFESTED');
+  });
 });
 
 function expectHash(file: string): string {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function decisionRunner(
+  root: string,
+  taskId: string,
+  payload: unknown,
+  mutate?: (task: { workspace: { root: string } | null }) => void,
+): FakeAgentRunner {
+  return new FakeAgentRunner().on(
+    (task) => task.id === taskId,
+    (task) => {
+      mutate?.(task);
+      return {
+        task_id: task.id,
+        ok: true,
+        summary: 'valid result',
+        files_written: [],
+        payload,
+        scope_requests: [],
+        decision_proposals: [
+          {
+            id: `DEC-${taskId}`,
+            context: 'Choose the evidenced implementation location.',
+            selected_option: 'Keep the current module boundary.',
+            rationale: 'The existing boundary is evidenced.',
+            material: true,
+            impact: 'medium',
+            confidence: 0.9,
+            reversible: true,
+            consequences: ['No new architectural boundary.'],
+            review_condition: 'Review if the module lifecycle diverges.',
+            evidence: [{ path: 'package.json', file_hash: expectHash(`${root}/package.json`) }],
+            blocker: null,
+          },
+        ],
+      } as any;
+    },
+  );
 }

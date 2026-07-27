@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { parseFrontmatter, serializeFrontmatter } from './frontmatter.js';
 import { SCHEMA_VERSION } from './schemas/index.js';
-import { ensureDir, exists, readJsonIfExists, readText, writeFileAtomic, writeJsonAtomic } from './fsx.js';
+import { ensureDir, exists, readJsonIfExists, readText, sha256, sha256File, writeFileAtomic, writeJsonAtomic } from './fsx.js';
 import { computeHashes } from './manifest.js';
 import type { RijoPaths } from './paths.js';
 
@@ -26,11 +26,13 @@ export class MigrationError extends Error {
  * interrupted migration is re-runnable (the version stamp only advances after
  * every artifact has been rewritten).
  *
- * v1/v2 → v3:
+ * v1/v2/v3 → v4:
  *  - PLAN.md tasks gain `status` (derived from the legacy `done` flag);
- *  - config.yml receives the v3 stamp; the autonomous decision policy and
+ *  - legacy task files are explicitly migrated to intent-bearing references;
+ *  - legacy plans receive an invalid freshness stamp, forcing safe re-planning;
+ *  - config.yml receives the v4 stamp; the autonomous decision policy and
  *    codebase-map defaults materialize deterministically through ConfigSchema;
- *  - manifest.schema_version becomes 3.
+ *  - manifest.schema_version becomes 4.
  */
 export function migrateProject(paths: RijoPaths, now: () => Date = () => new Date()): MigrationReport {
   const manifest = readJsonIfExists<{ schema_version?: number }>(paths.manifest);
@@ -82,7 +84,36 @@ export function migrateProject(paths: RijoPaths, now: () => Date = () => new Dat
       if (typeof t['status'] !== 'string') {
         t['status'] = t['done'] === true ? 'DONE' : 'PENDING';
       }
+      if (!Array.isArray(t['mapped_references'])) {
+        const files = Array.isArray(t['files']) ? t['files'].filter((entry): entry is string => typeof entry === 'string') : [];
+        t['mapped_references'] = files.map((file) => {
+          const normalized = file.replace(/\\/g, '/').replace(/^\.\/+/, '');
+          const absolute = path.resolve(paths.projectRoot, normalized);
+          const rel = path.relative(paths.projectRoot, absolute);
+          if (!path.isAbsolute(rel) && !rel.startsWith('..') && exists(absolute) && fs.statSync(absolute).isFile()) {
+            return { path: normalized, intent: 'existing', file_hash: sha256File(absolute) };
+          }
+          return {
+            path: normalized,
+            intent: 'new',
+            parent_module: 'legacy-unmapped',
+            placement_evidence: [{ path: '.', reason: 'explicit legacy migration; freshness gate requires re-planning' }],
+          };
+        });
+      }
     }
+    const invalidationSeed = sha256(`legacy-plan-migration\0${path.relative(paths.root, planPath)}`);
+    data['mapped_commit'] = typeof data['mapped_commit'] === 'string' ? data['mapped_commit'] : 'legacy-unmapped';
+    data['mapped_tree_hash'] = typeof data['mapped_tree_hash'] === 'string' ? data['mapped_tree_hash'] : invalidationSeed;
+    data['planned_at'] = typeof data['planned_at'] === 'string' ? data['planned_at'] : now().toISOString();
+    data['context_packet_hash'] =
+      typeof data['context_packet_hash'] === 'string' ? data['context_packet_hash'] : invalidationSeed;
+    data['mapped_reference_hashes'] =
+      data['mapped_reference_hashes'] && typeof data['mapped_reference_hashes'] === 'object'
+        ? data['mapped_reference_hashes']
+        : {};
+    data['decision_context_hash'] =
+      typeof data['decision_context_hash'] === 'string' ? data['decision_context_hash'] : invalidationSeed;
     writeFileAtomic(planPath, serializeFrontmatter(data, body));
     changed.push(planPath);
   }

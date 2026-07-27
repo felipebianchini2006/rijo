@@ -44,6 +44,8 @@ import {
   failed,
   dispatch,
   dispatchBatch,
+  commitDecisionProposals,
+  discardDecisionProposals,
   isWorkflowCancellation,
   type WorkflowDeps,
   type WorkflowOutcome,
@@ -232,7 +234,9 @@ export async function newWorkflow(
     // slightly off-shape payload. Neither is a fatal planner failure — re-dispatch
     // with a sharpened reminder, bounded by plan_revisions, before giving up.
     let extraction: PlanExtraction | null = null;
+    let extractionEnvelope: import('./shared.js').ValidatedAgentEnvelope | null = null;
     let lastExtractSummary = '';
+    let lastExtractErrors: string[] = [];
     const extractAttempts = ctx.config.limits.plan_revisions + 1;
     for (let attempt = 0; attempt < extractAttempts; attempt++) {
       const task: AgentTaskDraft =
@@ -243,17 +247,28 @@ export async function newWorkflow(
               id: `new-extract-r${attempt}`,
               notes:
                 `${extractTask.notes}\n\nIMPORTANT: put the extraction JSON in the AgentResult "payload" field (not prose), ` +
-                'matching the PlanExtraction schema exactly: classification is one of NEW|CHANGE|REMOVE|CARRYOVER|UNCHANGED_DEPENDENCY and every boolean is a real JSON boolean.',
+                'matching the PlanExtraction schema exactly: classification is one of NEW|CHANGE|REMOVE|CARRYOVER|UNCHANGED_DEPENDENCY and every boolean is a real JSON boolean.\n' +
+                `CORRECT THESE EXACT ERRORS FROM THE PREVIOUS RESULT:\n${lastExtractErrors.map((error) => `- ${error}`).join('\n')}`,
             };
       const extractResult = await dispatch(ctx, task, { stage: 'PLAN' });
       lastExtractSummary = extractResult.summary;
+      lastExtractErrors = [];
       if (extractResult.ok && extractResult.payload) {
         const parsed = PlanExtractionSchema.safeParse(extractResult.payload);
         if (parsed.success) {
           extraction = parsed.data;
+          extractionEnvelope = extractResult;
           break;
         }
+        lastExtractErrors = parsed.error.issues.map(
+          (issue) => `${issue.path.length > 0 ? issue.path.join('.') : '<payload>'}: ${issue.message}`,
+        );
+      } else if (!extractResult.ok) {
+        lastExtractErrors = [`AgentResult rejected: ${extractResult.summary}`];
+      } else {
+        lastExtractErrors = ['payload: required PlanExtraction object was null or absent'];
       }
+      discardDecisionProposals(ctx, extractResult);
       // The workflow is being torn down (deadline/host disconnect): stop retrying
       // so the unwind is not blocked by a fresh dispatch to a dead host.
       if (isWorkflowCancellation(extractResult)) break;
@@ -265,6 +280,7 @@ export async function newWorkflow(
       // previous phase exists, corrupting the "untouched on failure" guarantee).
       return failed(ctx, 'Plan extraction failed.', [
         lastExtractSummary,
+        ...lastExtractErrors,
         `Brief was:\n${renderBrief(AgentTaskSchema.parse(extractTask)).slice(0, 400)}…`,
       ]);
     }
@@ -400,6 +416,7 @@ export async function newWorkflow(
           ]);
         };
         if (!r.ok) {
+          discardDecisionProposals(ctx, r);
           const out = failClosed('researcher failed to produce a result');
           if (out) return out;
           continue;
@@ -423,6 +440,7 @@ export async function newWorkflow(
           })
           .safeParse(r.payload);
         if (!payload.success) {
+          discardDecisionProposals(ctx, r);
           const out = failClosed('researcher returned an unparseable result');
           if (out) return out;
           continue;
@@ -447,6 +465,7 @@ export async function newWorkflow(
             if (out) return out;
           }
         }
+        commitDecisionProposals(ctx, r);
         researchSummaries.push(`- ${topic.topic}: ${payload.data.summary}`);
       }
       // long-project hygiene: keep sources.json bounded, archive the oldest
@@ -607,6 +626,7 @@ export async function newWorkflow(
         ]);
       }
     }
+    if (extractionEnvelope) commitDecisionProposals(ctx, extractionEnvelope);
 
     bus.emit(
       'new.done',
