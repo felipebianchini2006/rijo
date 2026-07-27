@@ -59,6 +59,13 @@ export async function finishWorkflow(
           return blockedReadOnly(ctx, 'The partial milestone seal commit still cannot complete.');
         }
       }
+      if (
+        existingStatus.isRepo &&
+        ctx.config.git.tag_milestones &&
+        !ctx.git.tag(projectRoot, `rijo/${milestone.id}`, `RIJO milestone ${milestone.id} sealed`)
+      ) {
+        return blockedReadOnly(ctx, 'The milestone is sealed, but its Git tag is missing.');
+      }
       return completed(ctx, `Milestone ${milestone.id} is already sealed.`);
     }
 
@@ -198,6 +205,13 @@ export async function finishWorkflow(
           return blockedReadOnly(ctx, 'The milestone was sealed, but the closeout commit failed.');
         }
       }
+    }
+    if (
+      gitStatus.isRepo &&
+      ctx.config.git.tag_milestones &&
+      !ctx.git.tag(projectRoot, `rijo/${milestone.id}`, `RIJO milestone ${milestone.id} sealed`)
+    ) {
+      return blockedReadOnly(ctx, 'The milestone was sealed, but the Git tag could not be created.');
     }
 
     ctx.bus.emit('finish.ready', {

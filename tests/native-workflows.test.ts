@@ -165,5 +165,11 @@ describe('native workflow lifecycle', () => {
       `| ${milestone.id} | ${milestone.slug} | COMPLETE |`,
     );
     expect(runtime.git.dirty).toEqual([]);
+    expect(runtime.git.tags).toEqual(['rijo/M001']);
+
+    const repeated = await finishWorkflow(root, runtime);
+    expect(repeated.ok, repeated.message).toBe(true);
+    expect(repeated.message).toContain('already sealed');
+    expect(runtime.git.tags).toEqual(['rijo/M001']);
   });
 });

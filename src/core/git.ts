@@ -82,6 +82,7 @@ export class SystemGit implements GitOps {
   }
 
   tag(cwd: string, name: string, message: string): boolean {
+    if (git(cwd, ['rev-parse', '--verify', `refs/tags/${name}`]).code === 0) return true;
     return git(cwd, [...this.identityArgs(cwd), 'tag', '-a', name, '-m', message]).code === 0;
   }
 
@@ -130,6 +131,7 @@ export class FakeGit implements GitOps {
     return hash;
   }
   tag(_cwd: string, name: string): boolean {
+    if (this.tags.includes(name)) return true;
     this.tags.push(name);
     return true;
   }
