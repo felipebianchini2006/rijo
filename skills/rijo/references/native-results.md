@@ -23,6 +23,8 @@ Run the selected internal helper with the empty bundle.
 Read each new request from `.rijo/runtime/native-requests.jsonl`.
 Delegate that exact request to a native subagent.
 Add the validated result to `results`.
+Preserve every existing validated result entry.
+Do not replace, remove, or reorder a prior result entry.
 Run the same helper again.
 Repeat until the helper completes or reports a true blocker.
 
@@ -32,3 +34,5 @@ Keep reviewer and researcher `files` empty.
 RIJO validates each result against the current lease, generation, baseline, workspace, and write scope.
 RIJO rejects a missing, stale, reused, or out-of-scope result.
 Keep all native transport files in `.rijo/runtime/`.
+Use Node.js or the host file tools for native transport.
+Do not require Python, Go, or Rust.
