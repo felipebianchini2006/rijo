@@ -45,6 +45,7 @@ Put each bounded native result in the phase result bundle.
 Run real build, lint, type check, unit, integration, and contract commands.
 Treat command output and artifacts as evidence.
 Run each approved command through `rijo internal safe-command -- COMMAND`.
+Use `rijo internal safe-command --loopback -- COMMAND` when a local application server must bind to loopback.
 
 ## ENGINEERING_REVIEW
 

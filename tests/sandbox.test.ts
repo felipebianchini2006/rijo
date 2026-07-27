@@ -98,6 +98,13 @@ describe('execution policy (planCommand)', () => {
       sandboxAvailableOverride: true,
     });
     expect(repo.ok && repo.command.network).toBe('none');
+    const server = planCommand('node server.mjs', {
+      cwd: root,
+      config,
+      allowLoopback: true,
+      sandboxAvailableOverride: true,
+    });
+    expect(server.ok && server.command.network).toBe('restricted');
     const audit = planCommand('npm audit', { cwd: root, config });
     expect(audit.ok && audit.command.network).toBe('enabled');
   });

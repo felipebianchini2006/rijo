@@ -340,10 +340,8 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
       (t) => t.role === 'reviewer',
       (t) => {
         const approved = opts.reviewApproved ?? true;
-        // A disapproving reviewer must carry a BLOCKING-severity finding: the
-        // workflow only holds a plan for blocker/critical findings (mere high/
-        // medium/low nitpicks never block), so an empty-finding or low-severity
-        // rejection would be accepted.
+        // A disapproving reviewer must carry a high-impact finding. Medium and
+        // low observations remain non-blocking.
         const findings = approved
           ? []
           : [{ type: 'quality_issue', severity: 'critical', description: 'blocking review finding', file: null }];

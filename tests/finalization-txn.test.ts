@@ -78,6 +78,8 @@ function expectPhase01Complete(root: string): void {
   const state = readState(paths)!;
   expect(state.stage).toBe('DONE');
   expect(state.last_commit).toBe(c1);
+  expect(state.blocked).toBe(false);
+  expect(state.blocked_reason).toBeNull();
 
   // the tree is clean for everything RIJO touched
   const dirty = git(root, ['status', '--porcelain', '-uall']).split('\n').filter(Boolean);

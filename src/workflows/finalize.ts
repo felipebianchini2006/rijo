@@ -50,6 +50,7 @@ interface StageInput {
   pp: PhasePaths;
   plan: PhasePlan;
   evidences: CommandEvidence[];
+  tddRedEvidences: Array<{ task_id: string; commands: CommandEvidence[] }>;
   uiSmokeNote: string;
   /** Working-tree snapshot taken before any worker patch was applied. */
   phaseBaseline: FileSnapshot;
@@ -64,6 +65,7 @@ function writeVerificationCandidate(
   pp: PhasePaths,
   phase: RoadmapPhase,
   evidences: CommandEvidence[],
+  tddRedEvidences: Array<{ task_id: string; commands: CommandEvidence[] }>,
   uiSmokeNote: string,
   vcsEnabled: boolean,
   now: () => Date,
@@ -75,6 +77,14 @@ function writeVerificationCandidate(
         phase: phase.id,
         verified_at: now().toISOString(),
         commands: evidences.map((e) => ({ command: e.command, exit_code: e.exit_code, duration_ms: e.duration_ms })),
+        tdd_red: tddRedEvidences.map((entry) => ({
+          task_id: entry.task_id,
+          commands: entry.commands.map((e) => ({
+            command: e.command,
+            exit_code: e.exit_code,
+            duration_ms: e.duration_ms,
+          })),
+        })),
         ui_smoke: uiSmokeNote,
         tested_commit: null,
         evidence_commit: null,
@@ -84,6 +94,15 @@ function writeVerificationCandidate(
         `# Verification — phase ${phase.id}`,
         '',
         ...evidences.map((e) => `- \`${e.command}\` → exit ${e.exit_code}`),
+        '',
+        '## TDD RED evidence',
+        '',
+        ...(tddRedEvidences.length > 0
+          ? tddRedEvidences.flatMap((entry) => [
+              `- ${entry.task_id}`,
+              ...entry.commands.map((e) => `  - \`${e.command}\` → expected RED exit ${e.exit_code}`),
+            ])
+          : ['- Not required for this phase.']),
         '',
         `UI smoke: ${uiSmokeNote}`,
         '',
@@ -160,7 +179,17 @@ function applyRequirementCompletion(
  */
 export async function stageFinalization(ctx: WorkflowContext, input: StageInput): Promise<WorkflowOutcome> {
   const { paths, config, now, projectRoot } = ctx;
-  const { milestone, phase, pp, plan, evidences, uiSmokeNote, phaseBaseline, dirtyAtStart } = input;
+  const {
+    milestone,
+    phase,
+    pp,
+    plan,
+    evidences,
+    tddRedEvidences,
+    uiSmokeNote,
+    phaseBaseline,
+    dirtyAtStart,
+  } = input;
 
   // Task-level DONE is part of the phase "code+state" committed in C1; it never
   // flips the ROADMAP/requirement status that resume keys off, so it is safe to
@@ -173,7 +202,7 @@ export async function stageFinalization(ctx: WorkflowContext, input: StageInput)
   }
 
   const vcsEnabled = config.git.commit && ctx.git.status(projectRoot).isRepo;
-  writeVerificationCandidate(pp, phase, evidences, uiSmokeNote, vcsEnabled, now);
+  writeVerificationCandidate(pp, phase, evidences, tddRedEvidences, uiSmokeNote, vcsEnabled, now);
   writeSummary(pp, phase, readPlan(pp.plan), now);
 
   // Decide the authorized source delta and the pre-existing-user-edit conflict
@@ -320,6 +349,8 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
     last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
     last_commit: marker.tested_commit,
     next_step: 'rijo run (next phase) or rijo check',
+    blocked: false,
+    blocked_reason: null,
   });
   hooks.afterStep?.('state');
 

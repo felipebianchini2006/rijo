@@ -36,6 +36,8 @@ export interface ShellRunOptions {
   timeoutMs?: number;
   /** dependency installation requires this explicit flag (gate-managed). */
   allowInstall?: boolean;
+  /** Permit loopback traffic for a local application server or browser journey. */
+  allowLoopback?: boolean;
 }
 
 export interface ShellRunner {
@@ -200,6 +202,7 @@ export class SystemShellRunner implements ShellRunner {
       cwd: opts.cwd ?? process.cwd(),
       config: this.execConfig,
       allowInstall: opts.allowInstall,
+      allowLoopback: opts.allowLoopback,
     });
     if (!plan.ok) {
       const decision = evaluateCommand(command);

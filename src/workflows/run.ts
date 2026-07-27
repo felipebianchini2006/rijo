@@ -83,6 +83,28 @@ const ReviewPayloadSchema = z.object({
 });
 type ReviewPayload = z.infer<typeof ReviewPayloadSchema>;
 
+interface TddRedEvidence {
+  task_id: string;
+  commands: CommandEvidence[];
+}
+
+const TEST_PATH_PATTERN =
+  /(^|\/)(__tests__|tests?|spec)(\/|\.|$)|\.(test|spec)\.[^.]+$/i;
+
+function isTestPath(relativePath: string): boolean {
+  return TEST_PATH_PATTERN.test(relativePath);
+}
+
+function isTestHarnessPath(relativePath: string): boolean {
+  const base = path.posix.basename(relativePath);
+  return (
+    isTestPath(relativePath) ||
+    base === 'package.json' ||
+    base === 'package-lock.json' ||
+    /^(vitest|jest|playwright|cypress|tsconfig)(\.|$)/i.test(base)
+  );
+}
+
 export function normalizeResearchCheckedAt(value: string): string {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00.000Z` : value;
 }
@@ -888,6 +910,25 @@ async function executePhase(
     stage('PLAN_LINT', 'Validate the plan deterministically.');
     const phaseRequirements = reqDoc.requirements.filter((r) => r.phase === phase.id).map((r) => r.id);
     const lintIssues = lintPlan(plan, { knownRequirements: knownReqs, phaseRequirements });
+    if (!exists(path.join(ctx.projectRoot, 'package.json'))) {
+      const packageOwner = plan.tasks.find((task) => task.write_scope.includes('package.json'));
+      if (packageOwner) {
+        for (const task of plan.tasks) {
+          const needsPackageBeforeRed =
+            task.id !== packageOwner.id &&
+            task.tdd &&
+            task.write_scope.some(isTestPath) &&
+            task.tests.some((command) => /^npm(?:\s|$)/.test(command));
+          if (needsPackageBeforeRed && !task.depends_on.includes(packageOwner.id)) {
+            lintIssues.push({
+              code: 'TDD_RED_MISSING_SETUP',
+              message: `${task.id}: the RED command needs package.json from ${packageOwner.id}.`,
+              fix: `Add ${packageOwner.id} to ${task.id}.depends_on so the framework can run a meaningful RED test.`,
+            });
+          }
+        }
+      }
+    }
     const mapReferenceIssues = (readMapState(paths) ? validatePlanMapReferences(ctx.projectRoot, plan) : [])
       .filter((issue) => {
         if (!appliedPlanAtEntry) return true;
@@ -954,18 +995,15 @@ async function executePhase(
       continue;
     }
     const review = ReviewPayloadSchema.safeParse(reviewRes.payload);
-    // Accept the plan when the reviewer approves OR (verdict parsed) raised no
-    // structurally-BLOCKING finding. Only blocker/critical findings hold a plan:
-    // a mere `high` nitpick (a missing dependency note, an under-specified
-    // acceptance line) is routinely over-rated by the reviewer and is caught
-    // anyway downstream by the deterministic lint, the verification commands and
-    // the independent code review — it must not deadlock the phase. A COMPLETED
-    // but unparseable verdict is treated as "revise" (never silent approval).
-    // Everything is bounded by the plan_revisions budget.
+    // A high-impact finding requires a correction even when the reviewer also
+    // sets approved=true. This keeps the structured findings authoritative and
+    // prevents a contradictory verdict from bypassing the bounded review loop.
+    // Medium and low observations remain non-blocking. A completed but
+    // unparseable verdict is treated as "revise" (never silent approval).
     const blockingFindings = review.success
-      ? review.data.findings.filter((f) => f.severity === 'blocker' || f.severity === 'critical')
+      ? review.data.findings.filter((f) => ['blocker', 'critical', 'high'].includes(f.severity))
       : [];
-    if (review.success && (review.data.approved || blockingFindings.length === 0)) break;
+    if (review.success && blockingFindings.length === 0) break;
     if (revisions >= config.limits.plan_revisions) {
       return blocked(
         ctx,
@@ -1057,6 +1095,13 @@ async function executePhase(
   }
 
   // ---- EXECUTE (fresh isolated workspace per task; parallel only for disjoint scopes)
+  const tddRedPath = path.join(
+    paths.runtimeDir,
+    'tdd-red',
+    `${milestone.id}-${phase.id}.json`,
+  );
+  const tddRedEvidences =
+    readJsonIfExists<TddRedEvidence[]>(tddRedPath) ?? [];
   const groups = parallelGroups(plan.tasks, config.limits.max_parallel_agents);
   const totalTasks = plan.tasks.length;
   for (const group of groups) {
@@ -1084,7 +1129,7 @@ async function executePhase(
       );
       const tddInstruction =
         t.tdd && taskOwnsTestPath
-          ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. '
+          ? 'Write the test before the implementation. The framework replays the test-only change against the pre-task checkout and requires a RED failure before it applies the implementation. Then implement the GREEN change and refactor. '
           : t.tdd
             ? 'Tests for this change are allocated to a separate task; do not edit them or any path outside this task write scope. '
             : '';
@@ -1153,6 +1198,32 @@ async function executePhase(
       return blocked(ctx, `Phase ${phase.id}: canonical context changed while attempts ran (CANONICAL_DRIFT).`, [
         `Stale attempts: ${stale.map((a) => a.attempt.task.id).join(', ')}. Re-run to retry against the current baseline.`,
       ]);
+    }
+
+    // A TDD task that owns both tests and implementation must prove RED
+    // against the pre-task checkout before its implementation patch reaches
+    // the controlled tree. RIJO overlays only test harness files into a fresh
+    // isolated workspace. The real command must fail for a test reason.
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i]!;
+      const task = pending[i]!;
+      if (
+        !task.tdd ||
+        !task.write_scope.some(isTestPath) ||
+        tddRedEvidences.some((entry) => entry.task_id === task.id)
+      ) {
+        continue;
+      }
+      const red = runTddRedProof(ctx, phase.id, task, attempt);
+      if (!red.ok) {
+        discardAll();
+        transition(task.id, 'FAILED', 'TDD RED proof failed');
+        return blocked(ctx, `Phase ${phase.id}: task ${task.id} has no valid TDD RED evidence.`, [
+          red.reason,
+        ]);
+      }
+      tddRedEvidences.push({ task_id: task.id, commands: red.commands });
+      writeJsonAtomic(tddRedPath, tddRedEvidences);
     }
 
     // Authoritative scope enforcement per INDIVIDUAL task: the real filesystem
@@ -1365,7 +1436,7 @@ async function executePhase(
     const actionable = cr.data.findings.filter(
       (f) => !['defer', 'reject'].includes(f.type) && blockingSeverities.has(f.severity),
     );
-    if (cr.data.approved || actionable.length === 0) {
+    if (actionable.length === 0) {
       commitDecisionProposals(ctx, crRes);
       break;
     }
@@ -1448,6 +1519,7 @@ async function executePhase(
     pp,
     plan,
     evidences,
+    tddRedEvidences,
     uiSmokeNote,
     phaseBaseline,
     dirtyAtStart,
@@ -1526,6 +1598,129 @@ function detectProjectCommands(ctx: WorkflowContext): string[] {
     }
   }
   return commands;
+}
+
+function runTddRedProof(
+  ctx: WorkflowContext,
+  phaseId: string,
+  task: PhasePlan['tasks'][number],
+  implementationAttempt: ReplaceableAttempt,
+): { ok: true; commands: CommandEvidence[] } | { ok: false; reason: string } {
+  if (task.tests.length === 0) {
+    return { ok: false, reason: 'The TDD task has no executable test command.' };
+  }
+  const delta = implementationAttempt.attempt.workspace.collectDelta();
+  const harnessFiles = delta.changed.filter(
+    (relativePath) =>
+      isTestHarnessPath(relativePath) &&
+      task.write_scope.some((scope) => pathInScope(relativePath, [scope])),
+  );
+  if (!harnessFiles.some(isTestPath)) {
+    return {
+      ok: false,
+      reason: 'The task did not add or change a test file inside its write scope.',
+    };
+  }
+
+  const redWorkspace = AttemptWorkspace.create(ctx.projectRoot, {
+    taskId: `tdd-red-${phaseId}-${task.id}`,
+    writeScope: harnessFiles,
+    baselineCommit: ctx.git.headCommit(ctx.projectRoot),
+    baselineCanonicalHash: canonicalBaselineHash(ctx.paths),
+  });
+  try {
+    for (const relativePath of harnessFiles) {
+      const source = path.join(implementationAttempt.attempt.workspace.root, relativePath);
+      const target = path.join(redWorkspace.root, relativePath);
+      if (!exists(source)) {
+        fs.rmSync(target, { force: true });
+        continue;
+      }
+      ensureDir(path.dirname(target));
+      fs.copyFileSync(source, target);
+    }
+    redWorkspace.validate();
+
+    const packageFile = path.join(redWorkspace.root, 'package.json');
+    if (harnessFiles.includes('package.json') && exists(packageFile)) {
+      try {
+        const pkg = JSON.parse(readText(packageFile)) as {
+          dependencies?: Record<string, unknown>;
+          devDependencies?: Record<string, unknown>;
+          optionalDependencies?: Record<string, unknown>;
+        };
+        const dependencyCount =
+          Object.keys(pkg.dependencies ?? {}).length +
+          Object.keys(pkg.devDependencies ?? {}).length +
+          Object.keys(pkg.optionalDependencies ?? {}).length;
+        if (dependencyCount > 0) {
+          const install = ctx.shell.run('npm install --no-audit --no-fund', {
+            cwd: redWorkspace.root,
+            allowInstall: true,
+            timeoutMs: 10 * 60 * 1000,
+          });
+          if (install.exit_code !== 0) {
+            return {
+              ok: false,
+              reason: `The RED workspace dependency setup failed: ${install.summary.slice(0, 400)}`,
+            };
+          }
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `The RED workspace package.json is invalid: ${String(error)}`,
+        };
+      }
+    }
+
+    const commands = task.tests.map((command) =>
+      ctx.shell.run(command, { cwd: redWorkspace.root }),
+    );
+    const blockedCommand = commands.find((command) => command.blocked);
+    if (blockedCommand) {
+      return {
+        ok: false,
+        reason: `The RED command was blocked: ${blockedCommand.command} → ${blockedCommand.summary}`,
+      };
+    }
+    const infrastructureFailure = commands.find(
+      (command) =>
+        command.exit_code !== 0 &&
+        /(ENOENT|command not found|missing script|could not determine executable|cannot find package|module not found)/i.test(
+          command.summary,
+        ),
+    );
+    if (infrastructureFailure) {
+      return {
+        ok: false,
+        reason: `The RED command failed because the test environment was incomplete: ${infrastructureFailure.summary.slice(0, 400)}`,
+      };
+    }
+    if (!commands.some((command) => command.exit_code !== 0)) {
+      return {
+        ok: false,
+        reason: 'All RED commands passed against the pre-task checkout. The new tests do not prove the behavior change.',
+      };
+    }
+    ctx.bus.emit(
+      'run.tdd_red',
+      {
+        stage: 'EXECUTE',
+        message: `Task ${task.id} produced a failing RED test before implementation.`,
+      },
+      {
+        task: task.id,
+        commands: commands.map((command) => ({
+          command: command.command,
+          exit: command.exit_code,
+        })),
+      },
+    );
+    return { ok: true, commands };
+  } finally {
+    redWorkspace.discard();
+  }
 }
 
 /**

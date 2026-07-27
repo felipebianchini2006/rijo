@@ -142,6 +142,7 @@ describe('native RIJO product surface', () => {
       if (agent === 'rijo-browser-qa' || agent === 'rijo-mobile-qa') {
         expect(source).toContain('ToolSearch');
         expect(source).toContain('Load the available');
+        expect(source).not.toMatch(/^tools:/m);
       }
       expect(source).not.toContain('command: "rijo internal lifecycle');
       expect(source).toContain('native-hooks.jsonl');

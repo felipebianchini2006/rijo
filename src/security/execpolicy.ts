@@ -52,6 +52,8 @@ export interface PlanCommandOptions {
   config: ExecutionConfig;
   /** dependency installation requires this explicit policy flag */
   allowInstall?: boolean;
+  /** Permit loopback traffic for a local application server or browser journey. */
+  allowLoopback?: boolean;
   /** test seam: force the sandbox-availability answer */
   sandboxAvailableOverride?: boolean;
 }
@@ -233,6 +235,8 @@ export function planCommand(raw: string, opts: PlanCommandOptions): CommandPlan 
     ? 'enabled'
     : trust === 'known-script'
       ? classified.network
+      : opts.allowLoopback
+        ? 'restricted'
       : category === 'test' && opts.config.network_default === 'none'
         ? 'restricted'
         : opts.config.network_default;

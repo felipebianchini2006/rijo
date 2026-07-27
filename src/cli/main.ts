@@ -194,11 +194,18 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         return 0;
       }
       if (helper === 'safe-command') {
-        const commandArgs = helperArgs[0] === '--' ? helperArgs.slice(1) : helperArgs;
-        if (commandArgs.length === 0) return usage('rijo internal safe-command -- COMMAND');
+        const allowLoopback = helperArgs[0] === '--loopback';
+        const remainingArgs = allowLoopback ? helperArgs.slice(1) : helperArgs;
+        const commandArgs = remainingArgs[0] === '--' ? remainingArgs.slice(1) : remainingArgs;
+        if (commandArgs.length === 0) {
+          return usage('rijo internal safe-command [--loopback] -- COMMAND');
+        }
         const commandLine = commandArgs.join(' ');
         const paths = new RijoPaths(cwd);
-        const evidence = new SystemShellRunner(loadConfig(paths).execution).run(commandLine, { cwd });
+        const evidence = new SystemShellRunner(loadConfig(paths).execution).run(commandLine, {
+          cwd,
+          allowLoopback,
+        });
         appendLine(
           paths.events,
           JSON.stringify({

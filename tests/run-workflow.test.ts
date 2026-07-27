@@ -202,6 +202,64 @@ describe('rijo run', () => {
     expect(planners.length).toBe(3);
   });
 
+  it('revises a plan when an approved verdict still contains a high finding', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (t) => t.id.startsWith('plan-review-'),
+      (t) =>
+        ok(t, {
+          payload: {
+            approved: true,
+            findings: [
+              {
+                type: 'test_gap',
+                severity: 'high',
+                description: 'The test command depends on missing setup.',
+                file: null,
+              },
+            ],
+          },
+        }),
+    );
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('not approved after 2 revisions');
+    expect(d.runner.executed.filter((t) => t.id.startsWith('plan-01-r')).length).toBe(3);
+  });
+
+  it('repairs a high code finding even when the reviewer sets approved', async () => {
+    const d = deps(root);
+    let reviews = 0;
+    d.runner.on(
+      (t) => t.id.startsWith('code-review-'),
+      (t) => {
+        reviews++;
+        return ok(t, {
+          payload:
+            reviews === 1
+              ? {
+                  approved: true,
+                  findings: [
+                    {
+                      type: 'implementation_bug',
+                      severity: 'high',
+                      description: 'The implementation misses a required error path.',
+                      file: 'src/a.ts',
+                    },
+                  ],
+                }
+              : { approved: true, findings: [] },
+        });
+      },
+    );
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+    expect(outcome.ok, outcome.message).toBe(true);
+    expect(d.runner.executed.some((t) => t.id.startsWith('review-fix-01-'))).toBe(true);
+    expect(reviews).toBe(2);
+  });
+
   it('rejects a diff that violates the spec (code review findings) and returns to spec on spec_gap', async () => {
     const d = deps(root);
     // override reviewer: approve plan reviews, flag spec_gap on code review
@@ -336,6 +394,81 @@ describe('rijo run', () => {
     expect(tddWorker.write_scope).toEqual(['src/a.ts']);
     expect(tddWorker.objective).toContain('Tests for this change are allocated to a separate task');
     expect(tddWorker.objective).not.toContain('write a failing test');
+  });
+
+  it('records a real RED command before a TDD implementation patch is applied', async () => {
+    const calls: Array<{ cwd: string; exit: number }> = [];
+    const redAwareShell = {
+      run(command: string, options: { cwd?: string } = {}) {
+        const cwd = options.cwd ?? root;
+        const implemented = fs.existsSync(path.join(cwd, 'src', 'feature.mjs'));
+        const exit = implemented ? 0 : 1;
+        calls.push({ cwd, exit });
+        return {
+          command,
+          exit_code: exit,
+          summary: exit === 0 ? 'pass' : 'AssertionError: expected implemented behavior',
+          duration_ms: 1,
+          blocked: false,
+          category: 'test' as const,
+          sandbox: 'test-double',
+          trust: 'repository-script',
+          network: 'none',
+        };
+      },
+    };
+    const d = deps(root, {
+      planPayload: (phaseId) => ({
+        phase: phaseId,
+        tasks: [
+          {
+            id: 'T01',
+            name: 'Add tested behavior',
+            requirement_ids: phaseReqIds(root, phaseId),
+            technical_justification: null,
+            files: ['src/feature.mjs', 'test/feature.test.mjs'],
+            mapped_references: [
+              newMappedReference('src/feature.mjs'),
+              newMappedReference('test/feature.test.mjs'),
+            ],
+            write_scope: ['src/feature.mjs', 'test/feature.test.mjs'],
+            depends_on: [],
+            parallel: false,
+            tdd: true,
+            tests: ['node --test test/feature.test.mjs'],
+            evidence_expected: 'The behavior test passes.',
+            done: false,
+          },
+          {
+            id: 'T02',
+            name: 'Add integration marker',
+            requirement_ids: [],
+            technical_justification: 'The marker records integration.',
+            files: ['src/integration.mjs'],
+            mapped_references: [newMappedReference('src/integration.mjs')],
+            write_scope: ['src/integration.mjs'],
+            depends_on: ['T01'],
+            parallel: false,
+            tdd: false,
+            tests: [],
+            evidence_expected: 'The integration marker exists.',
+            done: false,
+          },
+        ],
+      }),
+    });
+    const wired = { ...d, shell: redAwareShell };
+    await newWorkflow(root, { planFile: '@PLAN.md' }, wired);
+    const outcome = await runWorkflow(root, {}, wired);
+    expect(outcome.ok, outcome.message).toBe(true);
+    expect(calls.map((call) => call.exit)).toEqual([1, 0]);
+    expect(calls[0]!.cwd).toContain('.rijo/runtime/workspaces/ws-tdd-red-01-T01-');
+    const verification = fs.readFileSync(
+      path.join(milestoneDir(root), 'phases', '01-catalog', 'VERIFICATION.md'),
+      'utf8',
+    );
+    expect(verification).toContain('## TDD RED evidence');
+    expect(verification).toContain('expected RED exit 1');
   });
 
   it('resumes from the last verified checkpoint without repeating work', async () => {

@@ -130,12 +130,14 @@ describe('native result ingestion', () => {
     const bundle = path.join(paths.runtimeDir, 'native-results.json');
     fs.writeFileSync(bundle, JSON.stringify({ version: 1, results: [] }));
 
-    await expect(
+    const pending = expect(
       startWorkflow(root, {
         ...runtime,
         runner: new NativeResultRunner(bundle),
       }),
-    ).rejects.toThrow('NATIVE_RESULT_REQUIRED');
+    ).rejects;
+    await pending.toThrow('NATIVE_RESULT_REQUIRED');
+    await pending.not.toThrow(/BLOCKED|exhausted/);
 
     expect(detectDrift(paths)).toEqual({ drifted: [], missing: [] });
     expect(fs.existsSync(path.join(paths.runtimeDir, 'native-requests.jsonl'))).toBe(true);

@@ -34,7 +34,7 @@ interface NativeClaudeAgent {
   body: string;
   effort: 'low' | 'medium' | 'high';
   maxTurns: number;
-  tools: string[];
+  tools?: string[];
   readOnly?: boolean;
   isolation?: 'worktree';
 }
@@ -117,7 +117,8 @@ const AGENT_DEFS: NativeClaudeAgent[] = [
     body: 'Load the available browser tools through ToolSearch. Run the assigned journey as a real user. Use real controls. Check persistence, authorization, console errors, network errors, keyboard access, responsive layouts, and all main interface states. Return READY, NOT_READY, or BLOCKED with evidence.',
     effort: 'medium',
     maxTurns: 24,
-    tools: ['Read', 'Glob', 'Grep', 'ToolSearch'],
+    // Omit the allowlist. Claude Code then inherits deferred MCP tools and
+    // exposes ToolSearch to this read-only subagent.
     readOnly: true,
   },
   {
@@ -127,7 +128,8 @@ const AGENT_DEFS: NativeClaudeAgent[] = [
     body: 'Load the available simulator or emulator tools through ToolSearch. Build and install the application. Run the assigned journey on a real simulator or emulator. Capture screenshots and logs for each defect. Return READY, NOT_READY, or BLOCKED with evidence.',
     effort: 'medium',
     maxTurns: 24,
-    tools: ['Read', 'Glob', 'Grep', 'ToolSearch'],
+    // Omit the allowlist. Claude Code then inherits deferred simulator tools
+    // and exposes ToolSearch to this read-only subagent.
     readOnly: true,
   },
 ];
@@ -281,9 +283,9 @@ function renderNativeClaudeAgent(agent: NativeClaudeAgent, tier: string, model: 
     `effort: ${agent.effort}`,
     `maxTurns: ${agent.maxTurns}`,
     'skills: [rijo]',
-    `tools: [${agent.tools.join(', ')}]`,
     `permissionMode: ${agent.readOnly ? 'plan' : 'acceptEdits'}`,
   ];
+  if (agent.tools) frontmatter.splice(frontmatter.length - 1, 0, `tools: [${agent.tools.join(', ')}]`);
   if (agent.readOnly) frontmatter.push('disallowedTools: [Write, Edit, NotebookEdit, Bash]');
   if (agent.isolation) frontmatter.push(`isolation: ${agent.isolation}`);
   frontmatter.push(

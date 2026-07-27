@@ -220,6 +220,31 @@ export class Supervisor {
     cause: string,
   ): AgentResult {
     const recent = failures.slice(-3);
+    const nativePending = recent.find((failure) =>
+      failure.includes('native result bundle has no result for task'),
+    );
+    if (nativePending) {
+      return {
+        task_id: record.logical_task_id,
+        ok: false,
+        summary: nativePending.replace(/^agent returned failure:\s*/i, ''),
+        files_written: [],
+        payload: {
+          diagnostic: {
+            logical_task_id: record.logical_task_id,
+            final_state: 'AWAITING_NATIVE_RESULT',
+            cause,
+            attempts: replacements + 1,
+            replacements,
+            last_errors: failures.slice(-5),
+          },
+        },
+        scope_requests: [],
+        attempt_id: record.attempt_id,
+        generation: record.generation,
+        lease_id: record.lease_id,
+      };
+    }
     return {
       task_id: record.logical_task_id,
       ok: false,
