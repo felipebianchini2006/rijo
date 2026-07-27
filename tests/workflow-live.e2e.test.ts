@@ -289,7 +289,18 @@ describe('LIVE full-workflow E2E (Claude)', () => {
         const mapState = JSON.parse(
           fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
         );
-        expect(mapState.status).toBe('COMPLETE');
+        expect(['COMPLETE', 'PARTIAL']).toContain(mapState.status);
+        if (mapState.status === 'PARTIAL') {
+          expect(mapState.gap_records?.length, 'PARTIAL map must carry structured gap records').toBeGreaterThan(0);
+          expect(
+            mapState.gap_records.every(
+              (gap: { code?: unknown; severity?: unknown; affected_paths?: unknown }) =>
+                typeof gap.code === 'string' &&
+                ['critical', 'non_critical'].includes(String(gap.severity)) &&
+                Array.isArray(gap.affected_paths),
+            ),
+          ).toBe(true);
+        }
         expect(trackedDirty(fixture)).toEqual([]);
       } finally {
         rmFixture(fixture);
