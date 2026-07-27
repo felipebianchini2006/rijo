@@ -192,7 +192,7 @@ function writePhaseRecoveryBaseline(
   );
 }
 
-function readPhaseRecoveryBaseline(
+export function readPhaseExecutionBaseline(
   target: string,
 ): { snapshot: FileSnapshot; controlledSnapshot: FileSnapshot; dirtyAtStart: Set<string> } | null {
   const raw = readTextIfExists(target);
@@ -466,7 +466,7 @@ async function executePhase(
       .status(ctx.projectRoot)
       .dirtyFiles.filter((dirtyPath) => dirtyPath === '.rijo' || dirtyPath.startsWith('.rijo/'));
     if (hasAppliedProgress) {
-      const recovery = readPhaseRecoveryBaseline(
+      const recovery = readPhaseExecutionBaseline(
         phaseRecoveryBaselinePath(ctx, milestone.id, phase.id),
       );
       if (!recovery) {
@@ -991,9 +991,11 @@ async function executePhase(
   const hasAppliedTaskProgress = taskStates.some((status) =>
     ['IMPLEMENTED', 'VERIFYING', 'VERIFIED', 'DONE'].includes(status),
   );
-  const recoveredBaseline = hasAppliedTaskProgress
-    ? readPhaseRecoveryBaseline(recoveryBaselinePath)
-    : null;
+  // Keep the first durable source baseline until the phase finalizes. Task
+  // projections can temporarily return to PENDING during native recovery.
+  // Replacing the baseline in that state can misclassify verified worker
+  // output as a pre-existing user change and leave it outside the phase commit.
+  const recoveredBaseline = readPhaseExecutionBaseline(recoveryBaselinePath);
   if (hasAppliedTaskProgress && !recoveredBaseline) {
     return blocked(ctx, `Phase ${phase.id}: source baseline needed for safe recovery is missing.`, [
       'Implemented task paths are present, but RIJO cannot prove which dirty bytes came from its isolated workers.',

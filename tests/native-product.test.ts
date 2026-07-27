@@ -117,6 +117,10 @@ describe('native RIJO product surface', () => {
           'Do not write to `.rijo/runtime/workspaces/` from the host worktree.',
         );
       }
+      if (agent === 'rijo-browser-qa' || agent === 'rijo-mobile-qa') {
+        expect(source).toContain('ToolSearch');
+        expect(source).toContain('Load the available');
+      }
     }
   });
 
