@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { detectCodexCli } from '../src/hosts/detect.js';
@@ -15,6 +16,7 @@ import {
   rmFixture,
   runRijo,
   trackedDirty,
+  writeFailingHostShim,
 } from './live-workflow-harness.js';
 
 /**
@@ -92,7 +94,12 @@ describe('LIVE full-workflow E2E (Codex)', () => {
         ctx.skip('SKIPPED: the Codex CLI is not detected on PATH (honest gate — nothing is faked).');
         return;
       }
-      const fixture = createBrownfieldMapFixture(tarball!, 'rijo-wf-map-codex-', haikuConfigYaml('codex'));
+      const fixture = createBrownfieldMapFixture(
+        tarball!,
+        'rijo-wf-map-codex-',
+        haikuConfigYaml('codex', { maxReplacements: 0 }),
+      );
+      let failureShim: string | null = null;
       try {
         const execute = (args: string[], label: string) => {
           const result = runRijo(fixture, [...args, '--host', 'codex'], { timeoutMs: TEST_TIMEOUT_MS });
@@ -105,15 +112,42 @@ describe('LIVE full-workflow E2E (Codex)', () => {
         execute(['map'], 'initial Codex map');
         execute(['new', '@PLANO.md'], 'Codex new');
         execute(['run', '01'], 'Codex phase 01');
+        const realCodex = execFileSync('which', ['codex'], { encoding: 'utf8' }).trim();
+        failureShim = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-plan-only-codex-'));
+        writeFailingHostShim(failureShim, 'codex', realCodex, 'exec-02-');
+        const persistedPlanRun = runRijo(fixture, ['run', '02', '--host', 'codex'], {
+          env: {
+            ...process.env,
+            PATH: `${failureShim}${path.delimiter}${process.env.PATH ?? ''}`,
+          },
+          timeoutMs: TEST_TIMEOUT_MS,
+        });
+        expect(persistedPlanRun.status).not.toBe(0);
+        expect(persistedPlanRun.combined).toMatch(/exhausted|failed|blocked/i);
+        const phaseTwoDir = path.join(
+          fixture.root,
+          '.rijo',
+          'milestones',
+          fs.readdirSync(path.join(fixture.root, '.rijo', 'milestones')).find((entry) => entry.startsWith('M001-'))!,
+          'phases',
+          fs.readdirSync(
+            path.join(
+              fixture.root,
+              '.rijo',
+              'milestones',
+              fs.readdirSync(path.join(fixture.root, '.rijo', 'milestones')).find((entry) => entry.startsWith('M001-'))!,
+              'phases',
+            ),
+          ).find((entry) => entry.startsWith('02-'))!,
+        );
+        expect(fs.existsSync(path.join(phaseTwoDir, 'PLAN.md'))).toBe(true);
         const externalCommit = commitExternalCounterChange(fixture);
-        execute(['map'], 'Codex incremental map');
+        execute(['run', '02'], 'Codex phase 02 stale-plan recovery');
         const mapState = JSON.parse(
           fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
         );
         expect(mapState.last_operation).toBe('incremental');
-        expect(mapState.mapped_commit).toBe(externalCommit);
         expect(mapState.changed_paths_since_map).toContain('src/counter.mjs');
-        execute(['run', '02'], 'Codex phase 02');
         const phaseTwoMapState = JSON.parse(
           fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
         );
@@ -125,9 +159,22 @@ describe('LIVE full-workflow E2E (Codex)', () => {
           ),
         ).toBeDefined();
         assertPhaseConsumedMap(fixture, '02', phaseTwoMapState.mapped_commit);
+        const invalidationDir = path.join(fixture.root, '.rijo', 'runtime', 'plan-invalidations');
+        const invalidations = fs
+          .readdirSync(invalidationDir)
+          .map((entry) => JSON.parse(fs.readFileSync(path.join(invalidationDir, entry), 'utf8')));
+        expect(invalidations).toContainEqual(
+          expect.objectContaining({
+            phase: '02',
+            status: 'REPLANNED',
+            old_plan_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+            new_plan_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+          }),
+        );
         execFileSync('npm', ['test'], { cwd: fixture.root, encoding: 'utf8' });
         expect(trackedDirty(fixture)).toEqual([]);
       } finally {
+        if (failureShim) fs.rmSync(failureShim, { recursive: true, force: true });
         rmFixture(fixture);
       }
     },

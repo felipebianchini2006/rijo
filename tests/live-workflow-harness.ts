@@ -211,6 +211,33 @@ export function assertPhaseConsumedMap(fixture: Fixture, phase: string, mappedCo
   );
 }
 
+/**
+ * Install a PATH shim that proxies every invocation to the real host except
+ * tasks whose argv contains `taskMarker`. Those exit without emitting an
+ * AgentResult, so the real workflow persists its approved plan and exercises
+ * supervised failure/recovery without accepting any fabricated model output.
+ */
+export function writeFailingHostShim(
+  shimDir: string,
+  binaryName: 'claude' | 'codex',
+  realBinary: string,
+  taskMarker: string,
+): void {
+  const source = `#!/usr/bin/env node
+'use strict';
+const { spawnSync } = require('child_process');
+const REAL = ${JSON.stringify(realBinary)};
+const MARKER = ${JSON.stringify(taskMarker)};
+const argv = process.argv.slice(2);
+if (argv.join('\\n').includes(MARKER)) process.exit(86);
+const result = spawnSync(REAL, argv, { stdio: 'inherit' });
+process.exit(result.status == null ? 1 : result.status);
+`;
+  const target = path.join(shimDir, binaryName);
+  fs.writeFileSync(target, source, { mode: 0o755 });
+  fs.chmodSync(target, 0o755);
+}
+
 /** (Re)write the fixture RIJO config, e.g. before `rijo run` to change supervisor policy. */
 export function writeConfig(fixture: Fixture, configYaml: string): void {
   fs.writeFileSync(path.join(fixture.root, '.rijo', 'config.yml'), configYaml);
