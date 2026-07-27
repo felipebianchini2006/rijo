@@ -159,6 +159,40 @@ describe('rijo new (greenfield)', () => {
     expect(researchTask.return_format).toContain('confidence: high|medium|low');
     expect(researchTask.return_format).toContain('checked_at: ISO-8601 string');
   });
+
+  it('normalizes a numeric research confidence score', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id === 'new-research-1',
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'Official Node.js source checked.',
+        files_written: [],
+        payload: {
+          summary: 'Node.js 24 is an active Long-Term Support release.',
+          sources: [{
+            claim: 'Node.js 24 is active Long-Term Support.',
+            source: 'Node.js releases',
+            url: 'https://nodejs.org/en/about/previous-releases',
+            checked_at: '2026-07-27T00:00:00.000Z',
+            version: '24.18.0',
+            confidence: 1,
+            tier: 'official',
+          }],
+        },
+        scope_requests: [],
+      }),
+    );
+
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const sources = JSON.parse(
+      fs.readFileSync(new RijoPaths(root).researchSources, 'utf8'),
+    ) as { sources: Array<{ confidence: string }> };
+    expect(sources.sources[0]!.confidence).toBe('high');
+  });
 });
 
 describe('rijo new (brownfield)', () => {

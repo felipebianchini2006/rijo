@@ -510,7 +510,15 @@ export async function newWorkflow(
                   url: z.string(),
                   checked_at: z.string().default(now().toISOString()),
                   version: z.string().nullable().default(null),
-                  confidence: z.enum(['high', 'medium', 'low']).default('medium'),
+                  confidence: z.preprocess(
+                    (value) => {
+                      if (typeof value !== 'number' || !Number.isFinite(value)) return value;
+                      if (value >= 0.8) return 'high';
+                      if (value >= 0.5) return 'medium';
+                      return 'low';
+                    },
+                    z.enum(['high', 'medium', 'low']).default('medium'),
+                  ),
                   tier: z.enum(['official', 'advisory', 'secondary']).default('secondary'),
                 }),
               )
