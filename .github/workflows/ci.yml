@@ -26,6 +26,10 @@ jobs:
 
       - run: npm ci
 
+      - name: Install Chromium for real production-gate tests
+        if: startsWith(matrix.os, 'macos')
+        run: npm exec -- playwright install chromium
+
       - run: npm run typecheck
 
       # unit + integration + golden + CLI E2E with fake agent runner,
