@@ -115,25 +115,16 @@ describe('LIVE full-workflow E2E (Codex)', () => {
         const realCodex = execFileSync('which', ['codex'], { encoding: 'utf8' }).trim();
         failureShim = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-plan-only-codex-'));
         writeFailingHostShim(failureShim, 'codex', realCodex, 'exec-02-');
-        const phaseTwoDir = path.join(
+        const phasesDir = path.join(
           fixture.root,
           '.rijo',
           'milestones',
           fs.readdirSync(path.join(fixture.root, '.rijo', 'milestones')).find((entry) => entry.startsWith('M001-'))!,
           'phases',
-          fs.readdirSync(
-            path.join(
-              fixture.root,
-              '.rijo',
-              'milestones',
-              fs.readdirSync(path.join(fixture.root, '.rijo', 'milestones')).find((entry) => entry.startsWith('M001-'))!,
-              'phases',
-            ),
-          ).find((entry) => entry.startsWith('02-'))!,
         );
-        const planPath = path.join(phaseTwoDir, 'PLAN.md');
+        let planPath: string | null = null;
         const preparationAttempts = [];
-        for (let attempt = 0; attempt < 3 && !fs.existsSync(planPath); attempt++) {
+        for (let attempt = 0; attempt < 3 && (!planPath || !fs.existsSync(planPath)); attempt++) {
           const result = runRijo(fixture, ['run', '02', '--host', 'codex'], {
             env: {
               ...process.env,
@@ -144,9 +135,11 @@ describe('LIVE full-workflow E2E (Codex)', () => {
           preparationAttempts.push(result.combined);
           expect(result.status).not.toBe(0);
           expect(result.combined).toMatch(/exhausted|failed|blocked/i);
+          const phaseTwoEntry = fs.readdirSync(phasesDir).find((entry) => entry.startsWith('02-'));
+          if (phaseTwoEntry) planPath = path.join(phasesDir, phaseTwoEntry, 'PLAN.md');
         }
         expect(
-          fs.existsSync(planPath),
+          planPath !== null && fs.existsSync(planPath),
           `Codex never persisted phase 02 PLAN before the deliberate worker failure:\n${preparationAttempts.join('\n---\n')}`,
         ).toBe(true);
         const externalCommit = commitExternalCounterChange(fixture);
