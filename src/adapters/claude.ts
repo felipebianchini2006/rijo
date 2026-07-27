@@ -74,7 +74,7 @@ const AGENT_DEFS: NativeClaudeAgent[] = [
     name: 'rijo-worker',
     role: 'worker',
     description: 'Implement one bounded RIJO task in an isolated worktree.',
-    body: 'Implement exactly one RIJO task. Stay inside the declared write scope. Use Test-Driven Development for testable behavior. Run the listed verification commands. Return the complete text content for each changed file. Return changed paths, command evidence, and blockers. The lead must record the file content before worktree cleanup. Do not include private reasoning.',
+    body: 'Implement exactly one RIJO task. Stay inside the declared write scope. Use Test-Driven Development for testable behavior. Run the listed verification commands. Host worktree isolation can make the RIJO runtime workspace path unavailable. In that case, write each project-relative path inside your host worktree. Do not write to `.rijo/runtime/workspaces/` from the host worktree. Return the complete text content for each changed file. Return changed paths, command evidence, and blockers. The lead must record the file content before worktree cleanup. Do not include private reasoning.',
     effort: 'medium',
     maxTurns: 30,
     tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit'],

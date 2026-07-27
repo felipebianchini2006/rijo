@@ -113,6 +113,9 @@ describe('native RIJO product surface', () => {
       expect(source).toMatch(/^hooks:/m);
       if (agent === 'rijo-worker') {
         expect(source).toMatch(/^isolation: worktree$/m);
+        expect(source).toContain(
+          'Do not write to `.rijo/runtime/workspaces/` from the host worktree.',
+        );
       }
     }
   });
