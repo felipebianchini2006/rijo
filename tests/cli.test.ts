@@ -92,10 +92,22 @@ describe('runCli', () => {
     expect((await newWorkflow(root, { planFile: 'PLAN.md' }, runtime)).ok).toBe(true);
 
     log.mockClear();
-    const code = await runCli(['internal', 'recovery'], runtime, root);
+    const code = await runCli(['internal', 'recovery'], {}, root);
 
     expect(code).toBe(0);
     expect(logged()).toContain('Native workflow state recovered.');
+  });
+
+  it('internal milestone finish validates state without an agent runner', async () => {
+    writePlanFile(root);
+    expect((await newWorkflow(root, { planFile: 'PLAN.md' }, deps(root))).ok).toBe(true);
+
+    log.mockClear();
+    const code = await runCli(['internal', 'milestone-finish'], {}, root);
+
+    expect(code).toBe(3);
+    expect(logged()).not.toContain('native host must orchestrate');
+    expect(logged()).toContain('incomplete');
   });
 
   it('supports map full, status, and zero-model query from the CLI', async () => {

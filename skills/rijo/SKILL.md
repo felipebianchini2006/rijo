@@ -19,6 +19,7 @@ Keep canonical project memory in `.rijo/`.
 6. Follow `references/language-style.md` for all generated content.
 
 Use English for every host message.
+Never use Portuguese in a RIJO message.
 Do not inspect the RIJO implementation source.
 Invoke the documented internal helper without probing its help output.
 Do not expose private reasoning.

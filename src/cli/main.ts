@@ -272,11 +272,11 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       }
       if (helper === 'milestone-finish') {
         if (helperArgs.length > 0) return usage('rijo internal milestone-finish');
-        return withNative(cwd, deps, (d) => finishWorkflow(cwd, d));
+        return withDeterministic(cwd, deps, (d) => finishWorkflow(cwd, d));
       }
       if (helper === 'recovery') {
         if (helperArgs.length > 0) return usage('rijo internal recovery');
-        return withNative(cwd, deps, (d) => recoverNativeState(cwd, d));
+        return withDeterministic(cwd, deps, (d) => recoverNativeState(cwd, d));
       }
       return usage(
         'rijo internal status|lifecycle|safe-command|map-codebase|project-init|phase-open|plan-validate|qa-record|milestone-finish|recovery',
@@ -351,6 +351,20 @@ async function withNative(
       message: 'Use `$rijo` in Codex or `/rijo` in Claude Code. The native host must orchestrate this command.',
     });
   }
+  const durableBinding = await attachProductionDurableEngine(cwd, deps);
+  try {
+    return report(await body({ ...durableBinding.deps, hostProvider: 'none' }));
+  } finally {
+    await closeOwnedDurable(durableBinding);
+  }
+}
+
+/** Run a deterministic helper that does not require a native-agent result. */
+async function withDeterministic(
+  cwd: string,
+  deps: WorkflowDeps,
+  body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
+): Promise<number> {
   const durableBinding = await attachProductionDurableEngine(cwd, deps);
   try {
     return report(await body({ ...durableBinding.deps, hostProvider: 'none' }));

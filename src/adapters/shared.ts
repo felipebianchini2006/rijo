@@ -53,6 +53,7 @@ export function rijoInstructionBlock(): string {
     '14. Use deterministic RIJO helper commands only for state, validation, evidence, checkpoints, and recovery.',
     '15. Resolve reversible technical decisions with `.rijo/config.yml` and `.rijo/DECISIONS.md`.',
     '16. Use English for every RIJO host message and generated artifact.',
+    '17. Never use Portuguese during a RIJO workflow.',
   ].join('\n');
 }
 
