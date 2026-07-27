@@ -847,6 +847,19 @@ export function validateClaims(projectRoot: string, inventory: InventoryDocument
   const byPath = new Map(inventory.files.map((f) => [f.path, f]));
   for (const [index, claim] of claims.entries()) {
     const evidencePaths = new Set(claim.evidence.map((item) => item.path));
+    if (
+      evidencePaths.has('.gitignore') &&
+      /\b(?:exclude|prevent|ensure|keep)\b[\s\S]*\b(?:track|tracked|tracking|version control)\b/i.test(
+        claim.statement,
+      ) &&
+      !/\b(?:untracked|new files?|unless already tracked|does not affect already tracked)\b/i.test(
+        claim.statement,
+      )
+    ) {
+      errors.push(
+        `claim ${index}: .gitignore only affects untracked/new matching paths by default and does not untrack existing files; state that limitation explicitly`,
+      );
+    }
     const unevidencedMentions = inventory.files
       .filter((file) => claim.statement.includes(file.path) && !evidencePaths.has(file.path))
       .map((file) => file.path);

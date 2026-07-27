@@ -32,6 +32,7 @@ describe('map trust gates', () => {
     fs.writeFileSync(path.join(root, 'src', 'auth', 'token.ts'), 'export const token = "safe";\n');
     fs.writeFileSync(path.join(root, 'src', 'payments', 'index.ts'), 'export const charge = () => true;\n');
     fs.writeFileSync(path.join(root, 'docs', 'architecture.md'), '# Architecture\n');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'node_modules/\n');
     fs.mkdirSync(paths.codebaseDir, { recursive: true });
     writeMapArtifacts();
   });
@@ -205,6 +206,31 @@ describe('map trust gates', () => {
     });
     expect(validateFragmentDetailed(root, inventory, empty(code), new Set([code.path])).fragment).toBeNull();
     expect(validateFragmentDetailed(root, inventory, empty(doc), new Set([doc.path])).errors).toEqual([]);
+  });
+
+  it('rejects an overbroad .gitignore tracking claim before semantic review', () => {
+    const inventory = buildInventory(root);
+    const ignored = inventory.files.find((file) => file.path === '.gitignore')!;
+    expect(ignored.kind).toBe('configuration');
+    const checked = validateFragmentDetailed(
+      root,
+      inventory,
+      {
+        shard_id: 'ignore-shard',
+        module_ids: [ignored.module_id],
+        claims: [
+          {
+            kind: 'operation',
+            statement: 'The patterns exclude node_modules from version control.',
+            evidence: [{ path: ignored.path, file_hash: ignored.file_hash }],
+          },
+        ],
+        gaps: [],
+      },
+      new Set([ignored.path]),
+    );
+    expect(checked.fragment).toBeNull();
+    expect(checked.errors.join('\n')).toMatch(/only affects untracked\/new matching paths/i);
   });
 
   it('enforces exact shard paths and explicitly marked neighbor contracts', () => {

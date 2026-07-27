@@ -134,6 +134,9 @@ function languageFor(rel: string): string | null {
 function classify(rel: string): InventoryKind {
   const lower = rel.toLowerCase();
   const base = path.posix.basename(lower);
+  if (['.gitignore', '.npmignore', '.dockerignore', '.gitattributes', '.editorconfig'].includes(base)) {
+    return 'configuration';
+  }
   if (
     /(^|\/)(migrations?|prisma\/migrations|supabase\/migrations|drizzle\/migrations)(\/|$)/.test(lower) ||
     /\.sql$/.test(lower)

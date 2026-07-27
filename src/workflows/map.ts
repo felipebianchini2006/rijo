@@ -280,6 +280,7 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
         ])}`,
         'Every evidence object must use the ownership value assigned to its exact path above. Never infer external_contract from an import relationship. A claim statement must never name a literal path absent from this matrix.',
         'Return exactly one semantic_coverage record for every module_id/category pair in that matrix. Use COVERED with a matching primary claim, GAP with the matching factual gap, or NOT_APPLICABLE only where applicable=false.',
+        'For .gitignore evidence, never claim that a pattern excludes already tracked files: it only affects untracked/new matching paths by default unless a file is explicitly untracked.',
       ].join('\n\n'),
       };
     });
