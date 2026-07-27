@@ -97,7 +97,7 @@ describe('LIVE full-workflow E2E (Codex)', () => {
       const fixture = createBrownfieldMapFixture(
         tarball!,
         'rijo-wf-map-codex-',
-        haikuConfigYaml('codex', { maxReplacements: 0 }),
+        haikuConfigYaml('codex'),
       );
       let failureShim: string | null = null;
       try {

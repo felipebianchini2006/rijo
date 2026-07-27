@@ -207,7 +207,7 @@ describe('LIVE full-workflow E2E (Claude)', () => {
       const fixture = createBrownfieldMapFixture(
         tarball!,
         'rijo-wf-map-claude-',
-        haikuConfigYaml('claude', { maxReplacements: 0 }),
+        haikuConfigYaml('claude'),
       );
       let failureShim: string | null = null;
       try {
