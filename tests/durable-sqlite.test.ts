@@ -51,7 +51,8 @@ describe('SqliteStateStore', () => {
     expect(fs.existsSync(path.join(root, '.rijo', 'state', 'migrations', '001-initial.sql'))).toBe(true);
     if (process.platform !== 'win32') expect(fs.statSync(db).mode & 0o777).toBe(0o600);
 
-    const tables = new Database(db, { readonly: true })
+    const inspection = new Database(db, { readonly: true });
+    const tables = inspection
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
       .all()
       .map((row) => (row as { name: string }).name);
@@ -80,6 +81,7 @@ describe('SqliteStateStore', () => {
     ]) {
       expect(tables).toContain(table);
     }
+    inspection.close();
     await store.close();
   });
 
@@ -242,13 +244,15 @@ describe('SqliteStateStore', () => {
       fs.readdirSync(path.join(root, '.rijo', 'state', 'backups')),
     ).toContain('pre-migration-v1-20260727123000.sqlite');
     expect(fs.existsSync(path.join(root, '.rijo', 'ledger', 'latest.json'))).toBe(true);
-    const index = new Database(db, { readonly: true })
+    const inspection = new Database(db, { readonly: true });
+    const index = inspection
       .prepare(
         `SELECT name FROM sqlite_master
          WHERE type='index' AND name='checkpoints_kind_sequence_idx'`,
       )
       .get();
     expect(index).toBeDefined();
+    inspection.close();
     await store.close();
   });
 

@@ -255,7 +255,7 @@ describe('engine supervisor state machine', () => {
         type: 'supervisor.heartbeat',
         supervisor_pid: process.pid,
         pid: factory.handles[0]!.pid,
-        process_group: factory.handles[0]!.pid,
+        process_group: process.platform === 'win32' ? null : factory.handles[0]!.pid,
       }),
     );
     expect(factory.maximumActive).toBe(1);
