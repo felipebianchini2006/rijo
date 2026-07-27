@@ -57,4 +57,4 @@ RIJO validates each result against the current lease, generation, baseline, work
 RIJO rejects a missing, stale, reused, or out-of-scope result.
 Keep all native transport files in `.rijo/runtime/`.
 Use Node.js or the host file tools for native transport.
-Do not require Python, Go, or Rust.
+Do not invoke Python, Go, or Rust.

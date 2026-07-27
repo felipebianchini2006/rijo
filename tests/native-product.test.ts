@@ -69,6 +69,7 @@ describe('native RIJO product surface', () => {
     }
     expect(nativeResults).toContain('Put the structured return value in `payload`.');
     expect(nativeResults).toContain('Do not encode the payload in `summary`.');
+    expect(nativeResults).toContain('Do not invoke Python, Go, or Rust.');
   });
 
   it('keeps old skills as short compatibility redirects', () => {
