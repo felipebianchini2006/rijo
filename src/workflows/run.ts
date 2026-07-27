@@ -867,10 +867,19 @@ async function executePhase(
     };
     const attempts: ReplaceableAttempt[] = [];
     for (const t of pending) {
+      const taskOwnsTestPath = t.write_scope.some((scope) =>
+        /(^|\/)(__tests__|tests?|spec)(\/|\.|$)|\.(test|spec)\.[^.]+$/i.test(scope),
+      );
+      const tddInstruction =
+        t.tdd && taskOwnsTestPath
+          ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. '
+          : t.tdd
+            ? 'Tests for this change are allocated to a separate task; do not edit them or any path outside this task write scope. '
+            : '';
       const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
-        objective: `Implement task ${t.id}: ${t.name}. ${t.tdd ? 'Follow TDD: write a failing test (RED), implement (GREEN), refactor. ' : ''}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
+        objective: `Implement task ${t.id}: ${t.name}. ${tddInstruction}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
         canonical_files: [ctx.paths.rules, pp.spec, pp.plan].filter(exists),
         code_files: t.files.map((f) => path.resolve(ctx.projectRoot, f)),
         write_scope: t.write_scope,

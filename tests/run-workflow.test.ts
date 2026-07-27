@@ -246,13 +246,14 @@ describe('rijo run', () => {
     expect(reqs.requirements.every((r) => r.status !== 'DONE')).toBe(true);
   });
 
-  it('TDD task records the RED-GREEN discipline in the worker brief', async () => {
+  it('does not instruct a TDD worker to edit tests allocated outside its write scope', async () => {
     const d = deps(root);
     await newWorkflow(root, { planFile: '@PLANO.md' }, d);
     await runWorkflow(root, {}, d);
     const tddWorker = d.runner.executed.find((t) => t.id === 'exec-01-T01')!;
-    expect(tddWorker.objective).toContain('TDD');
-    expect(tddWorker.objective).toContain('RED');
+    expect(tddWorker.write_scope).toEqual(['src/a.ts']);
+    expect(tddWorker.objective).toContain('Tests for this change are allocated to a separate task');
+    expect(tddWorker.objective).not.toContain('write a failing test');
   });
 
   it('resumes from the last verified checkpoint without repeating work', async () => {
