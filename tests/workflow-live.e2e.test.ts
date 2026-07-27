@@ -245,6 +245,60 @@ describe('LIVE full-workflow E2E (Claude)', () => {
     },
     2_400_000,
   );
+
+  it(
+    'Scenario MAP RECOVERY — a stalled mapper tree is killed and its real replacement promotes the map',
+    async (ctx) => {
+      if (!gate(ctx)) return;
+      const realClaude = execFileSync('which', ['claude'], { encoding: 'utf8' }).trim();
+      expect(realClaude, 'could not resolve the real claude binary').toBeTruthy();
+      const fixture = createBrownfieldMapFixture(
+        tarball!,
+        'rijo-wf-map-recovery-',
+        haikuConfigYaml('claude', {
+          researcherHardTimeoutMs: 45_000,
+          heartbeatIntervalMs: 1_000,
+          cancelGraceMs: 4_000,
+          hardKillGraceMs: 2_000,
+          maxReplacements: 1,
+        }),
+      );
+      const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-map-recovery-shim-'));
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-map-recovery-state-'));
+      writeClaudeShim(shimDir, realClaude, stateDir, 'map-shard-');
+      try {
+        const run = runRijo(fixture, ['map', '--host', 'claude'], {
+          env: {
+            ...process.env,
+            PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
+          },
+          timeoutMs: TEST_TIMEOUT_MS,
+        });
+        expect(run.status, `live mapper replacement failed:\n${run.combined}`).toBe(0);
+
+        const pids = readShimPids(stateDir);
+        expect(pids).toHaveLength(3);
+        for (const pid of pids) {
+          expect(() => process.kill(pid, 0), `stalled mapper pid ${pid} must be dead`).toThrow();
+        }
+        const status = readStatusJson(fixture);
+        const replacement = status.supervisor.tasks.find(
+          (task) => task.logical_task_id.startsWith('map-shard-') && task.generation === 2,
+        );
+        expect(replacement).toMatchObject({ state: 'SUCCEEDED', replacements: 1 });
+        const mapState = JSON.parse(
+          fs.readFileSync(path.join(fixture.root, '.rijo', 'codebase', 'map-state.json'), 'utf8'),
+        );
+        expect(mapState.status).toBe('COMPLETE');
+        expect(trackedDirty(fixture)).toEqual([]);
+      } finally {
+        rmFixture(fixture);
+        fs.rmSync(shimDir, { recursive: true, force: true });
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
 
 /** Recorded pids of the stalled generation-1 tree (shim, child, grandchild). */
@@ -267,7 +321,12 @@ function readShimPids(stateDir: string): number[] {
  * SIGTERM and hangs — never printing a fabricated result. See the file header
  * for why this is a legitimate, non-fabricating stall injector.
  */
-function writeClaudeShim(shimDir: string, realClaude: string, stateDir: string): void {
+function writeClaudeShim(
+  shimDir: string,
+  realClaude: string,
+  stateDir: string,
+  targetMarker = 'exec-',
+): void {
   const shim = `#!/usr/bin/env node
 'use strict';
 const fs = require('fs');
@@ -278,25 +337,26 @@ const { spawnSync, spawn } = require('child_process');
 // allowlisted environment, so the shim cannot rely on custom env vars.
 const REAL = ${JSON.stringify(realClaude)};
 const STATE = ${JSON.stringify(stateDir)};
+const TARGET = ${JSON.stringify(targetMarker)};
 const argv = process.argv.slice(2);
 const joined = argv.join('\\n');
 
-// Execution-worker attempts carry the 'exec-' logical id in their prompt argv.
-const isExecWorker = joined.indexOf('exec-') !== -1;
+// Only the selected logical task family is fault-injected.
+const isTarget = joined.indexOf(TARGET) !== -1;
 
 function execReal() {
   const res = spawnSync(REAL, argv, { stdio: 'inherit' });
   process.exit(res.status == null ? 1 : res.status);
 }
 
-if (!isExecWorker) {
-  // Detection (--version) and every non-worker role: the REAL host runs.
+if (!isTarget) {
+  // Detection (--version) and every non-target role: the REAL host runs.
   execReal();
 }
 
-// Count only execution-worker invocations. The FIRST one stalls; every later
+// Count only target invocations. The FIRST one stalls; every later
 // one (the generation-2 replacement, and any other task) runs the REAL host.
-const counterFile = path.join(STATE, 'worker-count');
+const counterFile = path.join(STATE, 'target-count');
 let count = 0;
 try { count = parseInt(fs.readFileSync(counterFile, 'utf8'), 10) || 0; } catch (e) {}
 count += 1;

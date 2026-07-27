@@ -219,6 +219,8 @@ export function writeConfig(fixture: Fixture, configYaml: string): void {
 export interface SupervisorOverrides {
   /** Worker hard timeout (ms). Short in Scenario B so a stalled attempt is terminated fast. */
   workerHardTimeoutMs?: number;
+  /** Researcher/mapper hard timeout (ms). Short only in live mapper replacement tests. */
+  researcherHardTimeoutMs?: number;
   heartbeatIntervalMs?: number;
   cancelGraceMs?: number;
   hardKillGraceMs?: number;
@@ -246,6 +248,7 @@ export interface SupervisorOverrides {
  */
 export function haikuConfigYaml(provider: 'claude' | 'codex', ov: SupervisorOverrides = {}): string {
   const workerHard = ov.workerHardTimeoutMs ?? 600_000;
+  const researcherHard = ov.researcherHardTimeoutMs ?? 600_000;
   const heartbeat = ov.heartbeatIntervalMs ?? 3_000;
   const cancelGrace = ov.cancelGraceMs ?? 15_000;
   const hardKill = ov.hardKillGraceMs ?? 5_000;
@@ -298,7 +301,7 @@ export function haikuConfigYaml(provider: 'claude' | 'codex', ov: SupervisorOver
     '    planner: 600000',
     `    worker: ${workerHard}`,
     '    reviewer: 600000',
-    '    researcher: 600000',
+    `    researcher: ${researcherHard}`,
     '    qa: 600000',
     '  no_progress_timeout_ms:',
     '    lead: 600000',
