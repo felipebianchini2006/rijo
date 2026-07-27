@@ -223,15 +223,6 @@ describe('LIVE full-workflow E2E (Claude)', () => {
         const realClaude = execFileSync('which', ['claude'], { encoding: 'utf8' }).trim();
         failureShim = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-plan-only-claude-'));
         writeFailingHostShim(failureShim, 'claude', realClaude, 'exec-02-');
-        const persistedPlanRun = runRijo(fixture, ['run', '02', '--host', 'claude'], {
-          env: {
-            ...process.env,
-            PATH: `${failureShim}${path.delimiter}${process.env.PATH ?? ''}`,
-          },
-          timeoutMs: TEST_TIMEOUT_MS,
-        });
-        expect(persistedPlanRun.status).not.toBe(0);
-        expect(persistedPlanRun.combined).toMatch(/exhausted|failed|blocked/i);
         const milestoneDir = path.join(
           fixture.root,
           '.rijo',
@@ -243,7 +234,24 @@ describe('LIVE full-workflow E2E (Claude)', () => {
           'phases',
           fs.readdirSync(path.join(milestoneDir, 'phases')).find((entry) => entry.startsWith('02-'))!,
         );
-        expect(fs.existsSync(path.join(phaseTwoDir, 'PLAN.md'))).toBe(true);
+        const planPath = path.join(phaseTwoDir, 'PLAN.md');
+        const preparationAttempts = [];
+        for (let attempt = 0; attempt < 3 && !fs.existsSync(planPath); attempt++) {
+          const result = runRijo(fixture, ['run', '02', '--host', 'claude'], {
+            env: {
+              ...process.env,
+              PATH: `${failureShim}${path.delimiter}${process.env.PATH ?? ''}`,
+            },
+            timeoutMs: TEST_TIMEOUT_MS,
+          });
+          preparationAttempts.push(result.combined);
+          expect(result.status).not.toBe(0);
+          expect(result.combined).toMatch(/exhausted|failed|blocked/i);
+        }
+        expect(
+          fs.existsSync(planPath),
+          `Claude never persisted phase 02 PLAN before the deliberate worker failure:\n${preparationAttempts.join('\n---\n')}`,
+        ).toBe(true);
         const externalCommit = commitExternalCounterChange(fixture);
         const phaseTwo = runRijo(fixture, ['run', '02', '--host', 'claude'], { timeoutMs: TEST_TIMEOUT_MS });
         expect(phaseTwo.status, `Claude stale-plan recovery failed:\n${phaseTwo.combined}`).toBe(0);

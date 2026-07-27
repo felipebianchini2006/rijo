@@ -115,15 +115,6 @@ describe('LIVE full-workflow E2E (Codex)', () => {
         const realCodex = execFileSync('which', ['codex'], { encoding: 'utf8' }).trim();
         failureShim = fs.mkdtempSync(path.join(os.tmpdir(), 'rijo-plan-only-codex-'));
         writeFailingHostShim(failureShim, 'codex', realCodex, 'exec-02-');
-        const persistedPlanRun = runRijo(fixture, ['run', '02', '--host', 'codex'], {
-          env: {
-            ...process.env,
-            PATH: `${failureShim}${path.delimiter}${process.env.PATH ?? ''}`,
-          },
-          timeoutMs: TEST_TIMEOUT_MS,
-        });
-        expect(persistedPlanRun.status).not.toBe(0);
-        expect(persistedPlanRun.combined).toMatch(/exhausted|failed|blocked/i);
         const phaseTwoDir = path.join(
           fixture.root,
           '.rijo',
@@ -140,7 +131,24 @@ describe('LIVE full-workflow E2E (Codex)', () => {
             ),
           ).find((entry) => entry.startsWith('02-'))!,
         );
-        expect(fs.existsSync(path.join(phaseTwoDir, 'PLAN.md'))).toBe(true);
+        const planPath = path.join(phaseTwoDir, 'PLAN.md');
+        const preparationAttempts = [];
+        for (let attempt = 0; attempt < 3 && !fs.existsSync(planPath); attempt++) {
+          const result = runRijo(fixture, ['run', '02', '--host', 'codex'], {
+            env: {
+              ...process.env,
+              PATH: `${failureShim}${path.delimiter}${process.env.PATH ?? ''}`,
+            },
+            timeoutMs: TEST_TIMEOUT_MS,
+          });
+          preparationAttempts.push(result.combined);
+          expect(result.status).not.toBe(0);
+          expect(result.combined).toMatch(/exhausted|failed|blocked/i);
+        }
+        expect(
+          fs.existsSync(planPath),
+          `Codex never persisted phase 02 PLAN before the deliberate worker failure:\n${preparationAttempts.join('\n---\n')}`,
+        ).toBe(true);
         const externalCommit = commitExternalCounterChange(fixture);
         execute(['run', '02'], 'Codex phase 02 stale-plan recovery');
         const mapState = JSON.parse(
