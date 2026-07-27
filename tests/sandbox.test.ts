@@ -37,6 +37,33 @@ describe('execution policy (planCommand)', () => {
     if (plan.ok) expect(plan.command.args).toContain('--ignore-scripts');
   });
 
+  it('allows only gate-managed, explicit Playwright browser provisioning', () => {
+    const denied = planCommand('playwright install chromium', { cwd: root, config });
+    expect(denied.ok).toBe(false);
+
+    const approved = planCommand('playwright install chromium webkit', {
+      cwd: root,
+      config,
+      allowInstall: true,
+    });
+    expect(approved.ok).toBe(true);
+    if (approved.ok) {
+      expect(approved.command.network).toBe('enabled');
+      expect(approved.command.trust).toBe('known-script');
+      expect(approved.sandbox).toBe('unsandboxed-trusted');
+    }
+
+    for (const command of [
+      'playwright install --with-deps chromium',
+      'playwright install chrome',
+      'playwright install',
+    ]) {
+      expect(planCommand(command, { cwd: root, config, allowInstall: true }).ok, command).toBe(
+        false,
+      );
+    }
+  });
+
   it('classifies repository scripts and requires a sandbox for them', () => {
     const blockedPlan = planCommand('npm run test', { cwd: root, config, sandboxAvailableOverride: false });
     expect(blockedPlan.ok).toBe(false);

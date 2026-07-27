@@ -57,12 +57,6 @@ function browsersCachePath(): string {
     : path.join(os.homedir(), '.cache', 'ms-playwright');
 }
 
-function browserInstalled(browser: string): boolean {
-  const cache = browsersCachePath();
-  if (!exists(cache)) return false;
-  return fs.readdirSync(cache).some((d) => d.startsWith(`${browser}-`) || d.startsWith(`${browser}_headless_shell-`));
-}
-
 /** Windows needs a shell to resolve/execute .cmd shims (npm, playwright). */
 const WIN_SHELL = process.platform === 'win32';
 
@@ -146,9 +140,6 @@ export async function runProductionGate(
       if (!actions) configIssues.push(`journey ${j.id} has no structured actions file (qa/journeys/${j.id.toLowerCase()}.actions.json)`);
       else actionsByJourney[j.id] = actions.actions;
     }
-    for (const b of qa.browsers) {
-      if (!browserInstalled(b)) configIssues.push(`Playwright browser "${b}" is not installed (run: playwright install ${b})`);
-    }
   }
   if (configIssues.length > 0) return blockedReport(configIssues.map((i) => `Gate configuration incomplete: ${i}`), commit);
 
@@ -184,6 +175,35 @@ export async function runProductionGate(
       }
     } else {
       return blockedReport(['No package-lock.json: reproducible installation is impossible.'], commit);
+    }
+
+    // The browser revision is coupled to the target project's Playwright
+    // version. Provision it with the binary from this exact checkout instead
+    // of trusting a global cache populated by an unrelated RIJO/CI version.
+    if (browserGate) {
+      const installCommand = `playwright install ${qa.browsers.join(' ')}`;
+      deps.emit(
+        'gate.install',
+        `provisionando browsers da versão travada do projeto (${qa.browsers.join(', ')})`,
+      );
+      const browserInstall = deps.shell.run(installCommand, {
+        cwd: gateDir,
+        allowInstall: true,
+        timeoutMs: 10 * 60 * 1000,
+      });
+      commands.push(browserInstall);
+      if (browserInstall.exit_code !== 0) {
+        return {
+          ...blockedReport(
+            [
+              `Playwright browser provisioning failed in the gate checkout (exit ${browserInstall.exit_code}).`,
+              browserInstall.summary,
+            ],
+            commit,
+          ),
+          commands,
+        };
+      }
     }
 
     // ---- 5: deterministic checks inside the CHECKOUT (the exact commit)

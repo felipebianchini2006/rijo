@@ -85,7 +85,7 @@ export const QaConfigSchema = z.object({
   health_url: z.string().default(''),
   startup_timeout_ms: z.number().int().positive().default(60_000),
   shutdown_timeout_ms: z.number().int().positive().default(10_000),
-  browsers: z.array(z.string()).default(['chromium']),
+  browsers: z.array(z.enum(['chromium', 'firefox', 'webkit'])).default(['chromium']),
   viewports: z
     .array(ViewportSchema)
     .default([

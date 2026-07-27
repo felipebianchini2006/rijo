@@ -185,13 +185,33 @@ export function planCommand(raw: string, opts: PlanCommandOptions): CommandPlan 
     };
   }
 
-  // dependency installation and lifecycle scripts need explicit policy
+  // Dependency installation and Playwright's browser provisioning need the
+  // explicit gate policy. The latter is deliberately limited to the three
+  // browser families supported by Playwright; flags and arbitrary download
+  // targets remain unavailable to agents.
   const sub = args.find((a) => !a.startsWith('-')) ?? '';
-  const isInstall = ['npm', 'pnpm', 'yarn', 'bun'].includes(executable) && INSTALL_SUBCOMMANDS.has(sub);
-  if (isInstall && !opts.allowInstall) {
+  const isPackageInstall =
+    ['npm', 'pnpm', 'yarn', 'bun'].includes(executable) && INSTALL_SUBCOMMANDS.has(sub);
+  const browserTargets = args.slice(1);
+  const isBrowserInstall =
+    executable === 'playwright' &&
+    args[0] === 'install' &&
+    browserTargets.length > 0 &&
+    browserTargets.every((browser) => ['chromium', 'firefox', 'webkit'].includes(browser));
+  const attemptedBrowserInstall = executable === 'playwright' && args[0] === 'install';
+  if (attemptedBrowserInstall && !isBrowserInstall) {
     return {
       ok: false,
-      reason: `dependency installation ("${executable} ${sub}") requires the explicit install policy (gate-managed); agents cannot install packages`,
+      reason:
+        'Playwright browser provisioning only accepts explicit chromium, firefox, or webkit targets without flags',
+      disposition: 'BLOCKED',
+    };
+  }
+  const isManagedInstall = isPackageInstall || isBrowserInstall;
+  if (isManagedInstall && !opts.allowInstall) {
+    return {
+      ok: false,
+      reason: `installation ("${executable} ${sub}") requires the explicit install policy (gate-managed); agents cannot install packages or browsers`,
       disposition: 'BLOCKED',
     };
   }
@@ -203,15 +223,19 @@ export function planCommand(raw: string, opts: PlanCommandOptions): CommandPlan 
   }
 
   const classified = classify(executable, args);
-  // A gate-approved install ALWAYS runs with --ignore-scripts (appended
-  // below), so no repository code executes — only the package manager itself.
-  // That makes it known-script: it needs the network, not an OS sandbox, and
-  // works identically on hosts without one (Linux/Windows runners).
-  const trust: CommandTrust = isInstall ? 'known-script' : classified.trust;
-  const effectiveNetwork: NetworkPolicy = isInstall ? 'enabled' : trust === 'known-script' ? classified.network : opts.config.network_default;
+  // A gate-approved package install runs with --ignore-scripts (appended
+  // below). A browser install executes only Playwright's version-pinned
+  // downloader with schema-constrained targets. Both need network access and
+  // work identically on hosts without an OS sandbox.
+  const trust: CommandTrust = isManagedInstall ? 'known-script' : classified.trust;
+  const effectiveNetwork: NetworkPolicy = isManagedInstall
+    ? 'enabled'
+    : trust === 'known-script'
+      ? classified.network
+      : opts.config.network_default;
 
   let finalArgs = args;
-  if (isInstall) {
+  if (isPackageInstall) {
     // lifecycle scripts are arbitrary code running at install time: always off
     if (!finalArgs.includes('--ignore-scripts')) finalArgs = [...finalArgs, '--ignore-scripts'];
   }
