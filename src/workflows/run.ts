@@ -1091,7 +1091,7 @@ async function executePhase(
       const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
-        objective: `Implement task ${t.id}: ${t.name}. ${tddInstruction}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
+        objective: `Implement task ${t.id}: ${t.name}. ${tddInstruction}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
         canonical_files: [ctx.paths.rules, pp.spec, pp.plan].filter(exists),
         code_files: t.files.map((f) => path.resolve(ctx.projectRoot, f)),
         write_scope: t.write_scope,
@@ -1291,7 +1291,7 @@ async function executePhase(
       id: `code-review-${phase.id}-l${reviewLoops}`,
       role: 'reviewer',
       objective:
-        'Independent code review. You receive the spec, the plan, the diff and the verification evidence — never the implementer reasoning. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject.',
+        'Independent code review. You receive the spec, the plan, the diff and the verification evidence — never the implementer reasoning. RIJO runs framework-owned UI smoke after this review. Do not reject only because that future smoke evidence is absent. Check whether the requested smoke journey can prove the UI acceptance criteria. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject.',
       canonical_files: [pp.spec, pp.plan].filter(exists),
       code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
       write_scope: [],
@@ -1471,7 +1471,7 @@ async function runRepairAttempt(
   const repairTask: AgentTaskDraft = {
     id: spec.id,
     role: 'worker',
-    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
+    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do not edit the phase specification or plan during a code repair. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
     canonical_files: [pp.spec, pp.plan].filter(exists),
     code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
     write_scope: plan.tasks.flatMap((t) => t.write_scope),

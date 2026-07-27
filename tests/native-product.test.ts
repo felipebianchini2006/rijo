@@ -116,11 +116,24 @@ describe('native RIJO product surface', () => {
         expect(source).toContain(
           'Do not write to `.rijo/runtime/workspaces/` from the host worktree.',
         );
+        expect(source).toContain(
+          'read the project-root copy as read-only context',
+        );
+      }
+      if (agent === 'rijo-code-reviewer') {
+        expect(source).toContain(
+          'RIJO runs the framework-owned UI smoke after this review.',
+        );
+        expect(source).toContain(
+          'Do not reject the phase only because UI smoke evidence does not exist yet.',
+        );
       }
       if (agent === 'rijo-browser-qa' || agent === 'rijo-mobile-qa') {
         expect(source).toContain('ToolSearch');
         expect(source).toContain('Load the available');
       }
+      expect(source).not.toContain('command: "rijo internal lifecycle');
+      expect(source).toContain('native-hooks.jsonl');
     }
   });
 

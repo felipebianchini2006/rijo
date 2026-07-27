@@ -74,7 +74,7 @@ const AGENT_DEFS: NativeClaudeAgent[] = [
     name: 'rijo-worker',
     role: 'worker',
     description: 'Implement one bounded RIJO task in an isolated worktree.',
-    body: 'Implement exactly one RIJO task. Stay inside the declared write scope. Use Test-Driven Development for testable behavior. Run the listed verification commands. Host worktree isolation can make the RIJO runtime workspace path unavailable. In that case, write each project-relative path inside your host worktree. Do not write to `.rijo/runtime/workspaces/` from the host worktree. Return the complete text content for each changed file. Return changed paths, command evidence, and blockers. The lead must record the file content before worktree cleanup. Do not include private reasoning.',
+    body: 'Implement exactly one RIJO task. Stay inside the declared write scope. Use Test-Driven Development for testable behavior. The lead runs the listed verification commands. Host worktree isolation can make the RIJO runtime workspace path unavailable. In that case, write each project-relative path inside your host worktree. When a required dependency or active phase artifact is absent from the host worktree, read the project-root copy as read-only context. Write only in the host worktree. Do not write to `.rijo/runtime/workspaces/` from the host worktree. Return the complete text content for each changed file. Return changed paths and blockers. The lead must record the file content before worktree cleanup. Do not include private reasoning.',
     effort: 'medium',
     maxTurns: 30,
     tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit'],
@@ -84,7 +84,7 @@ const AGENT_DEFS: NativeClaudeAgent[] = [
     name: 'rijo-code-reviewer',
     role: 'reviewer',
     description: 'Review verified RIJO changes independently for engineering quality.',
-    body: 'Review the specification, plan, diff, and command evidence. Check correctness, simplicity, cohesion, coupling, duplication, error handling, security, data integrity, performance, test quality, code smells, unnecessary abstractions, and scope drift. Return a verdict and evidence. Do not change files.',
+    body: 'Review the specification, plan, diff, and command evidence. Check correctness, simplicity, cohesion, coupling, duplication, error handling, security, data integrity, performance, test quality, code smells, unnecessary abstractions, and scope drift. RIJO runs the framework-owned UI smoke after this review. Do not reject the phase only because UI smoke evidence does not exist yet. Check that the requested smoke journey can prove the UI acceptance criteria. Return a verdict and evidence. Do not change files.',
     effort: 'high',
     maxTurns: 16,
     tools: ['Read', 'Glob', 'Grep'],
@@ -299,11 +299,18 @@ function renderNativeClaudeAgent(agent: NativeClaudeAgent, tier: string, model: 
 }
 
 function renderLifecycleHook(event: string): string[] {
+  const script = [
+    "const fs=require('node:fs');",
+    "const directory='.rijo/runtime';",
+    'fs.mkdirSync(directory,{recursive:true});',
+    `fs.appendFileSync(directory+'/native-hooks.jsonl',JSON.stringify({event:${JSON.stringify(event)},at:new Date().toISOString()})+'\\n');`,
+  ].join('');
+  const command = `node -e ${JSON.stringify(script)}`;
   return [
     `  ${event}:`,
     '    - hooks:',
     '        - type: command',
-    `          command: ${JSON.stringify(`rijo internal lifecycle ${event}`)}`,
+    `          command: ${JSON.stringify(command)}`,
   ];
 }
 

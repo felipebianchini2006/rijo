@@ -51,6 +51,7 @@ Run each approved command through `rijo internal safe-command -- COMMAND`.
 Read `engineering-review.md`.
 Use an independent native reviewer.
 Allow at most two repair cycles.
+Run the framework-owned UI smoke after engineering review.
 
 ## PHASE_DONE
 
