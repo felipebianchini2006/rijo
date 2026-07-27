@@ -110,6 +110,7 @@ describe('environment reconstruction', () => {
       expect(env['HOME']).not.toBe(process.env['HOME']);
       expect(env['HOME']).toContain('rijo-sbx');
       expect(env['TMPDIR']).toContain('rijo-sbx');
+      expect(env['PLAYWRIGHT_BROWSERS_PATH']).toContain(env['HOME']!);
       // PATH is rebuilt, not inherited
       expect(env['PATH']).toContain(path.join(root, 'node_modules', '.bin'));
     } finally {

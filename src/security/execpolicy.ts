@@ -112,6 +112,7 @@ export function buildEnv(cwd: string, config: ExecutionConfig): Record<string, s
     ),
     HOME: scratchHome,
     TMPDIR: path.join(scratchHome, 'tmp'),
+    PLAYWRIGHT_BROWSERS_PATH: path.join(scratchHome, 'ms-playwright'),
     npm_config_yes: 'true',
     npm_config_update_notifier: 'false',
     npm_config_fund: 'false',

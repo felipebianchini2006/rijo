@@ -1,6 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { ensureDir, exists, readJsonIfExists, readText } from '../core/fsx.js';
 import { buildEnv, seatbeltProfile } from '../security/execpolicy.js';
@@ -48,13 +47,6 @@ export interface GateDeps {
   qaDir: string;
   now: () => Date;
   emit: (type: string, message: string) => void;
-}
-
-function browsersCachePath(): string {
-  if (process.env['PLAYWRIGHT_BROWSERS_PATH']) return process.env['PLAYWRIGHT_BROWSERS_PATH'];
-  return process.platform === 'darwin'
-    ? path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright')
-    : path.join(os.homedir(), '.cache', 'ms-playwright');
 }
 
 /** Windows needs a shell to resolve/execute .cmd shims (npm, playwright). */
@@ -300,10 +292,7 @@ export async function runProductionGate(
       return { ...blockedReport(['Playwright binary missing from the checkout node_modules.'], commit), commands, server_log: serverLogPath };
     }
     const started = Date.now();
-    const pwEnv = {
-      ...buildEnv(gateDir, config.execution),
-      PLAYWRIGHT_BROWSERS_PATH: browsersCachePath(),
-    };
+    const pwEnv = buildEnv(gateDir, config.execution);
     const pw = spawnSync(pwBin, ['test', `--config=${pwConfigPath}`], {
       cwd: gateDir,
       env: pwEnv,
