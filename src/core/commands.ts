@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { redact } from '../security/redact.js';
 import { planCommand } from '../security/execpolicy.js';
@@ -55,6 +56,7 @@ const ALLOWED_EXECUTABLES = new Set([
   // registry packages. Locally installed binaries resolve via the
   // reconstructed PATH (node_modules/.bin) instead.
   'npm', 'pnpm', 'yarn', 'bun', 'node', 'deno',
+  'test',
   'tsc', 'vitest', 'jest', 'mocha', 'ava', 'playwright',
   'eslint', 'prettier', 'biome',
   'python', 'python3', 'pytest', 'ruff', 'mypy',
@@ -124,6 +126,22 @@ export function evaluateCommand(raw: string): CommandDecision {
   if (!ALLOWED_EXECUTABLES.has(executable)) {
     return { ok: false, executable, args, category: 'custom', reason: `executable "${executable}" is not in the safe allowlist` };
   }
+  if (
+    executable === 'test' &&
+    (args.length !== 2 ||
+      !['-e', '-f', '-d'].includes(args[0] ?? '') ||
+      !args[1] ||
+      path.isAbsolute(args[1]) ||
+      args[1].split(/[\\/]/).includes('..'))
+  ) {
+    return {
+      ok: false,
+      executable,
+      args,
+      category: 'custom',
+      reason: 'test supports only -e, -f, or -d with one contained relative path',
+    };
+  }
   const denied = DENIED_SUBCOMMANDS[executable];
   if (denied) {
     const sub = args.find((a) => !a.startsWith('-'));
@@ -146,6 +164,38 @@ export class SystemShellRunner implements ShellRunner {
   constructor(private readonly execConfig: ExecutionConfig = ExecutionConfigSchema.parse({})) {}
 
   run(command: string, opts: ShellRunOptions = {}): CommandEvidence {
+    const decision = evaluateCommand(command);
+    if (decision.ok && decision.executable === 'test') {
+      const started = Date.now();
+      const cwd = path.resolve(opts.cwd ?? process.cwd());
+      const target = path.resolve(cwd, decision.args[1]!);
+      const contained = target === cwd || target.startsWith(`${cwd}${path.sep}`);
+      let matches = false;
+      if (contained) {
+        try {
+          const stat = fs.lstatSync(target);
+          if (!stat.isSymbolicLink()) {
+            matches =
+              decision.args[0] === '-e' ||
+              (decision.args[0] === '-f' && stat.isFile()) ||
+              (decision.args[0] === '-d' && stat.isDirectory());
+          }
+        } catch {
+          matches = false;
+        }
+      }
+      return {
+        command,
+        exit_code: matches ? 0 : 1,
+        summary: '',
+        duration_ms: Date.now() - started,
+        blocked: false,
+        category: 'test',
+        sandbox: 'builtin',
+        trust: 'known-script',
+        network: 'none',
+      };
+    }
     const plan = planCommand(command, {
       cwd: opts.cwd ?? process.cwd(),
       config: this.execConfig,

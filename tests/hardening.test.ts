@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { evaluateCommand } from '../src/core/commands.js';
+import { evaluateCommand, SystemShellRunner } from '../src/core/commands.js';
 import { snapshotFiles, diffSnapshots, enforceScopeDelta, pathInScope, ScopeDiffViolationError } from '../src/core/scope.js';
 import { checkSchemaCompatibility, SchemaMismatchError } from '../src/core/manifest.js';
 import { newWorkflow } from '../src/workflows/new.js';
@@ -28,8 +28,27 @@ describe('command policy', () => {
     }
   });
   it('allows normal verification commands', () => {
-    for (const cmd of ['npm run build', 'npm test', 'vitest run', 'npm run typecheck', 'playwright test']) {
+    for (const cmd of ['npm run build', 'npm test', 'vitest run', 'npm run typecheck', 'playwright test', 'test -f package.json']) {
       expect(evaluateCommand(cmd).ok, cmd).toBe(true);
+    }
+  });
+
+  it('runs portable contained file checks without a host shell', () => {
+    const root = tmpProject('rijo-file-test-');
+    try {
+      fs.writeFileSync(path.join(root, 'package.json'), '{}\n');
+      const runner = new SystemShellRunner();
+      expect(runner.run('test -f package.json', { cwd: root })).toMatchObject({
+        exit_code: 0,
+        blocked: false,
+        sandbox: 'builtin',
+        network: 'none',
+      });
+      expect(runner.run('test -d package.json', { cwd: root }).exit_code).toBe(1);
+      expect(evaluateCommand('test -f ../outside').ok).toBe(false);
+      expect(evaluateCommand('test package.json').ok).toBe(false);
+    } finally {
+      cleanup(root);
     }
   });
 
