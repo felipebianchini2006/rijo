@@ -183,7 +183,13 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   const baseUnavailable = Boolean(previous && metadata.is_repo && drift && !drift.accessible);
   const requestedPaths = [...new Set([...scopes, ...(staleMarker?.changed_paths ?? [])])].sort();
   const sameSourceTree = previous?.mapped_tree_hash === currentTreeHash;
-  if (!options.full && !baseUnavailable && requestedPaths.length === 0 && previous?.status === 'COMPLETE' && sameSourceTree) {
+  if (
+    !options.full &&
+    !baseUnavailable &&
+    requestedPaths.length === 0 &&
+    (previous?.status === 'COMPLETE' || previous?.status === 'PARTIAL') &&
+    sameSourceTree
+  ) {
     bus.emit('map.done', { status: 'completed', stage: 'MAP_DONE', message: 'mapa atual; validação concluída sem remapeamento' });
     return completed(ctx, 'Codebase map is fresh; no-op.');
   }
@@ -491,7 +497,17 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
       ]);
     }
     claimReceipts.push(...review.receipts);
-    mapDecisionEnvelopes.push(...(review.envelopes ?? []));
+    if (review.status === 'PARTIAL') {
+      gaps.push(...review.details.map((detail) => `Independent review rejected a non-critical claim: ${detail}`));
+      const approvedClaimIds = new Set(
+        review.receipts
+          .filter((receipt) => receipt.final_disposition === 'APPROVED')
+          .map((receipt) => receipt.claim_id),
+      );
+      claims = claims.filter((claim) => approvedClaimIds.has(claim.claim_id!));
+    } else {
+      mapDecisionEnvelopes.push(...(review.envelopes ?? []));
+    }
     consolidationStatus = review.consolidation;
   } else {
     for (const claim of claims) {
@@ -656,7 +672,7 @@ type ClaimReviewOutcome =
       envelopes: ValidatedAgentEnvelope[];
     }
   | {
-      status: 'REJECTED' | 'INVALID';
+      status: 'PARTIAL' | 'REJECTED' | 'INVALID';
       details: string[];
       receipts: ClaimReviewReceipt[];
       consolidation: 'NOT_REVIEWED';
@@ -724,6 +740,7 @@ async function reviewClaimSet(
   const receipts: ClaimReviewReceipt[] = [];
   const approvedEnvelopes: ValidatedAgentEnvelope[] = [];
   const rejected: string[] = [];
+  let criticalRejection = false;
   for (let index = 0; index < results.length; index++) {
     const result = results[index]!;
     const review = MapReviewSchema.safeParse(result.payload);
@@ -751,18 +768,27 @@ async function reviewClaimSet(
     }
     if (!review.data.approved || review.data.findings.length > 0) {
       discardDecisionProposals(ctx, result);
+      const findingPaths = new Set(review.data.findings.flatMap((finding) => finding.evidence.map((item) => item.path)));
+      const rejectWholeShard = findingPaths.size === 0;
       for (const claim of claimShards[index]!) {
+        const rejectedClaim =
+          rejectWholeShard || claim.evidence.some((evidence) => findingPaths.has(evidence.path));
         receipts.push({
           claim_id: claim.claim_id!,
           source_shard: claim.source_shard!,
           structural_status: 'PASSED',
-          semantic_status: 'REJECTED',
+          semantic_status: rejectedClaim ? 'REJECTED' : 'APPROVED',
           reviewer_attempt: reviewTasks[index]!.id,
           reviewed_at: ctx.now().toISOString(),
           evidence_hash: claimEvidenceHash(claim),
-          final_disposition: 'REJECTED',
+          final_disposition: rejectedClaim ? 'REJECTED' : 'APPROVED',
         });
       }
+      criticalRejection ||= review.data.findings.some(
+        (finding) =>
+          finding.evidence.length === 0 ||
+          ['BAD_PATH', 'BAD_HASH', 'BAD_SYMBOL', 'CONTRADICTION'].includes(finding.code),
+      );
       rejected.push(
         ...(review.data.findings.length > 0
           ? review.data.findings.map((finding) => finding.message)
@@ -785,7 +811,12 @@ async function reviewClaimSet(
     }
   }
   if (rejected.length > 0) {
-    return { status: 'REJECTED', details: rejected, receipts, consolidation: 'NOT_REVIEWED' };
+    return {
+      status: criticalRejection ? 'REJECTED' : 'PARTIAL',
+      details: rejected,
+      receipts,
+      consolidation: 'NOT_REVIEWED',
+    };
   }
   if (claimShards.length > 1) {
     const { result, violation: consolidationViolation } = await dispatchReadOnlyMapConsolidation(

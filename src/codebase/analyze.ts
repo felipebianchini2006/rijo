@@ -423,7 +423,10 @@ export function assessMapCoverage(
       gapRecords.push({
         code: area === 'claims_verified' ? 'REVIEW_INCOMPLETE' : 'COVERAGE_INCOMPLETE',
         category: area === 'claims_verified' ? 'semantic' : 'coverage',
-        severity: area === 'claims_verified' ? 'critical' : 'non_critical',
+        severity:
+          area === 'claims_verified' && approvedClaims === 0 && candidateClaimIds.size > 0
+            ? 'critical'
+            : 'non_critical',
         message,
         affected_paths: affectedPaths,
         affected_modules: affectedModules,

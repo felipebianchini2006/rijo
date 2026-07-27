@@ -112,6 +112,22 @@ describe('rijo map workflow', () => {
     expect(reviewer.return_format).toContain('Evidence must be structured objects');
   });
 
+  it('treats an unchanged valid PARTIAL map as fresh instead of repeatedly remapping it', async () => {
+    const first = await mapWorkflow(root, { full: true }, { ...deps(root), git: new SystemGit() });
+    expect(first.ok).toBe(true);
+    const paths = new RijoPaths(root);
+    const state = JSON.parse(fs.readFileSync(paths.codebaseMapState, 'utf8'));
+    state.status = 'PARTIAL';
+    fs.writeFileSync(paths.codebaseMapState, `${JSON.stringify(state, null, 2)}\n`);
+    git(root, ['add', '.rijo/codebase/map-state.json']);
+    git(root, ['commit', '-m', 'test: retain valid partial map state']);
+    const d = deps(root);
+    const second = await mapWorkflow(root, {}, { ...d, git: new SystemGit() });
+    expect(second.ok).toBe(true);
+    expect(second.message).toContain('fresh');
+    expect(d.runner.executed).toHaveLength(0);
+  });
+
   it('reviews every claim beyond 250 in bounded shards and persists structural and semantic receipts', async () => {
     for (let index = 0; index < 130; index++) {
       const dir = path.join(root, 'packages', `module-${String(index).padStart(3, '0')}`);
@@ -187,6 +203,50 @@ describe('rijo map workflow', () => {
     expect(rejection.status).toBe('REJECTED');
     expect(rejection.receipts.length).toBeGreaterThan(0);
     expect(rejection.receipts.some((receipt: any) => receipt.final_disposition === 'REJECTED')).toBe(true);
+  });
+
+  it('publishes a PARTIAL candidate when review rejects only an evidenced non-critical claim', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id === 'map-review-001',
+      (task) => {
+        const marker = 'CANDIDATE CLAIM SHARD:\n';
+        const claims = JSON.parse(
+          task.notes
+            .slice(task.notes.indexOf(marker) + marker.length)
+            .split('\n\nAUTONOMOUS DECISION POLICY')[0]!,
+        ) as Array<{
+          evidence: Array<{ path: string; file_hash: string; ownership: 'primary' | 'external_contract' }>;
+        }>;
+        return {
+          task_id: task.id,
+          ok: true,
+          summary: 'one non-critical semantic overreach found',
+          files_written: [],
+          payload: {
+            approved: false,
+            findings: [
+              {
+                code: 'MISSING_EVIDENCE',
+                message: 'One convention claim overreaches the cited source.',
+                evidence: claims[0]!.evidence,
+              },
+            ],
+          },
+          scope_requests: [],
+        };
+      },
+    );
+
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+    expect(outcome.ok, outcome.message).toBe(true);
+    const paths = new RijoPaths(root);
+    const state = JSON.parse(fs.readFileSync(paths.codebaseMapState, 'utf8'));
+    const receipts = JSON.parse(fs.readFileSync(path.join(paths.codebaseDir, 'review-receipts.json'), 'utf8'));
+    expect(state.status).toBe('PARTIAL');
+    expect(state.coverage.claims_verified).toBeLessThan(1);
+    expect(receipts.claim_receipts.some((receipt: any) => receipt.final_disposition === 'REJECTED')).toBe(true);
+    expect(receipts.claim_receipts.some((receipt: any) => receipt.final_disposition === 'APPROVED')).toBe(true);
   });
 
   it('refuses a dirty checkout without corrupting the durable checkpoint needed for a clean retry', async () => {

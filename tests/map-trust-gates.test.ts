@@ -366,7 +366,7 @@ describe('map trust gates', () => {
       },
     );
     expect(assessment.coverage.claims_verified).toBe(0.5);
-    expect(assessment.status).toBe('BLOCKED');
+    expect(assessment.status).toBe('PARTIAL');
 
     const superseded = assessMapCoverage(
       inventory,
