@@ -7,11 +7,13 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     testTimeout,
     hookTimeout: testTimeout,
-    pool: 'threads',
-    // Process/fault suites spawn real trees and package fixtures. Bounding
-    // workers prevents host-memory pressure without skipping tests or changing
-    // any per-test deadline.
-    maxWorkers: 4,
+    // Native SQLite bindings and process/fault fixtures need process isolation.
+    // A thread pool can terminate the complete Vitest process when one native
+    // worker faults. Forks keep that boundary without reducing test coverage.
+    pool: 'forks',
+    // Use one fork so native fault fixtures cannot delay worker result delivery.
+    // Keep every test and every per-test deadline unchanged.
+    maxWorkers: 1,
     minWorkers: 1,
   },
 });
