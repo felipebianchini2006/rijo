@@ -1224,7 +1224,10 @@ async function executePhase(
     for (const t of readPlan(pp.plan).tasks) {
       if (t.status === 'IMPLEMENTED' || t.status === 'VERIFIED') transition(t.id, 'VERIFYING');
     }
-    evidences = runVerification(ctx, plan, projectCommands);
+    evidences = [
+      ...prepareProjectDependencies(ctx, phaseBaseline, projectCommands),
+      ...runVerification(ctx, plan, projectCommands),
+    ];
 
     // A command rejected by the security policy is a hard block, never a
     // repairable failure — we do not loop a worker on a forbidden command.
@@ -1517,6 +1520,54 @@ function detectProjectCommands(ctx: WorkflowContext): string[] {
     }
   }
   return commands;
+}
+
+/**
+ * Install newly declared Node.js dependencies through the managed command
+ * gate before project scripts run. The command policy disables lifecycle
+ * scripts and enables network access only for this explicit installation.
+ */
+function prepareProjectDependencies(
+  ctx: WorkflowContext,
+  phaseBaseline: FileSnapshot,
+  projectCommands: string[],
+): CommandEvidence[] {
+  if (!projectCommands.some((command) => command.startsWith('npm run '))) return [];
+  const pkgPath = path.join(ctx.projectRoot, 'package.json');
+  if (!exists(pkgPath)) return [];
+
+  const delta = diffSnapshots(phaseBaseline, snapshotFiles(ctx.projectRoot));
+  const nodeModulesPath = path.join(ctx.projectRoot, 'node_modules');
+  if (!delta.changed.includes('package.json') && exists(nodeModulesPath)) return [];
+
+  let packageCount = 0;
+  try {
+    const pkg = JSON.parse(readText(pkgPath)) as {
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+      optionalDependencies?: Record<string, unknown>;
+    };
+    packageCount =
+      Object.keys(pkg.dependencies ?? {}).length +
+      Object.keys(pkg.devDependencies ?? {}).length +
+      Object.keys(pkg.optionalDependencies ?? {}).length;
+  } catch {
+    return [];
+  }
+  if (packageCount === 0) return [];
+
+  const command = 'npm install --no-audit --no-fund';
+  const evidence = ctx.shell.run(command, {
+    cwd: ctx.projectRoot,
+    allowInstall: true,
+    timeoutMs: 10 * 60 * 1000,
+  });
+  ctx.bus.emit(
+    'run.verify_command',
+    { message: `${command} → exit ${evidence.exit_code}` },
+    { command, exit: evidence.exit_code, managed_install: true },
+  );
+  return [evidence];
 }
 
 function runVerification(ctx: WorkflowContext, plan: PhasePlan, projectCommands: string[]): CommandEvidence[] {

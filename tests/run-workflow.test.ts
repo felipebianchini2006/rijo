@@ -9,7 +9,7 @@ import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { readPlan } from '../src/core/plan.js';
 import { FakeShellRunner } from '../src/core/commands.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds, newMappedReference } from './helpers.js';
 
 function milestoneDir(root: string): string {
   const paths = new RijoPaths(root);
@@ -83,6 +83,78 @@ describe('rijo run', () => {
     expect(roadmap.phases.every((p) => p.status === 'DONE')).toBe(true);
     // one commit per verified phase
     expect(d.git.commits.filter((c) => c.message.includes('verified'))).toHaveLength(2);
+  });
+
+  it('installs newly declared Node.js dependencies through the managed gate before verification', async () => {
+    const d = deps(root, {
+      planPayload: (phaseId) => {
+        const requirementIds = phaseReqIds(root, phaseId);
+        return {
+          phase: phaseId,
+          tasks: [
+            {
+              id: 'T01',
+              name: 'Create the Node.js project manifest',
+              requirement_ids: requirementIds,
+              technical_justification: null,
+              files: ['package.json'],
+              mapped_references: [newMappedReference('package.json')],
+              write_scope: ['package.json'],
+              depends_on: [],
+              parallel: false,
+              tdd: false,
+              tests: ['npm run typecheck'],
+              evidence_expected: 'The type check exits with status 0.',
+            },
+            {
+              id: 'T02',
+              name: 'Add a typed source module',
+              requirement_ids: [],
+              technical_justification: 'The source module proves that the configured compiler can load project code.',
+              files: ['src/a.ts'],
+              mapped_references: [newMappedReference('src/a.ts')],
+              write_scope: ['src/a.ts'],
+              depends_on: ['T01'],
+              parallel: false,
+              tdd: false,
+              tests: ['npm run typecheck'],
+              evidence_expected: 'The source module passes the project type check.',
+            },
+          ],
+        };
+      },
+    });
+    d.runner.on(
+      (task) => task.id === 'exec-01-T01',
+      (task) => {
+        const target = path.join(task.workspace!.root, 'package.json');
+        fs.writeFileSync(target, JSON.stringify({
+          name: 'managed-install-fixture',
+          version: '1.0.0',
+          private: true,
+          scripts: { typecheck: 'tsc --noEmit' },
+          devDependencies: { typescript: '^5.9.0' },
+        }));
+        return ok(task, {
+          files_written: ['package.json'],
+          payload: { done: true, notes: 'Created the manifest.' },
+        });
+      },
+    );
+
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const outcome = await runWorkflow(root, {}, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const installIndex = d.shell.calls.indexOf('npm install --no-audit --no-fund');
+    const typecheckIndex = d.shell.calls.indexOf('npm run typecheck');
+    expect(installIndex).toBeGreaterThanOrEqual(0);
+    expect(typecheckIndex).toBeGreaterThan(installIndex);
+    expect(d.shell.callOptions[installIndex]).toMatchObject({
+      cwd: root,
+      allowInstall: true,
+      timeoutMs: 10 * 60 * 1000,
+    });
   });
 
   it('rejects an inconsistent plan (lint) and blocks after the revision limit', async () => {

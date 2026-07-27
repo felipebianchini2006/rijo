@@ -195,6 +195,7 @@ export class SystemShellRunner implements ShellRunner {
 /** Test double: scripted responses per command pattern; still runs policy validation. */
 export class FakeShellRunner implements ShellRunner {
   public readonly calls: string[] = [];
+  public readonly callOptions: ShellRunOptions[] = [];
   constructor(
     private readonly script: Array<{ match: RegExp; exitCode: number; output?: string }> = [],
     private readonly defaultExit = 0,
@@ -202,8 +203,9 @@ export class FakeShellRunner implements ShellRunner {
     private readonly enforcePolicy = false,
   ) {}
 
-  run(command: string): CommandEvidence {
+  run(command: string, opts: ShellRunOptions = {}): CommandEvidence {
     this.calls.push(command);
+    this.callOptions.push(opts);
     if (this.enforcePolicy) {
       const decision = evaluateCommand(command);
       if (!decision.ok) {
