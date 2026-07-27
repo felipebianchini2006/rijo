@@ -129,7 +129,16 @@ export function createFixture(tarball: string, prefix: string, configYaml: strin
   pkg.scripts = { test: 'node --test' };
   fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
-  execFileSync('npm', ['install', tarball, '--no-audit', '--no-fund'], { cwd: root, encoding: 'utf8' });
+  execFileSync(
+    'npm',
+    ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'],
+    { cwd: root, encoding: 'utf8' },
+  );
+  execFileSync(
+    'npm',
+    ['install', tarball, '--no-save', '--package-lock=false', '--no-audit', '--no-fund'],
+    { cwd: root, encoding: 'utf8' },
+  );
   const cliEntry = path.join(root, 'node_modules', 'rijo', 'dist', 'cli', 'index.js');
   expect(fs.existsSync(cliEntry), `installed CLI missing at ${cliEntry}`).toBe(true);
 
@@ -141,6 +150,16 @@ export function createFixture(tarball: string, prefix: string, configYaml: strin
 
   fs.writeFileSync(path.join(root, '.gitignore'), ['node_modules/', '*.tgz', ''].join('\n'));
   fs.writeFileSync(path.join(root, 'PLANO.md'), PLAN_CONTENT);
+  execFileSync(
+    'git',
+    ['add', '.gitignore', 'PLANO.md', 'package.json', 'package-lock.json'],
+    { cwd: root, encoding: 'utf8' },
+  );
+  execFileSync(
+    'git',
+    ['commit', '-m', 'test: seed clean client repository'],
+    { cwd: root, encoding: 'utf8' },
+  );
 
   fs.mkdirSync(path.join(root, '.rijo'), { recursive: true });
   fs.writeFileSync(path.join(root, '.rijo', 'config.yml'), configYaml);

@@ -8,5 +8,10 @@ export default defineConfig({
     testTimeout,
     hookTimeout: testTimeout,
     pool: 'threads',
+    // Process/fault suites spawn real trees and package fixtures. Bounding
+    // workers prevents host-memory pressure without skipping tests or changing
+    // any per-test deadline.
+    maxWorkers: 4,
+    minWorkers: 1,
   },
 });

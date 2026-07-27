@@ -71,6 +71,34 @@ function toolVersion(bin: string, args: string[], cwd?: string): string {
   return r.status === 0 ? (r.stdout ?? '').trim() : 'unavailable';
 }
 
+function requiresBrowserGate(
+  projectRoot: string,
+  config: RijoConfig,
+  acceptanceById: Record<string, string>,
+): boolean {
+  if (config.qa.surface === 'web') return true;
+  if (config.qa.surface === 'non_web') return false;
+  if (config.qa.start_command.length > 0 || config.qa.health_url.length > 0) return true;
+
+  const pkg = readJsonIfExists<{
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+    scripts?: Record<string, string>;
+  }>(path.join(projectRoot, 'package.json'));
+  const dependencyNames = Object.keys({
+    ...(pkg?.dependencies ?? {}),
+    ...(pkg?.devDependencies ?? {}),
+  });
+  const webDependency = dependencyNames.some((name) =>
+    /^(?:@playwright\/test|next|nuxt|react|react-dom|vue|svelte|@sveltejs\/kit|astro|vite|angular|@angular\/core)$/.test(name),
+  );
+  const webScript = Boolean(pkg?.scripts?.['dev'] || pkg?.scripts?.['start']);
+  const browserAcceptance = Object.values(acceptanceById).some((text) =>
+    /\b(?:browser|page|screen|viewport|desktop|mobile|click|form|frontend|ui|web|navegador|página|tela|responsiv|botão|formulário)\b/i.test(text),
+  );
+  return webDependency || webScript || browserAcceptance;
+}
+
 export async function runProductionGate(
   deps: GateDeps,
   journeys: Journey[],
@@ -78,6 +106,7 @@ export async function runProductionGate(
 ): Promise<GateReport> {
   const { projectRoot, git, config, now } = deps;
   const qa = config.qa;
+  const browserGate = requiresBrowserGate(projectRoot, config, acceptanceById);
   const blockedReport = (reasons: string[], testedCommit = ''): GateReport => ({
     status: 'blocked',
     tested_commit: testedCommit,
@@ -107,17 +136,19 @@ export async function runProductionGate(
 
   // ---- 2: configuration completeness
   const configIssues: string[] = [];
-  if (qa.start_command.length === 0) configIssues.push('qa.start_command is empty');
-  if (!qa.health_url) configIssues.push('qa.health_url is not set');
-  if (qa.browsers.length === 0) configIssues.push('qa.browsers is empty');
   const actionsByJourney: Record<string, JourneyAction[]> = {};
-  for (const j of journeys) {
-    const actions = loadJourneyActions(deps.qaDir, j.id);
-    if (!actions) configIssues.push(`journey ${j.id} has no structured actions file (qa/journeys/${j.id.toLowerCase()}.actions.json)`);
-    else actionsByJourney[j.id] = actions.actions;
-  }
-  for (const b of qa.browsers) {
-    if (!browserInstalled(b)) configIssues.push(`Playwright browser "${b}" is not installed (run: playwright install ${b})`);
+  if (browserGate) {
+    if (qa.start_command.length === 0) configIssues.push('qa.start_command is empty');
+    if (!qa.health_url) configIssues.push('qa.health_url is not set');
+    if (qa.browsers.length === 0) configIssues.push('qa.browsers is empty');
+    for (const j of journeys) {
+      const actions = loadJourneyActions(deps.qaDir, j.id);
+      if (!actions) configIssues.push(`journey ${j.id} has no structured actions file (qa/journeys/${j.id.toLowerCase()}.actions.json)`);
+      else actionsByJourney[j.id] = actions.actions;
+    }
+    for (const b of qa.browsers) {
+      if (!browserInstalled(b)) configIssues.push(`Playwright browser "${b}" is not installed (run: playwright install ${b})`);
+    }
   }
   if (configIssues.length > 0) return blockedReport(configIssues.map((i) => `Gate configuration incomplete: ${i}`), commit);
 
@@ -141,7 +172,7 @@ export async function runProductionGate(
     );
     if (!pkg) return blockedReport(['Gate checkout has no package.json.'], commit);
     const hasPlaywright = Boolean(pkg.devDependencies?.['@playwright/test'] || pkg.dependencies?.['@playwright/test']);
-    if (!hasPlaywright) {
+    if (browserGate && !hasPlaywright) {
       return blockedReport(['Target project does not declare @playwright/test; the gate cannot run real browser journeys.'], commit);
     }
     if (exists(path.join(gateDir, 'package-lock.json'))) {
@@ -156,12 +187,48 @@ export async function runProductionGate(
     }
 
     // ---- 5: deterministic checks inside the CHECKOUT (the exact commit)
+    const deterministicCheckStart = commands.length;
     for (const script of ['typecheck', 'lint', 'build', 'test']) {
       if (pkg.scripts?.[script]) {
         const ev = deps.shell.run(`npm run ${script}`, { cwd: gateDir });
         commands.push(ev);
         deps.emit('gate.check', `${script} → exit ${ev.exit_code}`);
       }
+    }
+
+    if (!browserGate) {
+      const checks = commands.slice(deterministicCheckStart);
+      if (checks.length === 0) {
+        return {
+          ...blockedReport(['Non-web project has no executable typecheck, lint, build, or test script to certify.'], commit),
+          commands,
+        };
+      }
+      const failedChecks = checks.filter((command) => command.exit_code !== 0);
+      const passed = failedChecks.length === 0;
+      return {
+        status: passed ? 'passed' : 'failed',
+        tested_commit: commit,
+        reasons: passed
+          ? ['Non-web surface: all deterministic checks passed in a clean checkout of the exact commit; browser gates are not applicable.']
+          : failedChecks.map((command) => `Check failed: ${command.command} (exit ${command.exit_code})`),
+        commands,
+        journeys: journeys.map((journey) => ({
+          id: journey.id,
+          requirement_ids: journey.requirement_ids,
+          spec: null,
+          passed,
+          evidence: checks.map((command) => command.command),
+          failures: passed ? [] : failedChecks.map((command) => `${command.command} exited ${command.exit_code}`),
+        })),
+        tool_versions: {
+          node: toolVersion(process.execPath, ['--version']),
+          npm: toolVersion('npm', ['--version']),
+          rijo_gate: 'deterministic non-web v1',
+        },
+        evidence_dir: evidenceDir,
+        server_log: null,
+      };
     }
 
     // ---- 6: deterministic spec codegen + anti-placeholder lint

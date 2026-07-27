@@ -12,7 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # macos-15 is Apple Silicon; macos-15-intel is GitHub's supported
+        # x86_64 compatibility image through August 2027.
+        os: [ubuntu-latest, windows-latest, macos-15, macos-15-intel]
         node: [22.x, 24.x]
     steps:
       - uses: actions/checkout@v4
@@ -30,9 +32,8 @@ jobs:
       # including tests/pack.e2e.test.ts which packs the tarball, installs it
       # into an empty fixture and executes the packaged CLI.
       #
-      # tests/gate.e2e.test.ts and tests/sandbox.test.ts are gated on
-      # darwin + sandbox availability and self-skip on linux/windows, so no
-      # browser/sandbox provisioning is required in CI.
+      # The macOS legs exercise the real browser/sandbox gates in addition to
+      # the portable unit, integration and recovery suites.
       - run: npm test
 
       - run: npm run build
@@ -66,6 +67,10 @@ jobs:
 
           echo "== ESM import surface =="
           node -e "import('rijo').then(m => console.log(Object.keys(m)))"
+
+          echo "== packaged SQLite driver + integrity + backup =="
+          node --input-type=module -e "import { SqliteStateStore } from 'rijo'; const store = new SqliteStateStore({ projectRoot: process.cwd() }); await store.initialize(); const result = await store.integrityCheck(); if (!result.ok) throw new Error(result.errors.join('; ')); await store.createBackup('.rijo/state/backups/ci.sqlite'); await store.close();"
+          test -f .rijo/state/backups/ci.sqlite
 
   security:
     runs-on: ubuntu-latest
