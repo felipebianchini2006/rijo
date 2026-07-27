@@ -576,6 +576,7 @@ async function executePhase(
     ].join('\n'),
     config.context_budget_bytes,
   );
+  const hasPlanningMap = readMapState(paths) !== null;
   let plan: PhasePlan | null = exists(pp.plan) && !forceReplan ? readPlan(pp.plan) : null;
   let revisions = 0;
   let reviewNotes: string[] = [];
@@ -594,7 +595,11 @@ async function executePhase(
         acceptance_criteria: ['2-4 tasks', 'every task writes at least one concrete file (non-empty files[] and write_scope[])', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
         verification_commands: [],
         return_format:
-          'JSON payload matching PhasePlanDraft: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 exact path*/], mapped_references:[{path,intent:"existing",file_hash,symbol?}|{path,intent:"new",parent_module,placement_evidence:[{path,reason}]}] /* required and must cover every task file */, write_scope[/*only exact declared files*/], depends_on[], parallel, tdd, tests[/*executable command strings only, e.g. "npm test"*/], evidence_expected}]}. Existing paths must use current hashes; new paths must extend a mapped module and cite real placement evidence. Never omit mapped_references. Put behavioral scenarios in evidence_expected, not tests[].',
+          'JSON payload matching PhasePlanDraft: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 exact path*/], mapped_references:[{path,intent:"existing",file_hash,symbol?}|{path,intent:"new",parent_module,placement_evidence:[{path,reason}]}] /* required and must cover every task file */, write_scope[/*only exact declared files*/], depends_on[], parallel, tdd, tests[/*executable command strings only, e.g. "npm test"*/], evidence_expected}]}. ' +
+          (hasPlanningMap
+            ? 'Existing paths must use current hashes; new paths must extend a mapped module and cite real placement evidence.'
+            : 'This is a greenfield phase with no codebase map: every task file is intent:"new", parent_module:"project-root", and placement_evidence must cite package.json as the existing project-root bootstrap contract.') +
+          ' Never omit mapped_references. Put behavioral scenarios in evidence_expected, not tests[].',
         notes: [
           planningMapContext.text,
           reviewNotes.length ? `Previous review issues to address:\n${reviewNotes.join('\n')}` : '',
