@@ -9,6 +9,8 @@ import {
   readTextIfExists,
   writeFileAtomic,
 } from '../core/fsx.js';
+import { computePlanHash } from '../durable/engine.js';
+import { ensureDurableGitignore } from '../durable/ignore.js';
 import { serializeFrontmatter } from '../core/frontmatter.js';
 import { milestonePaths } from '../core/paths.js';
 import { defaultConfig, saveConfig } from '../core/config.js';
@@ -40,12 +42,14 @@ import {
   createContext,
   withLock,
   blocked,
+  blockedReadOnly,
   completed,
   failed,
   dispatch,
   dispatchBatch,
   commitDecisionProposals,
   discardDecisionProposals,
+  durableCheckpoint,
   isWorkflowCancellation,
   type WorkflowDeps,
   type WorkflowOutcome,
@@ -141,19 +145,48 @@ export async function newWorkflow(
   if (!exists(planPath)) {
     return failed(ctx, `Plan file not found: ${opts.planFile}`);
   }
+  // Hash the exact bytes whose content is planned below. The durable ledger
+  // uses this identity to distinguish resume from a genuinely new contract.
+  const planContent = readText(planPath);
+  const planHash = computePlanHash(planContent);
   const hasRijo = exists(paths.manifest);
-  if (hasRijo && !opts.next) {
-    return blocked(
-      ctx,
-      'A RIJO project already exists here. Re-initialization is refused (non-destructive).',
-      [`To start the next milestone run: rijo new @${path.basename(planPath)} --next`],
-    );
-  }
   if (!hasRijo && opts.next) {
     return failed(ctx, '--next requires an existing RIJO project; run rijo new without --next first.');
   }
 
   return withLock(ctx, async () => {
+    if (opts.next && ctx.durableRun?.disposition === 'resumed') {
+      return blockedReadOnly(
+        ctx,
+        'The active durable run must reach a terminal checkpoint before a new milestone can start.',
+        ['Resume the active run before retrying this --next contract.'],
+      );
+    }
+    if (ctx.durableRun?.disposition === 'plan_mismatch') {
+      return blockedReadOnly(
+        ctx,
+        opts.next
+          ? 'The active durable run must reach a terminal checkpoint before a new milestone can start.'
+          : 'The plan differs from the active durable run; ambiguous reuse is refused.',
+        opts.next
+          ? ['Resume the active run with its original plan before retrying this --next contract.']
+          : [`To start the next milestone run: rijo new @${path.basename(planPath)} --next`],
+      );
+    }
+    if (hasRijo && !opts.next) {
+      if (opts.run && ctx.durableRun?.disposition === 'resumed') {
+        bus.emit('run.resumed', {
+          status: 'running',
+          message: `retomando run ${ctx.durableRun.runId} para o mesmo plan_hash`,
+        });
+        return runCore(ctx, { target: 'all' });
+      }
+      return blockedReadOnly(
+        ctx,
+        'A RIJO project already exists here. Re-initialization is refused (non-destructive).',
+        [`To start the next milestone run: rijo new @${path.basename(planPath)} --next`],
+      );
+    }
     bus.emit('new.start', { status: 'running', stage: 'ANALYZE', message: 'validando repositório e entrada' });
 
     // ---- git
@@ -206,7 +239,6 @@ export async function newWorkflow(
 
     // ---- read the plan and extract structure via planner agent
     bus.emit('new.analyze', { stage: 'ANALYZE', message: 'extraindo escopo e requisitos do plano' });
-    const planContent = readText(planPath);
     let codebaseContext = '';
     if (brown.isBrownfield) {
       const ensured = await ensureCodebaseMap(ctx, {
@@ -328,8 +360,9 @@ export async function newWorkflow(
       ensureDir(paths.archiveDir);
       ensureDir(paths.researchDir);
       // volatile internals never enter version control
-      writeFileAtomic(path.join(paths.root, '.gitignore'), ['runtime/', 'events.jsonl', 'archive/', ''].join('\n'));
-    if (!exists(paths.config)) saveConfig(paths, defaultConfig());
+      writeFileAtomic(path.join(paths.root, '.gitignore'), ['runtime/', 'archive/', ''].join('\n'));
+      ensureDurableGitignore(projectRoot);
+      if (!exists(paths.config)) saveConfig(paths, defaultConfig());
       writeManifest(paths, newManifest(now));
     }
     const newId = nextMilestoneId(readManifest(paths));
@@ -659,6 +692,9 @@ export async function newWorkflow(
       }
     }
     if (extractionEnvelope) commitDecisionProposals(ctx, extractionEnvelope);
+    await durableCheckpoint(ctx, `milestone:${milestone.id}:created`, {
+      commit: ctx.git.headCommit(projectRoot),
+    });
 
     bus.emit(
       'new.done',
@@ -680,6 +716,9 @@ export async function newWorkflow(
       return runCore(ctx, { target: 'all' });
     }
     return completed(ctx, `Milestone ${milestone.id} created (${requirements.length} requirements, ${phases.length} phases).`);
+  }, {
+    run: { plan: planContent, planHash, next: Boolean(opts.next), host: ctx.hostProvider },
+    terminal: Boolean(opts.run),
   });
 }
 

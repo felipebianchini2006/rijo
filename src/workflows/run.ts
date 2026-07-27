@@ -39,6 +39,7 @@ import {
   dispatchReadOnly,
   commitDecisionProposals,
   discardDecisionProposals,
+  durableCheckpoint,
   isWorkflowCancellation,
   type ReplaceableAttempt,
   type WorkflowContext,
@@ -46,6 +47,7 @@ import {
   type WorkflowOutcome,
   type ValidatedAgentEnvelope,
 } from './shared.js';
+import { checkCore } from './check.js';
 import { inferSecurityTag, inferHighRisk } from './routing.js';
 import { stageFinalization } from './finalize.js';
 import {
@@ -60,6 +62,8 @@ import { ensureCodebaseMap } from './map.js';
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
   target?: string;
+  /** Explicit programmatic opt-in/out for the same-lock production --fix gate. */
+  finalCheck?: boolean;
 }
 
 const ReviewPayloadSchema = z.object({
@@ -206,7 +210,10 @@ export async function runWorkflow(
   if (!exists(ctx.paths.manifest)) {
     return failed(ctx, 'No RIJO project here. Run `rijo new @PLAN.md` first.');
   }
-  return withLock(ctx, () => runCore(ctx, opts));
+  const autonomous = Boolean(ctx.durable) && (opts.finalCheck ?? (opts.target === undefined || opts.target === 'all'));
+  return withLock(ctx, () => runCore(ctx, opts), {
+    terminal: autonomous,
+  });
 }
 
 /**
@@ -216,6 +223,7 @@ export async function runWorkflow(
  */
 export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Promise<WorkflowOutcome> {
   const { paths, bus } = ctx;
+  const autonomous = Boolean(ctx.durable) && (opts.finalCheck ?? (opts.target === undefined || opts.target === 'all'));
   {
     // ---- LOAD
     bus.emit('run.load', { status: 'running', stage: 'LOAD', message: 'validando manifest, drift e checkpoint' });
@@ -255,9 +263,10 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
     }
 
     const roadmap = readRoadmap(milestone.paths.roadmap);
-    const targets = resolveTargets(ctx, roadmap, opts.target);
+    const targets = resolveTargets(ctx, roadmap, autonomous ? 'all' : opts.target);
     if (targets.length === 0) {
       const allDone = roadmap.phases.every((p) => p.status === 'DONE');
+      if (allDone && autonomous) return runAutonomousFinalCheck(ctx);
       return completed(
         ctx,
         allDone ? `All ${roadmap.phases.length} phases of ${milestone.id} are DONE.` : 'No ready phase (check dependencies/blockers).',
@@ -267,10 +276,27 @@ export async function runCore(ctx: WorkflowContext, opts: RunOptions = {}): Prom
     for (const phase of targets) {
       const outcome = await executePhase(ctx, milestone, phase);
       if (!outcome.ok) return outcome;
-      if (opts.target !== 'all') return outcome;
+      await durableCheckpoint(ctx, `phase:${phase.id}:completed`, {
+        commit: ctx.git.headCommit(ctx.projectRoot),
+      });
+      if (!autonomous && opts.target !== 'all') return outcome;
     }
+    if (autonomous) return runAutonomousFinalCheck(ctx);
     return completed(ctx, `Completed ${targets.length} phase(s) of ${milestone.id}.`);
   }
+}
+
+async function runAutonomousFinalCheck(ctx: WorkflowContext): Promise<WorkflowOutcome> {
+  ctx.bus.emit('run.final_check', {
+    status: 'running',
+    stage: 'CHECKS',
+    message: 'todas as fases concluídas; executando check de produção com correção limitada',
+  });
+  await durableCheckpoint(ctx, 'run:before-final-check', {
+    commit: ctx.git.headCommit(ctx.projectRoot),
+  });
+  const check = ctx.finalCheck ?? checkCore;
+  return check(ctx, { production: true, fix: true });
 }
 
 function resolveTargets(ctx: WorkflowContext, roadmap: RoadmapDoc, target?: string): RoadmapPhase[] {
@@ -1061,7 +1087,12 @@ async function executePhase(
     }
 
     for (const t of readPlan(pp.plan).tasks) {
-      if (t.status === 'VERIFYING') transition(t.id, 'VERIFIED');
+      if (t.status === 'VERIFYING') {
+        transition(t.id, 'VERIFIED');
+        await durableCheckpoint(ctx, `task:${phase.id}:${t.id}:verified`, {
+          commit: ctx.git.headCommit(ctx.projectRoot),
+        });
+      }
     }
 
     stage('CODE_REVIEW', 'revisão independente do código');

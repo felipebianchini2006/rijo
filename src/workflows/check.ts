@@ -43,6 +43,25 @@ export async function checkWorkflow(
   deps: WorkflowDeps = {},
 ): Promise<WorkflowOutcome> {
   const ctx = createContext(projectRoot, deps);
+  if (!exists(ctx.paths.manifest)) return failed(ctx, 'No RIJO project here. Run `rijo new @PLAN.md` first.');
+  return withLock(ctx, () => checkCore(ctx, opts), {
+    // A local diagnostic check is not a terminal production verdict. The
+    // autonomous run owns terminalization around its same-lock production
+    // check; standalone check may terminalize only when explicitly production.
+    terminal: Boolean(ctx.durable) && Boolean(opts.production),
+  });
+}
+
+/**
+ * Production/local readiness core for composition under an existing lock.
+ * `runCore` calls this directly after the last phase, so autonomous completion
+ * cannot deadlock by trying to acquire the project lock a second time.
+ */
+export async function checkCore(
+  ctx: WorkflowContext,
+  opts: CheckOptions = {},
+): Promise<WorkflowOutcome> {
+  const projectRoot = ctx.projectRoot;
   const { paths, bus, config, now } = ctx;
   if (!exists(paths.manifest)) return failed(ctx, 'No RIJO project here. Run `rijo new @PLAN.md` first.');
   const schemaGuard = guardSchema(ctx);
@@ -50,7 +69,6 @@ export async function checkWorkflow(
   const milestone = activeMilestone(paths);
   if (!milestone) return failed(ctx, 'No active milestone.');
 
-  return withLock(ctx, async () => {
     // ---- 1: pin commit and environment
     const commit = ctx.git.headCommit(projectRoot);
     const environment = opts.production ? 'production-candidate' : 'local';
@@ -246,7 +264,6 @@ export async function checkWorkflow(
       message: `Production readiness: ${decision.status}.`,
       details,
     };
-  });
 }
 
 /**

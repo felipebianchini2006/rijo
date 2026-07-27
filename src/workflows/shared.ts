@@ -7,7 +7,13 @@ import { reconcileTransactions, type TxnHooks } from '../core/txn.js';
 import type { FinalizeHooks } from '../core/finalize.js';
 import { reconcileFinalization } from './finalize.js';
 import { loadConfig } from '../core/config.js';
-import { ProgressBus, consoleSink, newRunId, type ProgressSink } from '../core/progress.js';
+import {
+  ProgressBus,
+  consoleSink,
+  newRunId,
+  type DurableProgressRecorder,
+  type ProgressSink,
+} from '../core/progress.js';
 import { acquireLock, RECOMMENDED_RENEW_MS } from '../core/locks.js';
 import { readState, writeState } from '../core/state.js';
 import { SchemaMismatchError, touchManifest } from '../core/manifest.js';
@@ -34,6 +40,43 @@ import {
 
 export type { DispatchRouting } from './routing.js';
 
+export type DurableTerminalStatus = 'READY' | 'NOT_READY' | 'BLOCKED';
+
+export interface DurableRunBinding {
+  runId: string;
+  disposition: 'created' | 'resumed' | 'plan_mismatch';
+  planHash: string | null;
+  existingPlanHash?: string | null;
+}
+
+/**
+ * Workflow-facing port of DurableStateEngine. Workflows know nothing about
+ * SQLite: they provide identities and lifecycle boundaries while the engine
+ * owns transactions, events, outbox projections, snapshots and rebuild.
+ */
+export interface DurableWorkflowEngine extends DurableProgressRecorder {
+  initialize(): Promise<void>;
+  recover(): Promise<void>;
+  beginOrResumeRun(input: {
+    requestedRunId: string;
+    /** Canonical plan source, when the command is `new`; adapters may hash it internally. */
+    plan?: string;
+    planHash?: string;
+    next?: boolean;
+    host?: string;
+    startedCommit?: string | null;
+  }): Promise<DurableRunBinding>;
+  createCheckpoint(input: { reason: string; commit?: string | null }): Promise<void>;
+  createSnapshot(input: { reason: string }): Promise<void>;
+  markTerminal(input: {
+    status: DurableTerminalStatus;
+    reason: string;
+    commit?: string | null;
+  }): Promise<void>;
+  flush(): Promise<void>;
+  close(): Promise<void>;
+}
+
 export interface WorkflowContext {
   projectRoot: string;
   paths: RijoPaths;
@@ -45,6 +88,12 @@ export interface WorkflowContext {
   shell: ShellRunner;
   git: GitOps;
   now: () => Date;
+  /** Effective CLI host after resolving `--host` over config defaults. */
+  hostProvider: RijoConfig['host']['provider'];
+  durable: DurableWorkflowEngine | null;
+  durableRun: DurableRunBinding | null;
+  /** Same-context production gate used by autonomous run completion. */
+  finalCheck?: (ctx: WorkflowContext, opts: { production?: boolean; fix?: boolean }) => Promise<WorkflowOutcome>;
   /** Crash-injection and durability hooks shared by canonical transactions, including codebase-map promotion. */
   txnHooks: TxnHooks;
   /** Test seam: fault injection at each durable phase-finalization step. */
@@ -71,6 +120,12 @@ export interface WorkflowDeps {
   git?: GitOps;
   sink?: ProgressSink;
   now?: () => Date;
+  /** Effective host selected by an embedding CLI boundary. */
+  hostProvider?: RijoConfig['host']['provider'];
+  /** Durable engine injection. Production wiring supplies the SQLite-backed implementation. */
+  durable?: DurableWorkflowEngine | null;
+  /** Programmatic seam; autonomous CLI uses checkCore in the same lock. */
+  finalCheck?: WorkflowContext['finalCheck'];
   /** test seam: fault injection inside milestone transactions. */
   txnHooks?: TxnHooks;
   /** test seam: fault injection at each durable phase-finalization step. */
@@ -112,6 +167,10 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     shell: deps.shell ?? new SystemShellRunner(config.execution),
     git: deps.git ?? new SystemGit(),
     now,
+    hostProvider: deps.hostProvider ?? config.host.provider,
+    durable: deps.durable ?? null,
+    durableRun: null,
+    ...(deps.finalCheck ? { finalCheck: deps.finalCheck } : {}),
     txnHooks: deps.txnHooks ?? {},
     finalizeHooks: deps.finalizeHooks ?? {},
     openDecisionEnvelopes: new Set(),
@@ -170,16 +229,14 @@ export function guardSchema(ctx: WorkflowContext): WorkflowOutcome | null {
 export async function withLock<T>(
   ctx: WorkflowContext,
   body: () => Promise<T>,
-  opts: { ttlMs?: number; renewMs?: number } = {},
+  opts: {
+    ttlMs?: number;
+    renewMs?: number;
+    run?: { plan?: string; planHash?: string; next?: boolean; host?: string };
+    terminal?: boolean;
+  } = {},
 ): Promise<T> {
   const handle = acquireLock(ctx.paths.lock, ctx.bus.runId, ctx.now, { ttlMs: opts.ttlMs });
-  if (handle.reclaimedAttempts.length > 0) {
-    ctx.bus.emit(
-      'lock.reclaimed',
-      { message: `lock reciclado; ${handle.reclaimedAttempts.length} attempt(s) órfão(s) para recovery` },
-      { attempts: handle.reclaimedAttempts },
-    );
-  }
   // Real (non-injected) timers: the lease must keep renewing on wall-clock
   // time regardless of ctx.now, and unref() so it never keeps the process alive.
   const renewTimer = setInterval(() => {
@@ -190,7 +247,42 @@ export async function withLock<T>(
     }
   }, opts.renewMs ?? RECOMMENDED_RENEW_MS);
   renewTimer.unref();
+  let durableInitialized = false;
   try {
+    if (ctx.durable) {
+      // Set before awaiting so a partially opened driver is still given a
+      // deterministic close opportunity when initialize() rejects.
+      durableInitialized = true;
+      await ctx.durable.initialize();
+      await ctx.durable.recover();
+      ctx.durableRun = await ctx.durable.beginOrResumeRun({
+        requestedRunId: ctx.bus.runId,
+        ...(opts.run?.plan !== undefined ? { plan: opts.run.plan } : {}),
+        ...(opts.run?.planHash ? { planHash: opts.run.planHash } : {}),
+        ...(opts.run?.next !== undefined ? { next: opts.run.next } : {}),
+        host: opts.run?.host ?? ctx.hostProvider,
+        startedCommit: ctx.git.headCommit(ctx.projectRoot),
+      });
+      // A changed plan without --next is a read-only refusal. Do not attach the
+      // bus to the prior run or write a BLOCKED event into somebody else's
+      // ledger; the caller reports the mismatch without mutating that run.
+      if (ctx.durableRun.disposition !== 'plan_mismatch') {
+        ctx.bus.attachDurable(ctx.durable, ctx.durableRun.runId);
+      } else {
+        // A plan mismatch is an input refusal, not startup recovery. Even
+        // legacy recovery can roll transactions forward, reconcile attempts,
+        // delete orphan workspaces or finalize a phase; none of those writes
+        // may happen while deciding whether this command owns the active run.
+        return await body();
+      }
+    }
+    if (handle.reclaimedAttempts.length > 0) {
+      ctx.bus.emit(
+        'lock.reclaimed',
+        { message: `lock reciclado; ${handle.reclaimedAttempts.length} attempt(s) órfão(s) para recovery` },
+        { attempts: handle.reclaimedAttempts },
+      );
+    }
     // Startup reconciliation runs for EVERY workflow, under the lock, before the
     // body observes anything. Order matters:
     //   (a) roll interrupted milestone transactions back/forward;
@@ -232,10 +324,97 @@ export async function withLock<T>(
     // never observes a phase that is DONE-on-disk yet uncommitted.
     await reconcileFinalization(ctx);
 
-    return await body();
+    const result = await body();
+    if (
+      ctx.durable &&
+      opts.terminal &&
+      ctx.durableRun?.disposition !== 'plan_mismatch' &&
+      isWorkflowOutcome(result)
+    ) {
+      await persistDurableTerminal(ctx, result);
+    }
+    return result;
   } finally {
     clearInterval(renewTimer);
-    handle.release();
+    try {
+      if (ctx.durable && durableInitialized) {
+        try {
+          await ctx.bus.flushDurable();
+          await ctx.durable.flush();
+          commitPortableDurableArtifacts(ctx, 'workflow projection flush');
+        } finally {
+          await ctx.durable.close();
+        }
+      }
+    } finally {
+      handle.release();
+    }
+  }
+}
+
+function isWorkflowOutcome(value: unknown): value is WorkflowOutcome {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<WorkflowOutcome>;
+  return typeof candidate.ok === 'boolean' && ['completed', 'blocked', 'failed'].includes(candidate.status ?? '');
+}
+
+function terminalStatus(outcome: WorkflowOutcome): DurableTerminalStatus {
+  const text = `${outcome.message}\n${(outcome.details ?? []).join('\n')}`;
+  if (outcome.ok && /\bREADY\b/i.test(text) && !/\bNOT_READY\b/i.test(text)) return 'READY';
+  if (/\bNOT_READY\b/i.test(text) || outcome.status === 'failed') return 'NOT_READY';
+  return 'BLOCKED';
+}
+
+async function persistDurableTerminal(ctx: WorkflowContext, outcome: WorkflowOutcome): Promise<void> {
+  if (!ctx.durable) return;
+  const status = terminalStatus(outcome);
+  await ctx.durable.markTerminal({
+    status,
+    reason: outcome.message,
+    commit: ctx.git.headCommit(ctx.projectRoot),
+  });
+  // Snapshot after the terminal transaction so it necessarily contains the
+  // run.ready/run.not_ready/run.blocked event and terminal run projection.
+  await ctx.durable.createSnapshot({ reason: `terminal:${status}` });
+  commitPortableDurableArtifacts(ctx, `terminal ${status}`);
+}
+
+/** Durable checkpoint/snapshot boundary shared by task, phase and milestone flows. */
+export async function durableCheckpoint(
+  ctx: WorkflowContext,
+  reason: string,
+  opts: { commit?: string | null; checkpoint?: boolean; snapshot?: boolean } = {},
+): Promise<void> {
+  if (!ctx.durable) return;
+  await ctx.bus.flushDurable();
+  if (opts.checkpoint !== false) {
+    await ctx.durable.createCheckpoint({ reason, commit: opts.commit ?? ctx.git.headCommit(ctx.projectRoot) });
+  }
+  if (opts.snapshot !== false) await ctx.durable.createSnapshot({ reason });
+  commitPortableDurableArtifacts(ctx, reason);
+}
+
+export function commitPortableDurableArtifacts(ctx: WorkflowContext, reason: string): void {
+  if (!ctx.config.git.commit) return;
+  const status = ctx.git.status(ctx.projectRoot);
+  if (!status.isRepo) return;
+  const portable = status.dirtyFiles.filter(
+    (file) =>
+      file === '.rijo/.gitignore' ||
+      file.startsWith('.rijo/ledger/') ||
+      file.startsWith('.rijo/state/migrations/'),
+  );
+  if (portable.length === 0) return;
+  const commit = ctx.git.commitPaths(
+    ctx.projectRoot,
+    `rijo(state): ${reason}`,
+    portable,
+  );
+  if (!commit) {
+    throw new BlockedError(
+      `Durable checkpoint ${reason} could not be committed.`,
+      `Portable ledger paths remain dirty: ${portable.join(', ')}`,
+    );
   }
 }
 
@@ -374,7 +553,22 @@ export function commitDecisionProposals(ctx: WorkflowContext, envelope: Validate
     throw new Error(`Dispatch ${envelope.dispatch_id}: stale or revoked result decisions were discarded`);
   }
   for (const pending of envelope.pending_decisions) {
-    commitPendingDecision(ctx.paths, ctx.config.decisions, pending, ctx.now, ctx.decisionHooks);
+    const outcome = commitPendingDecision(
+      ctx.paths,
+      ctx.config.decisions,
+      pending,
+      ctx.now,
+      ctx.decisionHooks,
+    );
+    ctx.bus.emit('decision.approved', {
+      message: `decisão ${pending.proposal.id} aprovada`,
+    }, {
+      proposal: pending.proposal,
+      attempt_id: pending.attempt_id,
+      generation: pending.generation,
+      idempotency_key: pending.idempotency_key,
+      materialized: outcome.status === 'DECIDED' && Boolean(outcome.record),
+    });
   }
   envelope.decision_state = 'COMMITTED';
   ctx.openDecisionEnvelopes.delete(envelope);

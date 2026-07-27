@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { runCli } from '../src/cli/main.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
@@ -43,6 +44,19 @@ describe('runCli', () => {
   it('rijo new without a plan file arg returns 2', async () => {
     const code = await runCli(['new'], {}, root);
     expect(code).toBe(2);
+  });
+
+  it('production CLI wiring opens the real durable SQLite engine without an injected test runtime', async () => {
+    writePlanFile(root);
+
+    // No fake runner/executor/deps: this is the same dependency path used by
+    // the packaged CLI. The unbound planner fails, but durable startup must be
+    // real and recoverable — never silently replaced with memory persistence.
+    const code = await runCli(['new', '@PLANO.md'], {}, root);
+
+    expect(code).toBe(1);
+    expect(fs.existsSync(path.join(root, '.rijo', 'state', 'rijo.db'))).toBe(true);
+    expect(fs.existsSync(path.join(root, '.rijo', '.gitignore'))).toBe(true);
   });
 
   it('--version prints 0.1.0-alpha.1', async () => {

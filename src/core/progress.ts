@@ -9,6 +9,7 @@ import {
 } from './schemas/index.js';
 import { appendLine, writeJsonAtomic, readJsonIfExists } from './fsx.js';
 import type { RijoPaths } from './paths.js';
+import { redactDurableValue } from '../durable/canonical.js';
 
 export interface ProgressSink {
   /** Short line rendered to the terminal on material transitions. */
@@ -48,6 +49,43 @@ export interface ProgressUpdate {
   message?: string;
 }
 
+export interface DurableProgressRecord {
+  runId: string;
+  type: string;
+  ts: string;
+  update: ProgressUpdate;
+  data: Record<string, unknown>;
+  snapshot: StatusSnapshot;
+}
+
+/**
+ * Narrow durable boundary used by ProgressBus. The concrete durable engine may
+ * write synchronously (better-sqlite3) or return a promise; the bus retains and
+ * flushes asynchronous work before the enclosing workflow releases its lock.
+ */
+export interface DurableProgressRecorder {
+  recordProgress(record: DurableProgressRecord): void | Promise<void>;
+}
+
+function scrubBearerBeforeGenericRedaction(value: unknown): unknown {
+  if (typeof value === 'string') {
+    // The generic log redactor recognizes the word "Bearer" independently.
+    // Strip the whole credential first so a later replacement cannot leave
+    // the token tail behind as ordinary text.
+    return value.replace(/\bBearer\s+[A-Za-z0-9._~+/-]{8,}={0,2}/gi, 'Bearer [REDACTED]');
+  }
+  if (Array.isArray(value)) return value.map(scrubBearerBeforeGenericRedaction);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, child]) => [
+        key,
+        scrubBearerBeforeGenericRedaction(child),
+      ]),
+    );
+  }
+  return value;
+}
+
 /**
  * Deterministic event bus. Every material transition, in order:
  *   1. structured event appended to events.jsonl
@@ -57,10 +95,12 @@ export interface ProgressUpdate {
  */
 export class ProgressBus {
   private snapshot: StatusSnapshot;
+  private durable: DurableProgressRecorder | null = null;
+  private durablePending: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly paths: RijoPaths,
-    public readonly runId: string,
+    public runId: string,
     private readonly sink: ProgressSink = consoleSink,
     private readonly now: () => Date = () => new Date(),
   ) {
@@ -83,31 +123,67 @@ export class ProgressBus {
     };
   }
 
+  /**
+   * Switch progress persistence to the durable engine. From this point onward
+   * ProgressBus no longer writes events/status directly: event + projection are
+   * one durable-engine responsibility (transaction + outbox).
+   */
+  attachDurable(recorder: DurableProgressRecorder, runId = this.runId): void {
+    this.durable = recorder;
+    this.runId = runId;
+    this.snapshot = { ...this.snapshot, run_id: runId };
+  }
+
+  async flushDurable(): Promise<void> {
+    await this.durablePending;
+  }
+
   get current(): StatusSnapshot {
     return this.snapshot;
   }
 
   emit(type: string, update: ProgressUpdate = {}, data: Record<string, unknown> = {}): StatusSnapshot {
     const ts = this.now().toISOString();
-    const event: RijoEvent = { ts, run_id: this.runId, type, data };
-    appendLine(this.paths.events, JSON.stringify(event));
+    const safeUpdate = redactDurableValue(scrubBearerBeforeGenericRedaction(update)) as ProgressUpdate;
+    const safeData = redactDurableValue(scrubBearerBeforeGenericRedaction(data)) as Record<string, unknown>;
+    const event: RijoEvent = { ts, run_id: this.runId, type, data: safeData };
 
     this.snapshot = StatusSchema.parse({
       ...this.snapshot,
-      status: update.status ?? this.snapshot.status,
-      milestone: update.milestone !== undefined ? update.milestone : this.snapshot.milestone,
-      phase: update.phase !== undefined ? update.phase : this.snapshot.phase,
-      stage: update.stage !== undefined ? update.stage : this.snapshot.stage,
-      task: update.task !== undefined ? update.task : this.snapshot.task,
-      agent: update.agent !== undefined ? update.agent : this.snapshot.agent,
-      completed_units: update.completedUnits ?? this.snapshot.completed_units,
-      total_units: update.totalUnits ?? this.snapshot.total_units,
+      status: safeUpdate.status ?? this.snapshot.status,
+      milestone: safeUpdate.milestone !== undefined ? safeUpdate.milestone : this.snapshot.milestone,
+      phase: safeUpdate.phase !== undefined ? safeUpdate.phase : this.snapshot.phase,
+      stage: safeUpdate.stage !== undefined ? safeUpdate.stage : this.snapshot.stage,
+      task: safeUpdate.task !== undefined ? safeUpdate.task : this.snapshot.task,
+      agent: safeUpdate.agent !== undefined ? safeUpdate.agent : this.snapshot.agent,
+      completed_units: safeUpdate.completedUnits ?? this.snapshot.completed_units,
+      total_units: safeUpdate.totalUnits ?? this.snapshot.total_units,
       last_checkpoint:
-        update.lastCheckpoint !== undefined ? update.lastCheckpoint : this.snapshot.last_checkpoint,
+        safeUpdate.lastCheckpoint !== undefined ? safeUpdate.lastCheckpoint : this.snapshot.last_checkpoint,
       updated_at: ts,
-      message: update.message ?? this.snapshot.message,
+      message: safeUpdate.message ?? this.snapshot.message,
     });
-    writeJsonAtomic(this.paths.status, this.snapshot);
+    if (this.durable) {
+      const record: DurableProgressRecord = {
+        runId: this.runId,
+        type,
+        ts,
+        update: safeUpdate,
+        data: safeData,
+        snapshot: this.snapshot,
+      };
+      // Invoke immediately: the production SQLite recorder commits before it
+      // returns. Deferring invocation through `.then()` would create a crash
+      // window in which the caller observed progress that never reached the
+      // ledger. Promise results are retained only for ACK/error flushing.
+      const pending = this.durable.recordProgress(record);
+      if (pending && typeof (pending as Promise<void>).then === 'function') {
+        this.durablePending = Promise.all([this.durablePending, pending]).then(() => undefined);
+      }
+    } else {
+      appendLine(this.paths.events, JSON.stringify(event));
+      writeJsonAtomic(this.paths.status, this.snapshot);
+    }
     this.sink.render(renderStatusLine(this.snapshot));
     return this.snapshot;
   }

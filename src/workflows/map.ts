@@ -17,6 +17,7 @@ import {
   dispatchReadOnly,
   commitDecisionProposals,
   discardDecisionProposals,
+  commitPortableDurableArtifacts,
   replaceableAttempt,
   guardSchema,
   type WorkflowContext,
@@ -137,6 +138,11 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
   const { projectRoot, paths, bus, now } = ctx;
   const schemaGuard = guardSchema(ctx);
   if (schemaGuard) return schemaGuard;
+
+  // Durable initialization materializes canonical, commit-able migrations and
+  // ignore policy before the map preflight. Seal those RIJO-owned files first
+  // so they cannot be mistaken for an external application edit.
+  commitPortableDurableArtifacts(ctx, 'map bootstrap');
 
   bus.emit('map.preflight', {
     status: 'running',

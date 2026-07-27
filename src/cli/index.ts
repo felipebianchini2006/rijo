@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { runCli } from './main.js';
+import { runCliEntrypoint } from './bootstrap.js';
 
-runCli(process.argv.slice(2)).then(
+runCliEntrypoint(process.argv.slice(2)).then(
   (code) => process.exit(code),
   (err) => {
     console.error(`rijo: ${err instanceof Error ? err.message : String(err)}`);

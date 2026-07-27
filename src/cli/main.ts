@@ -16,6 +16,7 @@ import { checkWorkflow } from '../workflows/check.js';
 import { mapWorkflow, queryCodebaseMap, readCodebaseMapStatus } from '../workflows/map.js';
 import { serve } from './serve.js';
 import { generateAdapters, type AdapterName } from '../adapters/index.js';
+import { openDurableWorkflowEngine } from '../durable/index.js';
 import type { WorkflowDeps, WorkflowOutcome } from '../workflows/shared.js';
 
 /**
@@ -89,7 +90,11 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       if (target && !['next', 'all'].includes(target) && !/^\d{2}$/.test(target)) {
         return usage('rijo run [next|all|NN] [--host claude|codex]');
       }
-      return withHost(cwd, values.host, deps, (d) => runWorkflow(cwd, { target }, d));
+      const effectiveTarget =
+        target ?? (process.env['RIJO_ENGINE_CHILD'] === '1' ? 'all' : undefined);
+      return withHost(cwd, values.host, deps, (d) =>
+        runWorkflow(cwd, { target: effectiveTarget }, d),
+      );
     }
     case 'ui': {
       const { host, rest: uiRest } = extractHostFlag(rest);
@@ -159,20 +164,73 @@ async function withHost(
   deps: WorkflowDeps,
   body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
 ): Promise<number> {
+  const durableBinding = await attachProductionDurableEngine(cwd, deps);
+  const durableDeps = durableBinding.deps;
   const config = loadConfig(new RijoPaths(cwd));
   const provider = resolveHostProvider(hostFlag, config);
-  if (typeof provider === 'object') return usage(provider.error);
-  if (provider === 'none') return report(await body(deps));
+  if (typeof provider === 'object') {
+    await closeOwnedDurable(durableBinding);
+    return usage(provider.error);
+  }
+  if (provider === 'none') {
+    try {
+      return report(await body({ ...durableDeps, hostProvider: provider }));
+    } finally {
+      await closeOwnedDurable(durableBinding);
+    }
+  }
 
   const boot = await buildHostExecutor({ provider, projectRoot: cwd, config, paths: new RijoPaths(cwd) });
   if (!boot.ok) {
+    await closeOwnedDurable(durableBinding);
     return report({ ok: false, status: 'blocked', message: boot.message, details: boot.details });
   }
   try {
-    return report(await body({ ...deps, executor: boot.executor, sink: deps.sink ?? stderrSink }));
+    return report(
+      await body({
+        ...durableDeps,
+        hostProvider: provider,
+        executor: boot.executor,
+        sink: durableDeps.sink ?? stderrSink,
+      }),
+    );
   } finally {
     await boot.executor.dispose();
+    await closeOwnedDurable(durableBinding);
   }
+}
+
+/**
+ * The packaged CLI always uses the SQLite-backed Durable State Engine. Tests
+ * and embedders that inject any runtime dependency retain full control and may
+ * explicitly pass `durable: null` or their own in-memory/test implementation.
+ */
+async function attachProductionDurableEngine(
+  cwd: string,
+  deps: WorkflowDeps,
+): Promise<{ deps: WorkflowDeps; owned: boolean }> {
+  if (Object.prototype.hasOwnProperty.call(deps, 'durable')) return { deps, owned: false };
+  const injectedRuntime =
+    deps.runner !== undefined ||
+    deps.executor !== undefined ||
+    deps.shell !== undefined ||
+    deps.git !== undefined ||
+    deps.now !== undefined ||
+    deps.clock !== undefined ||
+    deps.supervisorConfig !== undefined;
+  if (injectedRuntime) return { deps, owned: false };
+  return {
+    deps: { ...deps, durable: await openDurableWorkflowEngine(cwd) },
+    owned: true,
+  };
+}
+
+async function closeOwnedDurable(binding: {
+  deps: WorkflowDeps;
+  owned: boolean;
+}): Promise<void> {
+  if (!binding.owned) return;
+  await binding.deps.durable?.close();
 }
 
 /**
