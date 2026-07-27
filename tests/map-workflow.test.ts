@@ -16,6 +16,7 @@ import { SupervisorConfigSchema } from '../src/core/schemas/index.js';
 import { cleanup, deps, mapFragmentFor, tmpProject, writePlanFile } from './helpers.js';
 import { readStaleMarker } from '../src/codebase/state.js';
 import { initialState, writeState } from '../src/core/state.js';
+import { defaultConfig, saveConfig } from '../src/core/config.js';
 
 const ARTIFACTS = [
   'SUMMARY.md',
@@ -460,6 +461,35 @@ describe('rijo map workflow', () => {
     const generations = d.runner.executed.filter((task) => task.id.startsWith('map-shard-'));
     expect(generations.length).toBeGreaterThanOrEqual(2);
     expect(new Set(generations.map((task) => task.workspace?.id)).size).toBeGreaterThanOrEqual(2);
+  });
+
+  it('reports an exhausted mapper result instead of misclassifying its discarded workspace', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id.startsWith('map-shard-'),
+      (task) => ({
+        task_id: task.id,
+        ok: false,
+        summary: 'mapper host remained unavailable',
+        files_written: [],
+        payload: null,
+        scope_requests: [],
+      }),
+    );
+    const config = defaultConfig();
+    config.supervisor.max_replacements_per_task = 1;
+    config.supervisor.replacement_backoff_ms = [0];
+    fs.mkdirSync(path.join(root, '.rijo'), { recursive: true });
+    saveConfig(new RijoPaths(root), config);
+    git(root, ['add', '-f', '.rijo/config.yml']);
+    git(root, ['commit', '-m', 'test: configure mapper replacement budget']);
+
+    const outcome = await mapWorkflow(root, { full: true }, { ...d, git: new SystemGit() });
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toMatch(/supervised mapper .* failed/i);
+    expect(outcome.details?.join('\n')).toMatch(/exhausted|unavailable/i);
+    expect(outcome.details?.join('\n')).not.toMatch(/workspace .* discarded/i);
   });
 
   it('repairs one schema-invalid mapper payload in a fresh supervised shard attempt', async () => {

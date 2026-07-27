@@ -300,7 +300,12 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
         (task) => ({ stage: 'RESEARCH', paths: task.code_files, requirementTags: ['codebase-discovery'] }),
         (_task, index) => attempts[index]!.prepareReplacement,
       );
-      for (const attempt of attempts) attempt.attempt.workspace.validate();
+      for (let index = 0; index < attempts.length; index++) {
+        // An exhausted/failed replacement has already discarded its workspace.
+        // Inspect that result in the normal failure gate below; only a
+        // successful generation owns a live workspace that can be validated.
+        if (results[index]?.ok) attempts[index]!.attempt.workspace.validate();
+      }
     } catch (error) {
       return blocked(ctx, 'A map agent violated its isolated read-only workspace.', [(error as Error).message]);
     } finally {

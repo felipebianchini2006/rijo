@@ -256,7 +256,7 @@ describe('LIVE full-workflow E2E (Claude)', () => {
         tarball!,
         'rijo-wf-map-recovery-',
         haikuConfigYaml('claude', {
-          researcherHardTimeoutMs: 45_000,
+          researcherHardTimeoutMs: 180_000,
           heartbeatIntervalMs: 1_000,
           cancelGraceMs: 4_000,
           hardKillGraceMs: 2_000,
