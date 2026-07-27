@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
 import { runWorkflow } from '../src/workflows/run.js';
 import { checkWorkflow } from '../src/workflows/check.js';
+import { openQaCheckpoint } from '../src/workflows/qa-checkpoint.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { decideReadiness } from '../src/qa/readiness.js';
@@ -70,6 +71,29 @@ describe('rijo check', () => {
     expect(report).toContain('status: READY');
     expect(report).toContain(d.git.headCommit()!);
     expect(report).toContain('## Journeys');
+  });
+
+  it('native QA commits the verified repair set and records its exact commit', async () => {
+    const d = deps(root, { capabilities: { browser: true } });
+    prepareReadyProject(root, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    await runWorkflow(root, { target: 'all' }, d);
+    wireJourneys(d, () => ({}));
+
+    const opened = openQaCheckpoint(root, d.git);
+    expect(opened.resumed).toBe(false);
+    fs.writeFileSync(path.join(root, 'qa-repair.txt'), 'verified repair\n');
+
+    const outcome = await checkWorkflow(root, {}, d);
+    expect(outcome.ok, outcome.message).toBe(true);
+    const tested = d.git.commits.find((item) =>
+      item.message.includes('verified product QA checkpoint'),
+    );
+    expect(tested?.paths).toContain('qa-repair.txt');
+    const report = fs.readFileSync(readinessPath(root), 'utf8');
+    expect(report).toContain(`tested_commit: ${tested!.hash}`);
+    expect(report).toContain('evidence_commit: fake');
+    expect(fs.existsSync(new RijoPaths(root).qaCheckpoint)).toBe(false);
   });
 
   it('a console error in a critical flow prevents READY', async () => {
@@ -169,5 +193,30 @@ describe('readiness decision (unit)', () => {
       missingCapabilities: [], fixesApplied: [],
     });
     expect(decision.status).toBe('NOT_READY');
+  });
+
+  it('a project without a build script can use its available checks', () => {
+    const reqs = [req('M001-REQ-001', '01')];
+    const journeys = deriveJourneys(reqs);
+    const decision = decideReadiness({
+      commit: 'abc',
+      environment: 'local',
+      deterministicChecks: [{ command: 'npm test', exit_code: 0, summary: 'ok', duration_ms: 1 }],
+      requirements: reqs,
+      journeys,
+      journeyResults: journeys.map((journey) => ({
+        journey_id: journey.id,
+        passed: true,
+        steps: [],
+        console_errors: [],
+        network_errors: [],
+        findings: [],
+        screenshots: [],
+      })),
+      missingCapabilities: [],
+      fixesApplied: [],
+      hasBuild: false,
+    });
+    expect(decision.status).toBe('READY');
   });
 });

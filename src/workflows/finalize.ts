@@ -348,7 +348,7 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
     task: null,
     last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
     last_commit: marker.tested_commit,
-    next_step: 'rijo run (next phase) or rijo check',
+    next_step: '$rijo start',
     blocked: false,
     blocked_reason: null,
   });
@@ -387,7 +387,7 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
     task: null,
     last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
     last_commit: c1,
-    next_step: 'rijo run (next phase) or rijo check',
+    next_step: '$rijo start',
   });
 
   // ---- C2: evidence pointing at C1 — only allowed metadata paths may change.

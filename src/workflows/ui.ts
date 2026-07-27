@@ -346,7 +346,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     const prev = readState(paths) ?? initialState(now);
     writeState(
       paths,
-      { ...prev, milestone: milestone?.id ?? prev.milestone, next_step: 'rijo run', updated_at: now().toISOString() },
+      { ...prev, milestone: milestone?.id ?? prev.milestone, next_step: '$rijo start', updated_at: now().toISOString() },
       `UI import ${importId} completed: ${conv.data.components_created.length} components, ${conv.data.routes_mapped.length} routes mapped. ${validationNote}`,
     );
     // STATE.md is hash-tracked: refresh the manifest so the next run does not

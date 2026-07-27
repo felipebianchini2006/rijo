@@ -110,6 +110,21 @@ describe('runCli', () => {
     expect(logged()).toContain('incomplete');
   });
 
+  it('internal qa-open creates one idempotent clean-tree baseline', async () => {
+    writePlanFile(root);
+    const runtime = deps(root);
+    expect((await newWorkflow(root, { planFile: 'PLAN.md' }, runtime)).ok).toBe(true);
+
+    log.mockClear();
+    expect(await runCli(['internal', 'qa-open'], runtime, root)).toBe(0);
+    expect(JSON.parse(logged())).toMatchObject({ resumed: false });
+    expect(fs.existsSync(path.join(root, '.rijo', 'runtime', 'qa-checkpoint.json'))).toBe(true);
+
+    log.mockClear();
+    expect(await runCli(['internal', 'qa-open'], runtime, root)).toBe(0);
+    expect(JSON.parse(logged())).toMatchObject({ resumed: true });
+  });
+
   it('supports map full, status, and zero-model query from the CLI', async () => {
     const source = `${root}/src/auth.ts`;
     fs.mkdirSync(`${root}/src`, { recursive: true });

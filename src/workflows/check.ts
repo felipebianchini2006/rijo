@@ -26,6 +26,12 @@ import {
   type WorkflowDeps,
   type WorkflowOutcome,
 } from './shared.js';
+import {
+  clearQaCheckpoint,
+  portableQaSnapshot,
+  readQaCheckpoint,
+  writeQaCheckpoint,
+} from './qa-checkpoint.js';
 import { syncQaProjections } from './projections.js';
 
 export interface CheckOptions {
@@ -80,7 +86,7 @@ export async function checkCore(
   if (!milestone) return failed(ctx, 'No active milestone.');
 
     // ---- 1: pin commit and environment
-    const commit = ctx.git.headCommit(projectRoot);
+    let commit = ctx.git.headCommit(projectRoot);
     const environment = opts.production ? 'production-candidate' : 'local';
     bus.emit('check.start', {
       status: 'running',
@@ -193,11 +199,10 @@ export async function checkCore(
       }
     }
 
-    // The report must reference the exact state it tested. If --fix modified the
-    // working tree, that state is uncommitted and cannot be certified until the
-    // changes are committed and check is re-run against a clean commit.
+    // The report must reference the exact state it tested.
     const finalStatus = ctx.git.status(projectRoot);
     const dirtyAfterFix = fixesApplied.length > 0 && finalStatus.isRepo && finalStatus.dirtyFiles.length > 0;
+    const qaCheckpoint = readQaCheckpoint(paths);
 
     // ---- 13-15: readiness decision and report
     const decision = decideReadiness({
@@ -212,62 +217,150 @@ export async function checkCore(
       hasBuild,
       firstVersion: true,
     });
-    if (dirtyAfterFix && decision.status === 'READY') {
+    if (!qaCheckpoint && dirtyAfterFix && decision.status === 'READY') {
       decision.status = 'NOT_READY';
       decision.reasons = [
         'Working tree was modified by --fix but not committed; commit the fixes and re-run `rijo check` to certify a clean commit.',
       ];
     }
-    writeFileAtomic(
-      milestone.paths.readiness,
-      serializeFrontmatter(
-        {
-          status: decision.status,
-          commit,
-          environment,
-          checked_at: now().toISOString(),
-          commands: checks.map((c) => ({ command: c.command, exit_code: c.exit_code, blocked: c.blocked })),
-          journeys_executed: journeyResults.map((r) => ({ id: r.journey_id, passed: r.passed })),
-          missing_capabilities: missingCapabilities,
-          fixes_applied: fixesApplied,
-        },
-        [
-          `# Production readiness — ${milestone.id}`,
-          '',
-          `Status: **${decision.status}**`,
-          `Commit: \`${commit ?? 'no VCS'}\` · Environment: ${environment} · Date: ${now().toISOString()}`,
-          '',
-          '## Gates',
-          ...decision.reasons.map((r) => `- ${r}`),
-          '',
-          '## Deterministic checks',
-          ...checks.map((c) => `- \`${c.command}\` → exit ${c.exit_code}`),
-          '',
-          '## Journeys',
-          ...(journeys.length
-            ? journeys.map((j) => {
-                const r = journeyResults.find((x) => x.journey_id === j.id);
-                return `- ${j.id} (${j.requirement_ids.join(', ')}): ${r ? (r.passed ? 'PASSED' : 'FAILED') : 'NOT EXECUTED'}`;
-              })
-            : ['- none derived']),
-          '',
-          '## Findings by severity',
-          ...renderFindings(journeyResults),
-          '',
-          '## Unavailable capabilities',
-          ...(missingCapabilities.length ? missingCapabilities.map((c) => `- ${c}`) : ['- none']),
-          '',
-        ].join('\n'),
-      ),
-    );
-    syncQaProjections(paths, milestone.paths);
+
+    // Native QA can apply bounded repairs before it submits its result bundle.
+    // Commit only paths that changed after `qa-open`. This excludes any
+    // pre-existing user change. The checks above evaluated the exact content
+    // that this commit records.
+    if (qaCheckpoint && decision.status === 'READY') {
+      if (qaCheckpoint.tested_commit) {
+        commit = qaCheckpoint.tested_commit;
+      } else {
+        const before = new Map(Object.entries(qaCheckpoint.files));
+        const changed = diffSnapshots(before, portableQaSnapshot(projectRoot)).changed;
+        if (finalStatus.isRepo && config.git.commit && changed.length > 0) {
+          const testedCommit = ctx.git.commitPaths(
+            projectRoot,
+            `rijo(${milestone.id}): verified product QA checkpoint`,
+            changed,
+          );
+          if (!testedCommit) {
+            return blocked(ctx, 'The verified product QA checkpoint could not be committed.', changed);
+          }
+          commit = testedCommit;
+        } else {
+          commit = ctx.git.headCommit(projectRoot);
+        }
+        qaCheckpoint.tested_commit = commit;
+        writeQaCheckpoint(paths, qaCheckpoint);
+      }
+      if (finalStatus.isRepo && !commit) {
+        return blocked(ctx, 'Product QA could not identify the tested commit.');
+      }
+    }
+
+    let evidenceCommit: string | null = null;
+    const writeReadiness = (recordedEvidenceCommit: string | null): void => {
+      const checkedAt = now().toISOString();
+      writeFileAtomic(
+        milestone.paths.readiness,
+        serializeFrontmatter(
+          {
+            status: decision.status,
+            commit,
+            tested_commit: commit,
+            evidence_commit: recordedEvidenceCommit,
+            environment,
+            checked_at: checkedAt,
+            commands: checks.map((c) => ({ command: c.command, exit_code: c.exit_code, blocked: c.blocked })),
+            journeys_executed: journeyResults.map((r) => ({ id: r.journey_id, passed: r.passed })),
+            missing_capabilities: missingCapabilities,
+            fixes_applied: fixesApplied,
+          },
+          [
+            `# Production readiness — ${milestone.id}`,
+            '',
+            `Status: **${decision.status}**`,
+            `Tested commit: \`${commit ?? 'no VCS'}\` · Environment: ${environment} · Date: ${checkedAt}`,
+            '',
+            '## Gates',
+            ...decision.reasons.map((r) => `- ${r}`),
+            '',
+            '## Deterministic checks',
+            ...checks.map((c) => `- \`${c.command}\` → exit ${c.exit_code}`),
+            '',
+            '## Journeys',
+            ...(journeys.length
+              ? journeys.map((j) => {
+                  const result = journeyResults.find((item) => item.journey_id === j.id);
+                  return `- ${j.id} (${j.requirement_ids.join(', ')}): ${result ? (result.passed ? 'PASSED' : 'FAILED') : 'NOT EXECUTED'}`;
+                })
+              : ['- none derived']),
+            '',
+            '## Findings by severity',
+            ...renderFindings(journeyResults),
+            '',
+            '## Unavailable capabilities',
+            ...(missingCapabilities.length ? missingCapabilities.map((capability) => `- ${capability}`) : ['- none']),
+            '',
+          ].join('\n'),
+        ),
+      );
+      syncQaProjections(paths, milestone.paths);
+    };
+
+    const testedSnapshot = portableQaSnapshot(projectRoot);
+    writeReadiness(null);
+
+    if (qaCheckpoint && decision.status === 'READY' && finalStatus.isRepo && config.git.commit) {
+      const relReadiness = path.relative(projectRoot, milestone.paths.readiness).split(path.sep).join('/');
+      const relMilestoneQa = path.relative(projectRoot, milestone.paths.qaDir).split(path.sep).join('/');
+      const relActiveQa = path.relative(projectRoot, paths.qaDir).split(path.sep).join('/');
+      const relEvents = path.relative(projectRoot, paths.events).split(path.sep).join('/');
+      const evidencePaths = diffSnapshots(testedSnapshot, portableQaSnapshot(projectRoot)).changed;
+      evidenceCommit = ctx.git.commitPaths(
+        projectRoot,
+        `rijo(${milestone.id}): product QA evidence for ${commit!.slice(0, 12)}`,
+        evidencePaths,
+      );
+      if (!evidenceCommit) {
+        return blocked(ctx, 'The product QA evidence commit could not be created.', evidencePaths);
+      }
+      const range = ctx.git.diffNames(projectRoot, commit!, evidenceCommit);
+      const illegal = range.filter(
+        (file) =>
+          file !== relReadiness &&
+          file !== relEvents &&
+          !file.startsWith(`${relMilestoneQa}/`) &&
+          !file.startsWith(`${relActiveQa}/`),
+      );
+      if (illegal.length > 0) {
+        return blocked(ctx, 'The product QA evidence commit touched non-evidence paths.', illegal);
+      }
+
+      const evidenceSnapshot = portableQaSnapshot(projectRoot);
+      writeReadiness(evidenceCommit);
+      const sealPaths = diffSnapshots(evidenceSnapshot, portableQaSnapshot(projectRoot)).changed;
+      if (sealPaths.length > 0) {
+        const sealCommit = ctx.git.commitPaths(
+          projectRoot,
+          `rijo(${milestone.id}): product QA evidence sealed`,
+          sealPaths,
+        );
+        if (!sealCommit) {
+          return blocked(ctx, 'The product QA evidence seal could not be committed.', sealPaths);
+        }
+      }
+      clearQaCheckpoint(paths);
+    }
 
     bus.emit('check.done', {
       status: decision.status === 'READY' ? 'completed' : 'blocked',
       stage: decision.status === 'READY' ? 'READY' : 'PRODUCT_TEST',
       message: `[RIJO ${milestone.id}] ${decision.status}`,
     });
-    const details = [`Report: ${path.relative(projectRoot, milestone.paths.readiness)}`, ...decision.reasons.slice(0, 10)];
+    const details = [
+      `Report: ${path.relative(projectRoot, milestone.paths.readiness)}`,
+      `tested_commit: ${commit ?? 'n/a'}`,
+      ...(evidenceCommit ? [`evidence_commit: ${evidenceCommit}`] : []),
+      ...decision.reasons.slice(0, 10),
+    ];
     if (decision.status === 'READY') return completed(ctx, `Production readiness: READY (commit ${commit?.slice(0, 8) ?? 'n/a'}).`, details);
     return {
       ok: false,

@@ -51,10 +51,10 @@ export function decideReadiness(input: ReadinessInput): ReadinessDecision {
     reasons.push(`Check failed: ${c.command} (exit ${c.exit_code})`);
   }
 
-  // A production build must have run and passed. Its absence blocks READY.
+  // Run and enforce a production build when the project declares one.
   const buildCheck = input.deterministicChecks.find((c) => /\bbuild\b/.test(c.command));
-  if (!buildCheck) reasons.push('No production build was executed (build script missing or not run).');
-  else if (buildCheck.exit_code !== 0) reasons.push('Production build failing');
+  if (input.hasBuild && !buildCheck) reasons.push('The declared production build did not run.');
+  else if (buildCheck && buildCheck.exit_code !== 0) reasons.push('Production build failing');
 
   // Requirement gate: every active requirement must be covered by a journey,
   // AND (for a first-version certification) be DONE — a PENDING requirement can

@@ -128,6 +128,10 @@ export class RijoPaths {
   get finalize(): string {
     return path.join(this.runtimeDir, 'finalize.json');
   }
+  /** Native product QA baseline and post-repair checkpoint marker. */
+  get qaCheckpoint(): string {
+    return path.join(this.runtimeDir, 'qa-checkpoint.json');
+  }
   get archiveDir(): string {
     return path.join(this.root, 'archive');
   }

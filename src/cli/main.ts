@@ -31,6 +31,7 @@ import { NativeResultRunner } from '../agents/native-results.js';
 import { activeMilestone } from '../core/milestones.js';
 import { readRequirements, readRoadmap } from '../core/roadmap.js';
 import { SystemShellRunner } from '../core/commands.js';
+import { openQaCheckpoint } from '../workflows/qa-checkpoint.js';
 
 /**
  * Workflow commands: new, run, ui, fix, check.
@@ -272,6 +273,21 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
           return 1;
         }
       }
+      if (helper === 'qa-open') {
+        if (helperArgs.length > 0) return usage('rijo internal qa-open');
+        try {
+          const opened = openQaCheckpoint(cwd, deps.git);
+          console.log(JSON.stringify({
+            resumed: opened.resumed,
+            opened_at: opened.checkpoint.opened_at,
+            initial_head: opened.checkpoint.initial_head,
+          }));
+          return 0;
+        } catch (error) {
+          console.error(`rijo: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
       if (helper === 'qa-record') {
         if (helperArgs.length > 0) return usage('rijo internal qa-record');
         if (!resultFile) return usage('rijo internal qa-record --results @.rijo/runtime/native-results.json');
@@ -286,7 +302,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         return withDeterministic(cwd, deps, (d) => recoverNativeState(cwd, d));
       }
       return usage(
-        'rijo internal status|lifecycle|safe-command|map-codebase|project-init|phase-open|plan-validate|qa-record|milestone-finish|recovery',
+        'rijo internal status|lifecycle|safe-command|map-codebase|project-init|phase-open|plan-validate|qa-open|qa-record|milestone-finish|recovery',
       );
     }
     case 'install': {
