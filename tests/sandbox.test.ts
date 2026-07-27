@@ -85,8 +85,18 @@ describe('execution policy (planCommand)', () => {
     expect(plan.ok).toBe(false);
   });
 
-  it('network defaults to none for repository code, enabled only for known network commands', () => {
-    const repo = planCommand('npm run test', { cwd: root, config, sandboxAvailableOverride: true });
+  it('allows loopback only for tests and keeps other repository code offline', () => {
+    const test = planCommand('node scripts/verify-shell.mjs', {
+      cwd: root,
+      config,
+      sandboxAvailableOverride: true,
+    });
+    expect(test.ok && test.command.network).toBe('restricted');
+    const repo = planCommand('node scripts/build-app.mjs', {
+      cwd: root,
+      config,
+      sandboxAvailableOverride: true,
+    });
     expect(repo.ok && repo.command.network).toBe('none');
     const audit = planCommand('npm audit', { cwd: root, config });
     expect(audit.ok && audit.command.network).toBe('enabled');

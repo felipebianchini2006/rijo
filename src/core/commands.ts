@@ -95,7 +95,7 @@ function tokenize(raw: string): string[] {
 
 function categorize(exe: string, args: string[]): CommandCategory {
   const joined = `${exe} ${args.join(' ')}`;
-  if (/\b(test|vitest|jest|mocha|pytest|ava)\b/.test(joined)) return 'test';
+  if (/\b(test|verify|vitest|jest|mocha|pytest|ava)\b/.test(joined)) return 'test';
   if (/\btypecheck\b|\btsc\b|\bmypy\b/.test(joined)) return 'typecheck';
   if (/\blint\b|\beslint\b|\bruff\b|\bbiome\b/.test(joined)) return 'lint';
   if (/\bformat\b|\bprettier\b/.test(joined)) return 'format';

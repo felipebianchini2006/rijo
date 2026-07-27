@@ -233,7 +233,9 @@ export function planCommand(raw: string, opts: PlanCommandOptions): CommandPlan 
     ? 'enabled'
     : trust === 'known-script'
       ? classified.network
-      : opts.config.network_default;
+      : category === 'test' && opts.config.network_default === 'none'
+        ? 'restricted'
+        : opts.config.network_default;
 
   let finalArgs = args;
   if (isPackageInstall) {
