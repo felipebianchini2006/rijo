@@ -43,6 +43,15 @@ describe('native result ingestion', () => {
     );
     expect(request.task_id).toBe('plan-01');
     expect(request.objective).toBe(task.objective);
+    expect(request.result_contract).toEqual({
+      task_id: 'plan-01',
+      ok: 'boolean',
+      summary: 'non-empty string',
+      payload: 'value that matches return_format',
+      files: 'object that maps project-relative paths to complete string content',
+      files_written: 'optional array of project-relative paths',
+      scope_requests: 'array of requested project-relative paths',
+    });
   });
 
   it('does not create plan correction requests before the native host returns a result', async () => {

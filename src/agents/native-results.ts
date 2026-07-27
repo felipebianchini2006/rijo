@@ -140,6 +140,15 @@ export class NativeResultRunner implements AgentRunner {
         return_format: task.return_format,
         notes: task.notes,
         expert_profiles: task.expert_profiles,
+        result_contract: {
+          task_id: task.id,
+          ok: 'boolean',
+          summary: 'non-empty string',
+          payload: 'value that matches return_format',
+          files: 'object that maps project-relative paths to complete string content',
+          files_written: 'optional array of project-relative paths',
+          scope_requests: 'array of requested project-relative paths',
+        },
       }),
     );
   }

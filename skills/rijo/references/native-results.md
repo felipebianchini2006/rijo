@@ -18,6 +18,28 @@ Write one JSON file with this shape:
 }
 ```
 
+Add each native subagent result with this exact entry shape:
+
+```json
+{
+  "task_id": "exact request task identifier",
+  "ok": true,
+  "summary": "Short outcome.",
+  "payload": {},
+  "files": {},
+  "files_written": [],
+  "scope_requests": []
+}
+```
+
+Put the structured return value in `payload`.
+Make `payload` match the request `return_format`.
+Do not encode the payload in `summary`.
+Use a non-empty string for `summary`.
+Use `files` as an object.
+Map each project-relative writer path to its complete string content.
+Omit `files_written` when `files` lists every changed path.
+
 Store this bundle at `.rijo/runtime/native-results.json`.
 Run the selected internal helper with the empty bundle.
 Read each new request from `.rijo/runtime/native-requests.jsonl`.

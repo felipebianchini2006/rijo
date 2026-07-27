@@ -59,6 +59,16 @@ describe('native RIJO product surface', () => {
     expect(skill).not.toContain('claude -p');
     expect(skill).not.toContain('--host');
     expect(skill).not.toContain('--run');
+
+    const nativeResults = fs.readFileSync(
+      path.join(skillRoot, 'references', 'native-results.md'),
+      'utf8',
+    );
+    for (const field of ['task_id', 'ok', 'summary', 'payload', 'files', 'scope_requests']) {
+      expect(nativeResults).toContain(`"${field}"`);
+    }
+    expect(nativeResults).toContain('Put the structured return value in `payload`.');
+    expect(nativeResults).toContain('Do not encode the payload in `summary`.');
   });
 
   it('keeps old skills as short compatibility redirects', () => {
