@@ -10,6 +10,7 @@ import {
 } from '../src/core/decisions.js';
 import { defaultConfig } from '../src/core/config.js';
 import { RijoPaths } from '../src/core/paths.js';
+import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 import { FakeAgentRunner } from '../src/agents/runner.js';
 import {
   commitDecisionProposals,
@@ -284,6 +285,44 @@ describe('autonomous decision policy', () => {
     taskRecord.revoked_leases = [...taskRecord.revoked_leases, envelope.lease_id];
     fs.writeFileSync(taskFile, `${JSON.stringify(taskRecord, null, 2)}\n`);
     expect(() => commitDecisionProposals(ctx, envelope)).toThrow(/stale or revoked/i);
+    expect(fs.existsSync(paths.decisions)).toBe(false);
+  });
+
+  it('rejects decisions when the exact task record is missing', async () => {
+    fs.writeFileSync(`${root}/package.json`, '{"name":"fixture"}\n');
+    const ctx = createContext(root, {
+      runner: decisionRunner(root, 'missing-task-record', { done: true }),
+    });
+    const envelope = await dispatch(ctx, {
+      id: 'missing-task-record',
+      role: 'planner',
+      objective: 'Return a valid result.',
+      return_format: 'JSON payload',
+    });
+    fs.rmSync(`${paths.runtimeDir}/tasks/missing-task-record.json`);
+
+    expect(() => commitDecisionProposals(ctx, envelope)).toThrow(/missing.*cross-epoch/i);
+    expect(fs.existsSync(paths.decisions)).toBe(false);
+  });
+
+  it('rejects decisions replayed through another workflow epoch', async () => {
+    fs.writeFileSync(`${root}/package.json`, '{"name":"fixture"}\n');
+    const first = createContext(root, {
+      runner: decisionRunner(root, 'cross-epoch-result', { done: true }),
+      workflowEpoch: createWorkflowEpoch(),
+    });
+    const envelope = await dispatch(first, {
+      id: 'cross-epoch-result',
+      role: 'planner',
+      objective: 'Return a valid result.',
+      return_format: 'JSON payload',
+    });
+    const second = createContext(root, {
+      runner: decisionRunner(root, 'unused', { done: true }),
+      workflowEpoch: createWorkflowEpoch(),
+    });
+
+    expect(() => commitDecisionProposals(second, envelope)).toThrow(/cross-epoch/i);
     expect(fs.existsSync(paths.decisions)).toBe(false);
   });
 

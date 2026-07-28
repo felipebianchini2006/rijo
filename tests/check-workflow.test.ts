@@ -10,7 +10,7 @@ import { readManifest } from '../src/core/manifest.js';
 import { decideReadiness } from '../src/qa/readiness.js';
 import { deriveJourneys } from '../src/qa/journeys.js';
 import { RequirementSchema } from '../src/core/schemas/index.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, ok, uiSmokeOk } from './helpers.js';
 
 /** A project whose gates can pass: a build/test script and a passing ui-smoke. */
 function prepareReadyProject(root: string, d: ReturnType<typeof deps>) {
@@ -20,7 +20,7 @@ function prepareReadyProject(root: string, d: ReturnType<typeof deps>) {
   );
   d.runner.on(
     (t) => t.id.startsWith('ui-smoke-'),
-    (t) => ok(t, { payload: { passed: true, console_errors: [], network_errors: [], screenshot: null, notes: '' } }),
+    (t) => uiSmokeOk(t),
   );
 }
 

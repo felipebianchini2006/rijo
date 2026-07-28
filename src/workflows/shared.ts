@@ -118,6 +118,11 @@ export interface WorkflowContext {
   taskPatchHooks: {
     afterApplied?: (transactionId: string, taskId: string) => void;
   };
+  /** Test seam for a crash after a durable phase gate receipt. */
+  phaseGateHooks: {
+    afterAcceptedReview?: () => void;
+    afterUiSmokeReceipt?: () => void;
+  };
 }
 
 export interface WorkflowDeps {
@@ -148,6 +153,8 @@ export interface WorkflowDeps {
   planHooks?: WorkflowContext['planHooks'];
   /** test seam: fault injection between task patch apply and task projection. */
   taskPatchHooks?: WorkflowContext['taskPatchHooks'];
+  /** test seam: fault injection after durable phase gate receipts. */
+  phaseGateHooks?: WorkflowContext['phaseGateHooks'];
   /** Authorized workflow identity. Native helpers and resume must reuse it. */
   workflowEpoch?: WorkflowEpoch;
 }
@@ -207,6 +214,7 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     decisionHooks: deps.decisionHooks ?? {},
     planHooks: deps.planHooks ?? {},
     taskPatchHooks: deps.taskPatchHooks ?? {},
+    phaseGateHooks: deps.phaseGateHooks ?? {},
   };
 }
 
@@ -555,7 +563,7 @@ export type ValidatedAgentEnvelope = AgentResult & {
   decision_state: 'PENDING' | 'COMMITTED' | 'DISCARDED';
 };
 
-function validateAgentDecisions(ctx: WorkflowContext, result: AgentResult): ValidatedAgentEnvelope {
+export function validateAgentDecisions(ctx: WorkflowContext, result: AgentResult): ValidatedAgentEnvelope {
   const attemptId = result.attempt_id ?? `unsupervised-${result.task_id}`;
   const generation = result.generation ?? 1;
   const leaseId = result.lease_id ?? `unsupervised-${result.task_id}`;
@@ -616,15 +624,21 @@ export function commitDecisionProposals(ctx: WorkflowContext, envelope: Validate
   );
   const current = TaskRecordSchema.safeParse(readJsonIfExists<unknown>(taskFile));
   if (
-    current.success &&
-    (current.data.state !== 'SUCCEEDED' ||
-      current.data.attempt_id !== envelope.attempt_id ||
-      current.data.generation !== envelope.generation ||
-      current.data.lease_id !== envelope.lease_id ||
-      current.data.revoked_leases.includes(envelope.lease_id))
+    !current.success ||
+    envelope.workflow_epoch !== ctx.workflowEpoch ||
+    current.data.workflow_epoch !== ctx.workflowEpoch ||
+    current.data.workflow_epoch !== envelope.workflow_epoch ||
+    current.data.logical_task_id !== envelope.task_id ||
+    current.data.state !== 'SUCCEEDED' ||
+    current.data.attempt_id !== envelope.attempt_id ||
+    current.data.generation !== envelope.generation ||
+    current.data.lease_id !== envelope.lease_id ||
+    current.data.revoked_leases.includes(envelope.lease_id)
   ) {
     discardDecisionProposals(ctx, envelope);
-    throw new Error(`Dispatch ${envelope.dispatch_id}: stale or revoked result decisions were discarded`);
+    throw new Error(
+      `Dispatch ${envelope.dispatch_id}: missing, stale or revoked, or cross-epoch result decisions were discarded`,
+    );
   }
   for (const pending of envelope.pending_decisions) {
     const outcome = commitPendingDecision(

@@ -1,11 +1,17 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
-import { exists, readJsonIfExists, readText, readTextIfExists, sha256File, writeFileAtomic, writeJsonAtomic, ensureDir } from '../core/fsx.js';
+import { exists, readJsonIfExists, readText, readTextIfExists, sha256, sha256File, writeFileAtomic, writeJsonAtomic, ensureDir } from '../core/fsx.js';
 import { parseFrontmatter, serializeFrontmatter } from '../core/frontmatter.js';
 import { phasePaths, type PhasePaths } from '../core/paths.js';
 import { readState } from '../core/state.js';
-import { touchManifest, canonicalBaselineHash } from '../core/manifest.js';
+import {
+  canonicalBaselineHash,
+  computeHashes,
+  readManifest,
+  touchManifest,
+  type HashOverlay,
+} from '../core/manifest.js';
 import { activeMilestone, type MilestoneRef } from '../core/milestones.js';
 import { readRequirements, readRoadmap, writeRoadmap, nextPhase, type RoadmapDoc } from '../core/roadmap.js';
 import {
@@ -32,9 +38,15 @@ import {
   PatchConflictError,
 } from '../core/workspace.js';
 import { redact } from '../security/redact.js';
+import { DecisionProposalSchema } from '../core/decisions.js';
 import { PhasePlanDraftSchema, PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, looseBool, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
 import type { CommandEvidence } from '../core/commands.js';
-import type { AgentTask, AgentTaskDraft, AgentResult } from '../agents/protocol.js';
+import {
+  AgentResultSchema,
+  type AgentTask,
+  type AgentTaskDraft,
+  type AgentResult,
+} from '../agents/protocol.js';
 import {
   createContext,
   withLock,
@@ -47,6 +59,7 @@ import {
   replaceableAttempt,
   dispatchReadOnly,
   commitDecisionProposals,
+  validateAgentDecisions,
   discardDecisionProposals,
   durableCheckpoint,
   isNativeResultRequired,
@@ -73,9 +86,12 @@ import { TaskStore } from '../supervisor/store.js';
 import {
   completeRetainedTaskPatch,
   listPendingTaskPatches,
+  MilestoneTransaction,
   TransactionApplyConflictError,
   type PendingTaskPatch,
+  type TxnPathState,
 } from '../core/txn.js';
+import { WorkflowEpochSchema } from '../core/workflow-epoch.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -314,6 +330,34 @@ const UiSmokePayloadSchema = z.object({
   network_errors: z.array(z.string()).default([]),
   screenshot: z.string().nullable().default(null),
   notes: z.string().default(''),
+});
+
+const DecisionDispatchReceiptSchema = z.object({
+  task_id: z.string().min(1),
+  workflow_epoch: WorkflowEpochSchema,
+  attempt_id: z.string().min(1),
+  generation: z.number().int().min(1),
+  lease_id: z.string().min(1),
+  decision_proposals: z.array(DecisionProposalSchema),
+});
+type DecisionDispatchReceipt = z.infer<typeof DecisionDispatchReceiptSchema>;
+
+const AcceptedReviewGateSchema = ReviewPayloadSchema.extend({
+  gate_status: z.literal('ACCEPTED'),
+  review_input_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  loop: z.number().int().min(0),
+  decision_dispatches: z.array(DecisionDispatchReceiptSchema).default([]),
+});
+
+const UiSmokeReceiptSchema = z.object({
+  version: z.literal(2),
+  input_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  recorded_at: z.string().datetime({ offset: true }),
+  result: UiSmokePayloadSchema,
+  screenshot_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  screenshot_size: z.number().int().positive(),
+  screenshot_media_type: z.enum(['image/png', 'image/jpeg', 'image/gif', 'image/webp']),
+  decision_dispatches: z.array(DecisionDispatchReceiptSchema).default([]),
 });
 
 export async function runWorkflow(
@@ -1623,6 +1667,7 @@ async function executePhase(
   // ---- VERIFY + CODE_REVIEW loop (bounded)
   let reviewLoops = 0;
   let evidences: CommandEvidence[] = [];
+  let acceptedReviewInputHash: string | null = null;
   while (true) {
     stage('VERIFY', 'Run build, lint, and focused tests.');
     for (const t of readPlan(pp.plan).tasks) {
@@ -1685,6 +1730,29 @@ async function executePhase(
 
     stage('CODE_REVIEW', 'Run an independent code review.');
     const diffSummary = changedFilesReport(ctx, phaseBaseline);
+    const changeFingerprint = phaseChangeFingerprint(ctx, phaseBaseline);
+    const reviewedPaths = plan.tasks.flatMap((t) => [...t.files, ...t.write_scope]);
+    const securityContext = [
+      phase.name,
+      ...reqDoc.requirements
+        .filter((requirement) => requirement.phase === phase.id)
+        .flatMap((requirement) => [requirement.description, requirement.acceptance]),
+      ...reviewedPaths,
+    ].join('\n');
+    const reviewInputHash = phaseReviewInputHash(
+      phase.id,
+      plan,
+      changeFingerprint,
+      evidences,
+      securityContext,
+    );
+    const acceptedGate = readAcceptedReviewGate(pp, reviewInputHash);
+    if (acceptedGate) {
+      commitDecisionDispatchReceipts(ctx, acceptedGate.decisionDispatches);
+      reviewLoops = acceptedGate.loop;
+      acceptedReviewInputHash = reviewInputHash;
+      break;
+    }
     const crTask: AgentTaskDraft = {
       id: `code-review-${phase.id}-l${reviewLoops}`,
       role: 'reviewer',
@@ -1696,11 +1764,12 @@ async function executePhase(
       acceptance_criteria: [],
       verification_commands: [],
       return_format: 'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}',
-      notes: `DIFF SUMMARY:\n${diffSummary}\n\nEVIDENCE:\n${evidences.map((e) => `${e.command} → exit ${e.exit_code}`).join('\n')}`,
+      notes:
+        `CHANGE SET HASH: ${changeFingerprint}\n\n` +
+        `DIFF SUMMARY:\n${diffSummary}\n\nEVIDENCE:\n${evidences.map((e) => `${e.command} → exit ${e.exit_code}`).join('\n')}`,
       workspace: null,
       canonical_baseline: null,
     };
-    const reviewedPaths = plan.tasks.flatMap((t) => [...t.files, ...t.write_scope]);
     const { result: crRes, violation: crViolation } = await dispatchReadOnly(ctx, crTask, {
       stage: 'CODE_REVIEW',
       requirementTags: inferSecurityTag(reviewedPaths),
@@ -1745,13 +1814,6 @@ async function executePhase(
     }
     let reviewData = cr.data;
     let securityEnvelope: ValidatedAgentEnvelope | null = null;
-    const securityContext = [
-      phase.name,
-      ...reqDoc.requirements
-        .filter((requirement) => requirement.phase === phase.id)
-        .flatMap((requirement) => [requirement.description, requirement.acceptance]),
-      ...reviewedPaths,
-    ].join('\n');
     if (
       /\b(auth(?:entication|orization)?|permission|payment|money|secret|credential|upload|delete|destruct|trust boundary|personal data)\b/i.test(
         securityContext,
@@ -1772,7 +1834,9 @@ async function executePhase(
         verification_commands: [],
         return_format:
           'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}.',
-        notes: `RISK CONTEXT:\n${securityContext}\n\nDIFF SUMMARY:\n${diffSummary}`,
+        notes:
+          `CHANGE SET HASH: ${changeFingerprint}\n\n` +
+          `RISK CONTEXT:\n${securityContext}\n\nDIFF SUMMARY:\n${diffSummary}`,
       };
       const securityReview = await dispatchReadOnly(ctx, securityTask, {
         stage: 'ENGINEERING_REVIEW',
@@ -1804,13 +1868,12 @@ async function executePhase(
         findings: [...reviewData.findings, ...securityPayload.data.findings],
       };
     }
-    writeReviewDoc(pp, reviewData, reviewLoops, now);
-    touchManifest(paths, () => {}, now);
     const blockingSeverities = new Set(['blocker', 'critical', 'high']);
     const contractGaps = reviewData.findings.filter(
       (f) => (f.type === 'intent_gap' || f.type === 'spec_gap') && blockingSeverities.has(f.severity),
     );
     if (contractGaps.length > 0) {
+      persistReviewDoc(ctx, pp, reviewData, reviewLoops);
       return blocked(
         ctx,
         `Phase ${phase.id}: review found plan/intent gaps; returning to planning instead of patching locally.`,
@@ -1825,17 +1888,30 @@ async function executePhase(
       (f) => !['defer', 'reject'].includes(f.type) && blockingSeverities.has(f.severity),
     );
     if (actionable.length === 0) {
+      const decisionReceipts = decisionDispatchReceipts([crRes, securityEnvelope]);
+      persistReviewDoc(
+        ctx,
+        pp,
+        reviewData,
+        reviewLoops,
+        reviewInputHash,
+        decisionReceipts,
+      );
+      acceptedReviewInputHash = reviewInputHash;
+      ctx.phaseGateHooks.afterAcceptedReview?.();
       commitDecisionProposals(ctx, crRes);
       if (securityEnvelope) commitDecisionProposals(ctx, securityEnvelope);
       break;
     }
     if (reviewLoops >= config.limits.review_loops) {
+      persistReviewDoc(ctx, pp, reviewData, reviewLoops);
       return blocked(
         ctx,
         `Phase ${phase.id}: review findings persist after ${config.limits.review_loops} repair cycles.`,
         actionable.map((f) => `${f.type}/${f.severity}: ${f.description}`),
       );
     }
+    persistReviewDoc(ctx, pp, reviewData, reviewLoops);
     reviewLoops++;
     discardDecisionProposals(ctx, crRes);
     if (securityEnvelope) discardDecisionProposals(ctx, securityEnvelope);
@@ -1850,6 +1926,10 @@ async function executePhase(
     checkpointControlledSnapshot();
   }
 
+  if (!acceptedReviewInputHash) {
+    return blocked(ctx, `Phase ${phase.id}: the accepted engineering review was not retained.`);
+  }
+
   // ---- UI_SMOKE (only for UI surfaces; honest about capability)
   let uiSmokeNote = 'not applicable (no UI surface in this phase)';
   if (phase.ui_surface) {
@@ -1859,38 +1939,79 @@ async function executePhase(
     } else {
       stage('UI_SMOKE', 'Run a visual smoke test on the changed surface.');
       const screenshotScope = path.relative(ctx.projectRoot, path.join(milestone.paths.qaDir, 'screenshots')).split(path.sep).join('/') + '/**';
-      const smokeTask: AgentTaskDraft = {
-        id: `ui-smoke-${phase.id}`,
-        role: 'qa',
-        objective: 'UI smoke: load the changed surface, check console and network for errors, exercise the main navigation, capture a minimal screenshot.',
-        canonical_files: [pp.plan].filter(exists),
-        code_files: [],
-        write_scope: [screenshotScope],
-        acceptance_criteria: ['No unhandled console errors', 'No failing network requests on the main flow'],
-        verification_commands: [],
-        return_format: 'JSON payload: {passed, console_errors[], network_errors[], screenshot, notes}',
-        notes: '',
-        workspace: null,
-        canonical_baseline: null,
-      };
-      const smokeHandle = replaceableAttempt(ctx, smokeTask, { canonicalWriteScope: [screenshotScope] }, { stage: 'UI_SMOKE' });
-      const smokeRes = await dispatch(ctx, smokeHandle.attempt.task, { stage: 'UI_SMOKE' }, { prepareReplacement: smokeHandle.prepareReplacement });
-      const smoke = UiSmokePayloadSchema.safeParse(smokeRes.payload);
-      try {
-        if (!smokeRes.ok || !smoke.success || !smoke.data.passed) {
-          return blocked(ctx, `Phase ${phase.id}: UI smoke failed.`, [
-            smokeRes.summary,
-            ...(smoke.success ? [...smoke.data.console_errors, ...smoke.data.network_errors] : []),
+      const smokeInputHash = phaseUiSmokeInputHash(
+        phase.id,
+        plan,
+        phaseChangeFingerprint(ctx, phaseBaseline),
+        acceptedReviewInputHash,
+      );
+      const priorSmoke = readUiSmokeReceipt(ctx, pp, smokeInputHash, screenshotScope);
+      if (priorSmoke) {
+        commitDecisionDispatchReceipts(ctx, priorSmoke.decisionDispatches);
+        uiSmokeNote = smokeNote(priorSmoke.result);
+      } else {
+        const smokeTask: AgentTaskDraft = {
+          id: `ui-smoke-${phase.id}`,
+          role: 'qa',
+          objective:
+            'UI smoke: load the changed surface, check console and network for errors, exercise the main navigation, capture a minimal screenshot.',
+          canonical_files: [pp.plan].filter(exists),
+          code_files: [],
+          write_scope: [screenshotScope],
+          acceptance_criteria: [
+            'No unhandled console errors',
+            'No failing network requests on the main flow',
+          ],
+          verification_commands: [],
+          return_format:
+            'JSON payload: {passed, console_errors[], network_errors[], screenshot, notes}',
+          notes: '',
+          workspace: null,
+          canonical_baseline: null,
+        };
+        const smokeHandle = replaceableAttempt(
+          ctx,
+          smokeTask,
+          { canonicalWriteScope: [screenshotScope] },
+          { stage: 'UI_SMOKE' },
+        );
+        const smokeRes = await dispatch(
+          ctx,
+          smokeHandle.attempt.task,
+          { stage: 'UI_SMOKE' },
+          { prepareReplacement: smokeHandle.prepareReplacement },
+        );
+        const smoke = UiSmokePayloadSchema.safeParse(smokeRes.payload);
+        try {
+          if (!smokeRes.ok || !smoke.success || !smoke.data.passed) {
+            return blocked(ctx, `Phase ${phase.id}: UI smoke failed.`, [
+              smokeRes.summary,
+              ...(smoke.success
+                ? [...smoke.data.console_errors, ...smoke.data.network_errors]
+                : []),
+            ]);
+          }
+          smokeHandle.attempt.workspace.applyVerifiedPatch();
+          const decisionReceipts = decisionDispatchReceipts([smokeRes]);
+          writeUiSmokeReceipt(
+            ctx,
+            pp,
+            smokeInputHash,
+            smoke.data,
+            decisionReceipts,
+            screenshotScope,
+          );
+        } catch (err) {
+          return blocked(ctx, `Phase ${phase.id}: UI smoke violated workspace boundaries.`, [
+            String((err as Error).message),
           ]);
+        } finally {
+          smokeHandle.attempt.workspace.discard();
         }
-        smokeHandle.attempt.workspace.applyVerifiedPatch();
+        ctx.phaseGateHooks.afterUiSmokeReceipt?.();
         commitDecisionProposals(ctx, smokeRes);
-      } catch (err) {
-        return blocked(ctx, `Phase ${phase.id}: UI smoke violated workspace boundaries.`, [String((err as Error).message)]);
-      } finally {
-        smokeHandle.attempt.workspace.discard();
+        uiSmokeNote = smokeNote(smoke.data);
       }
-      uiSmokeNote = `passed${smoke.data.screenshot ? ` (screenshot: ${smoke.data.screenshot})` : ''}`;
     }
   }
 
@@ -2195,11 +2316,261 @@ function changedFilesReport(ctx: WorkflowContext, baseline: FileSnapshot): strin
   return parts.join('\n\n');
 }
 
-function writeReviewDoc(pp: PhasePaths, review: ReviewPayload, loop: number, now: () => Date): void {
-  writeFileAtomic(
-    pp.review,
-    serializeFrontmatter(
-      { approved: review.approved, loop, reviewed_at: now().toISOString(), findings: review.findings },
+function phaseReviewInputHash(
+  phaseId: string,
+  plan: PhasePlan,
+  changeFingerprint: string,
+  evidences: CommandEvidence[],
+  securityContext: string,
+): string {
+  return sha256(JSON.stringify({
+    phase: phaseId,
+    plan_contract_hash: planContractHash(plan),
+    change_fingerprint: changeFingerprint,
+    evidence: evidences.map((evidence) => ({
+      command: evidence.command,
+      exit_code: evidence.exit_code,
+      blocked: Boolean(evidence.blocked),
+    })),
+    security_context: securityContext,
+  }));
+}
+
+function decisionDispatchReceipts(
+  envelopes: Array<ValidatedAgentEnvelope | null>,
+): DecisionDispatchReceipt[] {
+  return envelopes.flatMap((envelope) => {
+    if (!envelope || (envelope.decision_proposals ?? []).length === 0) return [];
+    return [DecisionDispatchReceiptSchema.parse({
+      task_id: envelope.task_id,
+      workflow_epoch: envelope.workflow_epoch,
+      attempt_id: envelope.attempt_id,
+      generation: envelope.generation,
+      lease_id: envelope.lease_id,
+      decision_proposals: envelope.decision_proposals,
+    })];
+  });
+}
+
+function commitDecisionDispatchReceipts(
+  ctx: WorkflowContext,
+  receipts: DecisionDispatchReceipt[],
+): void {
+  for (const receipt of receipts) {
+    const result = AgentResultSchema.parse({
+      task_id: receipt.task_id,
+      ok: true,
+      summary: 'Replay validated decision proposals from a durable phase gate.',
+      files_written: [],
+      payload: null,
+      scope_requests: [],
+      decision_proposals: receipt.decision_proposals,
+      workflow_epoch: receipt.workflow_epoch,
+      attempt_id: receipt.attempt_id,
+      generation: receipt.generation,
+      lease_id: receipt.lease_id,
+    });
+    const envelope = validateAgentDecisions(ctx, result);
+    if (
+      !envelope.ok ||
+      envelope.pending_decisions.length !== receipt.decision_proposals.length
+    ) {
+      discardDecisionProposals(ctx, envelope);
+      throw new Error(
+        `Dispatch ${receipt.task_id}: durable decision receipt failed revalidation`,
+      );
+    }
+    commitDecisionProposals(ctx, envelope);
+  }
+}
+
+function phaseChangeFingerprint(ctx: WorkflowContext, baseline: FileSnapshot): string {
+  const current = snapshotFiles(ctx.projectRoot);
+  const delta = diffSnapshots(baseline, current);
+  return sha256(JSON.stringify(delta.changed.map((relative) => ({
+    path: relative,
+    hash: current.get(relative) ?? null,
+  }))));
+}
+
+function readAcceptedReviewGate(
+  pp: PhasePaths,
+  inputHash: string,
+): {
+  approved: boolean;
+  findings: ReviewPayload['findings'];
+  loop: number;
+  decisionDispatches: DecisionDispatchReceipt[];
+} | null {
+  const raw = readTextIfExists(pp.review);
+  if (raw === null) return null;
+  const parsed = AcceptedReviewGateSchema.safeParse(parseFrontmatter<unknown>(raw).data);
+  if (!parsed.success || parsed.data.review_input_hash !== inputHash) return null;
+  return {
+    approved: parsed.data.approved,
+    findings: parsed.data.findings,
+    loop: parsed.data.loop,
+    decisionDispatches: parsed.data.decision_dispatches,
+  };
+}
+
+function phaseUiSmokeInputHash(
+  phaseId: string,
+  plan: PhasePlan,
+  changeFingerprint: string,
+  reviewInputHash: string,
+): string {
+  return sha256(JSON.stringify({
+    phase: phaseId,
+    plan_contract_hash: planContractHash(plan),
+    change_fingerprint: changeFingerprint,
+    review_input_hash: reviewInputHash,
+    acceptance: [
+      'No unhandled console errors',
+      'No failing network requests on the main flow',
+    ],
+  }));
+}
+
+function uiSmokeReceiptPath(pp: PhasePaths): string {
+  return path.join(path.dirname(pp.review), 'UI-SMOKE.json');
+}
+
+function normalizedProjectRelativePath(input: string): string | null {
+  const slash = input.replace(/\\/g, '/');
+  if (slash === '' || path.isAbsolute(input) || path.posix.isAbsolute(slash)) return null;
+  const normalized = path.posix.normalize(slash);
+  if (
+    normalized !== slash ||
+    normalized === '..' ||
+    normalized.startsWith('../')
+  ) return null;
+  return normalized;
+}
+
+function screenshotMediaType(target: string): z.infer<
+  typeof UiSmokeReceiptSchema
+>['screenshot_media_type'] | null {
+  const prefix = fs.readFileSync(target).subarray(0, 12);
+  if (
+    prefix.length >= 8 &&
+    prefix.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) return 'image/png';
+  if (prefix.length >= 3 && prefix[0] === 0xff && prefix[1] === 0xd8 && prefix[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  const header = prefix.toString('ascii');
+  if (header.startsWith('GIF87a') || header.startsWith('GIF89a')) return 'image/gif';
+  if (header.startsWith('RIFF') && header.slice(8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+function readUiSmokeReceipt(
+  ctx: WorkflowContext,
+  pp: PhasePaths,
+  inputHash: string,
+  screenshotScope: string,
+): {
+  result: z.infer<typeof UiSmokePayloadSchema>;
+  decisionDispatches: DecisionDispatchReceipt[];
+} | null {
+  const parsed = UiSmokeReceiptSchema.safeParse(
+    readJsonIfExists<unknown>(uiSmokeReceiptPath(pp)),
+  );
+  if (!parsed.success || parsed.data.input_hash !== inputHash) return null;
+  const screenshot = parsed.data.result.screenshot;
+  if (screenshot === null) return null;
+  const normalizedScreenshot = normalizedProjectRelativePath(screenshot);
+  if (
+    normalizedScreenshot === null ||
+    !pathInScope(normalizedScreenshot, [screenshotScope])
+  ) return null;
+  const absolute = path.resolve(ctx.projectRoot, normalizedScreenshot);
+  const rootPrefix = `${path.resolve(ctx.projectRoot)}${path.sep}`;
+  if (!absolute.startsWith(rootPrefix) || !exists(absolute)) return null;
+  const screenshotStat = fs.lstatSync(absolute);
+  if (!screenshotStat.isFile() || screenshotStat.isSymbolicLink()) return null;
+  const mediaType = screenshotMediaType(absolute);
+  if (mediaType === null || mediaType !== parsed.data.screenshot_media_type) return null;
+  if (
+    parsed.data.screenshot_sha256 !== sha256File(absolute) ||
+    parsed.data.screenshot_size !== screenshotStat.size
+  ) return null;
+  return {
+    result: parsed.data.result,
+    decisionDispatches: parsed.data.decision_dispatches,
+  };
+}
+
+function writeUiSmokeReceipt(
+  ctx: WorkflowContext,
+  pp: PhasePaths,
+  inputHash: string,
+  result: z.infer<typeof UiSmokePayloadSchema>,
+  decisionDispatches: DecisionDispatchReceipt[],
+  screenshotScope: string,
+): void {
+  if (result.screenshot === null) {
+    throw new Error('UI smoke must return a project-relative screenshot path.');
+  }
+  const normalizedScreenshot = normalizedProjectRelativePath(result.screenshot);
+  if (normalizedScreenshot === null) {
+    throw new Error('UI smoke screenshot path must be normalized and project-relative.');
+  }
+  if (!pathInScope(normalizedScreenshot, [screenshotScope])) {
+    throw new Error('UI smoke screenshot is outside the authorized screenshot scope.');
+  }
+  const absolute = path.resolve(ctx.projectRoot, normalizedScreenshot);
+  const rootPrefix = `${path.resolve(ctx.projectRoot)}${path.sep}`;
+  if (!absolute.startsWith(rootPrefix) || !exists(absolute)) {
+    throw new Error('UI smoke screenshot evidence is missing or outside the project.');
+  }
+  const screenshotStat = fs.lstatSync(absolute);
+  if (!screenshotStat.isFile() || screenshotStat.isSymbolicLink()) {
+    throw new Error('UI smoke screenshot evidence must be a regular file.');
+  }
+  const mediaType = screenshotMediaType(absolute);
+  if (mediaType === null) {
+    throw new Error('UI smoke screenshot evidence must contain a supported image signature.');
+  }
+  const content = `${JSON.stringify({
+    version: 2,
+    input_hash: inputHash,
+    recorded_at: ctx.now().toISOString(),
+    result,
+    screenshot_sha256: sha256File(absolute),
+    screenshot_size: screenshotStat.size,
+    screenshot_media_type: mediaType,
+    decision_dispatches: decisionDispatches,
+  }, null, 2)}\n`;
+  persistPhaseGateFile(ctx, uiSmokeReceiptPath(pp), content);
+}
+
+function smokeNote(result: z.infer<typeof UiSmokePayloadSchema>): string {
+  return `passed${result.screenshot ? ` (screenshot: ${result.screenshot})` : ''}`;
+}
+
+function renderReviewDoc(
+  review: ReviewPayload,
+  loop: number,
+  now: () => Date,
+  acceptedInputHash?: string,
+  decisionDispatches: DecisionDispatchReceipt[] = [],
+): string {
+  return serializeFrontmatter(
+      {
+        approved: review.approved,
+        loop,
+        reviewed_at: now().toISOString(),
+        findings: review.findings,
+        ...(acceptedInputHash
+          ? {
+              gate_status: 'ACCEPTED',
+              review_input_hash: acceptedInputHash,
+              decision_dispatches: decisionDispatches,
+            }
+          : {}),
+      },
       [
         `# Review`,
         '',
@@ -2208,6 +2579,89 @@ function writeReviewDoc(pp: PhasePaths, review: ReviewPayload, loop: number, now
           : 'No findings.',
         '',
       ].join('\n'),
+  );
+}
+
+function phaseGatePreimage(target: string): TxnPathState {
+  if (!exists(target)) return { kind: 'absent' };
+  const stat = fs.lstatSync(target);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`Phase gate target is not a regular file: ${target}`);
+  }
+  return { kind: 'file', sha256: sha256File(target) };
+}
+
+/**
+ * Persist one canonical phase gate and manifest as a recoverable transaction.
+ * Startup reconciliation completes a committed partial apply before drift
+ * validation runs.
+ */
+function persistPhaseGateFile(
+  ctx: WorkflowContext,
+  target: string,
+  content: string,
+): void {
+  const manifest = readManifest(ctx.paths);
+  if (!manifest) throw new Error('Cannot persist a phase gate without manifest.json.');
+  const relProject = (candidate: string) =>
+    path.relative(ctx.projectRoot, candidate).split(path.sep).join('/');
+  const relRijo = path.relative(ctx.paths.root, target).split(path.sep).join('/');
+  if (
+    relRijo === '' ||
+    relRijo === '..' ||
+    relRijo.startsWith('../') ||
+    path.isAbsolute(relRijo)
+  ) {
+    throw new Error('Phase gate target must be inside .rijo/.');
+  }
+  const overlay: HashOverlay = new Map([[relRijo, content]]);
+  manifest.hashes = computeHashes(ctx.paths, overlay);
+  manifest.updated_at = ctx.now().toISOString();
+  const manifestContent = `${JSON.stringify(manifest, null, 2)}\n`;
+  const transaction = MilestoneTransaction.begin(
+    ctx.paths,
+    {
+      kind: 'phase-gate',
+      prev: exists(target) ? sha256File(target) : null,
+      next: sha256(content),
+    },
+    ctx.txnHooks,
+    ctx.now,
+  );
+  transaction.stageBytes(
+    relProject(target),
+    Buffer.from(content, 'utf8'),
+    0o644,
+    phaseGatePreimage(target),
+  );
+  transaction.stageBytes(
+    relProject(ctx.paths.manifest),
+    Buffer.from(manifestContent, 'utf8'),
+    0o644,
+    phaseGatePreimage(ctx.paths.manifest),
+  );
+  transaction.commitPoint();
+  transaction.apply();
+  transaction.finish();
+}
+
+function persistReviewDoc(
+  ctx: WorkflowContext,
+  pp: PhasePaths,
+  review: ReviewPayload,
+  loop: number,
+  acceptedInputHash?: string,
+  decisionDispatches: DecisionDispatchReceipt[] = [],
+): void {
+  persistPhaseGateFile(
+    ctx,
+    pp.review,
+    renderReviewDoc(
+      review,
+      loop,
+      ctx.now,
+      acceptedInputHash,
+      decisionDispatches,
     ),
   );
 }

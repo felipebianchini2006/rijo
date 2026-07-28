@@ -25,7 +25,14 @@ const TRACKED = [
 const MILESTONE_TRACKED = ['SCOPE.md', 'REQUIREMENTS.md', 'ROADMAP.md', 'RESEARCH.md', 'CLOSEOUT.md'];
 
 /** Per-phase canonical artifacts tracked for drift. */
-const PHASE_TRACKED = ['RESEARCH.md', 'SPEC.md', 'PLAN.md', 'VERIFICATION.md', 'REVIEW.md'];
+const PHASE_TRACKED = [
+  'RESEARCH.md',
+  'SPEC.md',
+  'PLAN.md',
+  'VERIFICATION.md',
+  'REVIEW.md',
+  'UI-SMOKE.json',
+];
 
 /**
  * Overlay of not-yet-written contents keyed by path relative to `.rijo/`.

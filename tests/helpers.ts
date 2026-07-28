@@ -68,6 +68,33 @@ export function ok(task: AgentTask, extra: Partial<AgentResult> = {}): AgentResu
   };
 }
 
+export function uiSmokeOk(task: AgentTask, notes = 'The UI smoke passed.'): AgentResult {
+  if (!task.workspace) throw new Error('The UI smoke task has no isolated workspace.');
+  const scope = task.write_scope.find((entry) => entry.endsWith('/**'));
+  if (!scope) throw new Error('The UI smoke task has no screenshot scope.');
+  const directory = scope.slice(0, -3);
+  const screenshot = `${directory}/${task.id}.png`;
+  const absolute = path.join(task.workspace.root, screenshot);
+  fs.mkdirSync(path.dirname(absolute), { recursive: true });
+  fs.writeFileSync(
+    absolute,
+    Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from(`RIJO UI smoke evidence: ${task.id}\n`, 'utf8'),
+    ]),
+  );
+  return ok(task, {
+    files_written: [screenshot],
+    payload: {
+      passed: true,
+      console_errors: [],
+      network_errors: [],
+      screenshot,
+      notes,
+    },
+  });
+}
+
 /** Evidence-valid structured payload for a RIJO map shard fake. */
 export function mapFragmentFor(task: AgentTask): unknown {
   const marker = 'SHARD INVENTORY:\n';
