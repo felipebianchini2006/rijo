@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { detectClaude, generateClaudeAdapter } from '../adapters/claude.js';
 import { detectCodex, generateCodexAdapter } from '../adapters/codex.js';
@@ -110,6 +111,7 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
     assertContainedWithoutSymlinks(projectRoot, target);
   }
   ensureDir(toolingRoot);
+  updateProjectIgnore(projectRoot, isolated);
   const current = readJsonIfExists<Record<string, unknown>>(manifest) ?? {};
   const devDependencies =
     current['devDependencies'] && typeof current['devDependencies'] === 'object'
@@ -152,6 +154,28 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
     lockfile,
     launcher,
   };
+}
+
+function updateProjectIgnore(projectRoot: string, isolated: boolean): void {
+  const file = path.join(projectRoot, '.gitignore');
+  const begin = '# RIJO:BEGIN';
+  const end = '# RIJO:END';
+  const body = [
+    begin,
+    isolated ? '.rijo/tooling/node_modules/' : 'node_modules/',
+    '.rijo/runtime/',
+    end,
+  ].join('\n');
+  const current = exists(file) ? fs.readFileSync(file, 'utf8') : '';
+  const start = current.indexOf(begin);
+  const finish = current.indexOf(end);
+  const updated =
+    start >= 0 && finish > start
+      ? `${current.slice(0, start)}${body}${current.slice(finish + end.length)}`
+      : current.trim().length === 0
+        ? `${body}\n`
+        : `${current.trimEnd()}\n\n${body}\n`;
+  writeFileAtomic(file, updated);
 }
 
 /** Install the exact project dependency and produce or update its npm lockfile. */

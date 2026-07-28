@@ -29,6 +29,10 @@ describe('native installer API', () => {
     expect(
       JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).devDependencies.rijo,
     ).toBe('0.2.0-rc.1');
+    const ignore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8');
+    expect(ignore).toContain('node_modules/');
+    expect(ignore).toContain('.rijo/runtime/');
+    expect(ignore.match(/# RIJO:BEGIN/g)).toHaveLength(1);
   });
 
   it('uses provider user locations and is byte-idempotent', () => {
@@ -66,6 +70,8 @@ describe('native installer API', () => {
     expect(instructions).toContain('Keep this text.');
     expect(instructions.match(/<!-- RIJO:BEGIN -->/g)).toHaveLength(1);
     expect(instructions.match(/<!-- RIJO:END -->/g)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(root, '.gitignore'), 'utf8').match(/# RIJO:BEGIN/g))
+      .toHaveLength(1);
   });
 
   it('rejects a provider destination that escapes through a symbolic link', () => {
@@ -100,6 +106,8 @@ describe('native installer API', () => {
       ).devDependencies.rijo,
     ).toBe('0.2.0-rc.1');
     expect(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).not.toContain('rijo');
+    expect(fs.readFileSync(path.join(root, '.gitignore'), 'utf8'))
+      .toContain('.rijo/tooling/node_modules/');
   });
 
   it('runs only the locked local CLI and blocks a divergent lock version', () => {
