@@ -435,4 +435,92 @@ describe('native result ingestion', () => {
     expect(detectDrift(paths)).toEqual({ drifted: [], missing: [] });
     expect(fs.existsSync(path.join(paths.runtimeDir, 'native-requests.jsonl'))).toBe(true);
   });
+
+  it('completes project setup across native helper turns without regenerating validated tasks', async () => {
+    const root = tmpProject('rijo-native-project-loop-');
+    roots.push(root);
+    writePlanFile(root, 'PLAN.md');
+    const runtime = deps(root);
+    const fake = runtime.runner!;
+    const bundle = path.join(root, 'native-results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    let outcome: Awaited<ReturnType<typeof newWorkflow>> | null = null;
+
+    for (let turn = 0; turn < 8 && outcome === null; turn++) {
+      try {
+        outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, {
+          ...runtime,
+          runner: new NativeResultRunner(bundle),
+        });
+      } catch (error) {
+        expect(String(error)).toContain('NATIVE_RESULT_REQUIRED');
+        const stored = JSON.parse(fs.readFileSync(bundle, 'utf8')) as {
+          version: 2;
+          results: Array<{ request_id: string }>;
+        };
+        const completed = new Set(stored.results.map((result) => result.request_id));
+        const requests = fs
+          .readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8')
+          .trim()
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((line) => JSON.parse(line));
+        for (const request of requests) {
+          if (completed.has(request.request_id)) continue;
+          const task = AgentTaskSchema.parse({
+            id: request.logical_task_id,
+            role: request.role,
+            tier: request.tier,
+            objective: request.objective,
+            canonical_files: request.canonical_files,
+            code_files: request.code_files,
+            write_scope: request.write_scope,
+            acceptance_criteria: request.acceptance_criteria,
+            verification_commands: request.verification_commands,
+            return_format: request.return_format,
+            notes: request.notes,
+            expert_profiles: request.expert_profiles,
+            attempt: {
+              logical_task_id: request.logical_task_id,
+              attempt_id: request.attempt_id,
+              generation: request.generation,
+              lease_id: request.lease_id,
+              idempotency_key: request.idempotency_key,
+              canonical_baseline_hash: null,
+              workspace_id: null,
+            },
+          });
+          const result = await fake.runTask(task);
+          stored.results.push({
+            ...request,
+            ok: result.ok,
+            summary: result.summary,
+            payload: result.payload,
+            files: {},
+            files_written: result.files_written,
+            scope_requests: result.scope_requests,
+            decision_proposals: result.decision_proposals ?? [],
+            artifacts: [],
+          });
+        }
+        fs.writeFileSync(bundle, JSON.stringify(stored));
+      }
+    }
+
+    expect(outcome?.ok, outcome?.message).toBe(true);
+    const requests = fs
+      .readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8')
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { request_id: string; logical_task_id: string });
+    expect(new Set(requests.map((request) => request.request_id)).size).toBe(requests.length);
+    expect(requests.map((request) => request.logical_task_id)).toEqual([
+      'new-extract',
+      'new-research-1',
+      'new-research-2',
+      'new-research-3',
+      'new-roadmap',
+    ]);
+  });
 });
