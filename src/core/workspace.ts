@@ -2,7 +2,9 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ensureDir, exists, sha256 } from './fsx.js';
+import { RijoPaths } from './paths.js';
 import { pathInScope } from './scope.js';
+import { MilestoneTransaction, type TxnHooks } from './txn.js';
 import { isSensitivePath } from '../security/sensitive.js';
 
 /**
@@ -247,6 +249,8 @@ export interface AttemptWorkspaceOptions {
   baselineCommit?: string | null;
   /** hash of the canonical baseline (manifest hashes) this attempt started from. */
   baselineCanonicalHash?: string;
+  /** Test seam for durable patch fault injection. */
+  transactionHooks?: TxnHooks;
 }
 
 export class AttemptWorkspace {
@@ -268,6 +272,7 @@ export class AttemptWorkspace {
      */
     public readonly droppedDependencyLinks: string[],
     private readonly baseline: TreeSnapshot,
+    private readonly transactionHooks: TxnHooks,
   ) {}
 
   /**
@@ -306,6 +311,7 @@ export class AttemptWorkspace {
       opts.baselineCanonicalHash ?? '',
       droppedDependencyLinks,
       baseline,
+      opts.transactionHooks ?? {},
     );
   }
 
@@ -374,25 +380,34 @@ export class AttemptWorkspace {
     if (conflicts.length > 0) throw new PatchConflictError(this.taskId, conflicts);
 
     const after = snapshotTree(this.root);
+    const transaction = MilestoneTransaction.begin(
+      new RijoPaths(this.projectRoot),
+      {
+        kind: 'task-patch',
+        prev: this.baselineCanonicalHash || null,
+        next: sha256(
+          JSON.stringify({
+            task_id: this.taskId,
+            workspace_id: this.id,
+            changed: delta.changed,
+          }),
+        ),
+      },
+      this.transactionHooks,
+    );
+    for (const rel of delta.removed) transaction.stageDelete(rel);
     for (const rel of [...delta.added, ...delta.modified]) {
-      const src = path.join(this.root, rel);
-      const dst = path.join(this.projectRoot, rel);
-      ensureDir(path.dirname(dst));
+      const source = path.join(this.root, rel);
       const entry = after.get(rel)!;
       if (entry.symlinkTarget !== null) {
-        fs.rmSync(dst, { force: true });
-        fs.symlinkSync(entry.symlinkTarget, dst);
+        transaction.stageSymlink(rel, entry.symlinkTarget);
       } else {
-        // Never write THROUGH a link occupying the destination: copyFileSync
-        // follows it and would clobber whatever it points at, possibly outside
-        // the checkout. Replace the link with the real file instead.
-        if (isSymlink(dst)) fs.rmSync(dst, { force: true });
-        fs.copyFileSync(src, dst);
+        transaction.stageBytes(rel, fs.readFileSync(source), fs.statSync(source).mode & 0o777);
       }
     }
-    for (const rel of delta.removed) {
-      fs.rmSync(path.join(this.projectRoot, rel), { force: true });
-    }
+    transaction.commitPoint();
+    transaction.apply();
+    transaction.finish();
     return { applied: delta.changed, renamed: delta.renamed };
   }
 

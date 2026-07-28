@@ -10,15 +10,42 @@ import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { validateStateIntegrity } from '../src/core/traceability.js';
 import { readRequirements } from '../src/core/roadmap.js';
-import { tmpProject, cleanup, writePlanFile, deps, EXTRACTION_PAYLOAD } from './helpers.js';
+import { tmpProject, cleanup, writePlanFile, deps, EXTRACTION_PAYLOAD, ok } from './helpers.js';
 
 const M2_EXTRACTION = {
   ...EXTRACTION_PAYLOAD,
   project_name: 'Store v2',
-  requirements: [{ description: 'Discount coupons', acceptance: 'Coupon applies a discount', non_functional: false, classification: 'NEW' as const }],
-  phases: [{ name: 'Cupons', requirement_indexes: [0], depends_on_indexes: [], ui_surface: false }],
+  requirements: [
+    { description: 'Discount coupons', acceptance: 'Coupon applies a discount', non_functional: false, classification: 'NEW' as const },
+    { description: 'Coupon minimum order', acceptance: 'Minimum order is enforced', non_functional: false, classification: 'NEW' as const },
+    { description: 'Expired coupon rejection', acceptance: 'Expired coupons are rejected', non_functional: false, classification: 'NEW' as const },
+  ],
+  phases: [
+    { name: 'Coupon application', requirement_indexes: [0], depends_on_indexes: [], ui_surface: false },
+    { name: 'Coupon constraints', requirement_indexes: [1], depends_on_indexes: [0], ui_surface: false },
+    { name: 'Coupon expiration', requirement_indexes: [2], depends_on_indexes: [1], ui_surface: false },
+  ],
   research_topics: [],
 };
+
+function milestoneTwoDeps(root: string) {
+  const configured = deps(root, { extraction: M2_EXTRACTION });
+  configured.runner
+    .on(
+      (task) => task.id.startsWith('new-extract'),
+      (task) => ok(task, { payload: M2_EXTRACTION }),
+    )
+    .on(
+      (task) => task.id.startsWith('new-roadmap'),
+      (task) => ok(task, {
+        payload: {
+          phases: M2_EXTRACTION.phases,
+          rationale: 'The phases deliver coupon behavior in dependency order.',
+        },
+      }),
+    );
+  return configured;
+}
 
 /** Copy the golden fixture into a fresh root for one injection scenario. */
 function cloneFixture(golden: string): string {
@@ -43,7 +70,25 @@ describe('milestone transaction crash safety (fault injection after every durabl
     // golden fixture: M001 fully executed and sealed-ready
     golden = tmpProject('rijo-txn-golden-');
     writePlanFile(golden);
-    writePlanFile(golden, 'PLAN-2.md', '# Plan M002\n\nCoupons.\n');
+    writePlanFile(
+      golden,
+      'PLAN-2.md',
+      [
+        '# Plan M002',
+        '',
+        'Add discount coupons.',
+        '',
+        '## Requirements',
+        '- Discount coupons apply a discount.',
+        '- Coupons enforce a minimum order.',
+        '- Expired coupons are rejected.',
+        '',
+        '## Acceptance criteria',
+        '- A valid coupon applies a discount.',
+        '- The minimum order is enforced.',
+        '- An expired coupon is rejected.',
+      ].join('\n'),
+    );
     const d = deps(golden);
     await newWorkflow(golden, { planFile: '@PLAN.md' }, d);
     const run = await runWorkflow(golden, { target: 'all' }, d);
@@ -54,9 +99,9 @@ describe('milestone transaction crash safety (fault injection after every durabl
     // discover every injection point by recording a successful --next on a clone
     const probe = cloneFixture(golden);
     const recorded: string[] = [];
-    const dp = deps(probe, { extraction: M2_EXTRACTION });
+    const dp = milestoneTwoDeps(probe);
     const outcome = await newWorkflow(probe, { planFile: '@PLAN-2.md', next: true }, { ...dp, txnHooks: { afterWrite: (s) => recorded.push(s) } });
-    expect(outcome.ok, outcome.message).toBe(true);
+    expect(outcome.ok, `${outcome.message}\n${outcome.details.join('\n')}`).toBe(true);
     steps = recorded;
     expect(steps.length).toBeGreaterThan(10);
     expect(steps).toContain('commit');
@@ -71,7 +116,7 @@ describe('milestone transaction crash safety (fault injection after every durabl
       try {
         const paths = new RijoPaths(root);
         const before = snapshotTree(root);
-        const dp = deps(root, { extraction: M2_EXTRACTION });
+        const dp = milestoneTwoDeps(root);
         await expect(
           newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, { ...dp, txnHooks: crashAt(step) }),
         ).rejects.toThrow(/INJECTED-CRASH/);
@@ -92,7 +137,7 @@ describe('milestone transaction crash safety (fault injection after every durabl
           const m1dir = paths.milestoneDir('M001', manifest.milestones[0]!.slug);
           expect(fs.existsSync(path.join(m1dir, 'CLOSEOUT.md'))).toBe(false);
           // the transition is fully retryable afterwards
-          const retry = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, deps(root, { extraction: M2_EXTRACTION }));
+          const retry = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, milestoneTwoDeps(root));
           expect(retry.ok, `retry after ${step}: ${retry.message}`).toBe(true);
         } else {
           // at/after the commit point the transition COMPLETES deterministically
@@ -132,7 +177,7 @@ describe('milestone transaction crash safety (fault injection after every durabl
       const { touchManifest } = await import('../src/core/manifest.js');
       touchManifest(paths);
 
-      const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, deps(root, { extraction: M2_EXTRACTION }));
+      const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, milestoneTwoDeps(root));
       expect(outcome.ok, outcome.message).toBe(true);
       const m1After = readRequirements(path.join(m1dir, 'REQUIREMENTS.md'));
       // the sealed side says CARRIED — not DONE
