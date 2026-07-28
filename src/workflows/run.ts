@@ -42,6 +42,7 @@ import { DecisionProposalSchema } from '../core/decisions.js';
 import { PhasePlanDraftSchema, PhasePlanSchema, ReviewFindingTypeSchema, FindingSeveritySchema, looseBool, type RoadmapPhase, type PhasePlan, type TaskStatus } from '../core/schemas/index.js';
 import type { CommandEvidence } from '../core/commands.js';
 import {
+  AgentTaskSchema,
   AgentResultSchema,
   type AgentTask,
   type AgentTaskDraft,
@@ -71,9 +72,14 @@ import {
   type ValidatedAgentEnvelope,
 } from './shared.js';
 import { checkCore } from './check.js';
-import { inferSecurityTag, inferHighRisk } from './routing.js';
+import {
+  inferSecurityTag,
+  inferHighRisk,
+  prepareDispatchedTask,
+} from './routing.js';
 import { stageFinalization } from './finalize.js';
 import { syncActiveProjectProjections } from './projections.js';
+import { supervisedTaskHash } from '../supervisor/supervisor.js';
 import {
   buildContextPacket,
   gapsAffectingScope,
@@ -426,6 +432,117 @@ function validateAppliedRepairReceipt(
     }
   }
   return issues;
+}
+
+function repairTaskDraft(
+  ctx: WorkflowContext,
+  pp: PhasePaths,
+  plan: PhasePlan,
+  spec: RepairSpec,
+): AgentTaskDraft {
+  return {
+    id: spec.id,
+    role: 'worker',
+    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do not edit the phase plan during a code repair. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
+    canonical_files: [pp.plan].filter(exists),
+    code_files: plan.tasks.flatMap((task) =>
+      task.files.map((file) => path.resolve(ctx.projectRoot, file)),
+    ),
+    write_scope: plan.tasks.flatMap((task) => task.write_scope),
+    acceptance_criteria: spec.acceptance,
+    verification_commands: spec.commands,
+    return_format: 'JSON payload: {done: boolean, notes: string}',
+    notes: spec.notes,
+    workspace: null,
+    canonical_baseline: null,
+  };
+}
+
+function recoverLegacyPendingReviewRepair(
+  ctx: WorkflowContext,
+  pp: PhasePaths,
+  phaseId: string,
+  plan: PhasePlan,
+): PhaseRepairReceipt | null {
+  const reviewText = readTextIfExists(pp.review);
+  if (!reviewText) return null;
+  const data = parseFrontmatter<Record<string, unknown>>(reviewText).data;
+  if (data['gate_status'] === 'ACCEPTED') return null;
+  const review = ReviewPayloadSchema.safeParse({
+    approved: data['approved'],
+    findings: data['findings'],
+  });
+  const priorLoop = z.number().int().min(0).safeParse(data['loop']);
+  if (!review.success || !priorLoop.success) return null;
+  const blockingSeverities = new Set(['blocker', 'critical', 'high']);
+  const actionable = review.data.findings.filter(
+    (finding) =>
+      !['defer', 'reject'].includes(finding.type) &&
+      blockingSeverities.has(finding.severity),
+  );
+  if (actionable.length === 0) return null;
+  const loop = priorLoop.data + 1;
+  const id = `review-fix-${phaseId}-l${loop}`;
+  const spec = RepairSpecSchema.parse({
+    id,
+    objective: 'Address the valid review findings below with minimal coherent changes.',
+    acceptance: ['Findings addressed', 'Verification commands still pass'],
+    commands: [],
+    notes: actionable
+      .map(
+        (finding) =>
+          `${finding.type}/${finding.severity}: ${finding.description}${
+            finding.file ? ` (${finding.file})` : ''
+          }`,
+      )
+      .join('\n'),
+  });
+  const record = new TaskStore(ctx.paths).read(id);
+  if (
+    !record ||
+    record.workflow_epoch !== ctx.workflowEpoch ||
+    record.logical_task_id !== id ||
+    record.role !== 'worker' ||
+    record.task_hash === null ||
+    record.workspace_path === null ||
+    !['STARTING', 'RUNNING', 'AWAITING_NATIVE_RESULT', 'REPLACING'].includes(
+      record.state,
+    )
+  ) {
+    return null;
+  }
+  const workspaceRoot = record.workspace_path;
+  const workspaceId = record.workspace_id ?? path.basename(workspaceRoot);
+  const remap = (target: string): string => {
+    const relative = path.relative(ctx.projectRoot, target);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return target;
+    return path.join(workspaceRoot, relative);
+  };
+  const draft = repairTaskDraft(ctx, pp, plan, spec);
+  const expectedTask = AgentTaskSchema.parse(
+    prepareDispatchedTask(
+      ctx.config,
+      {
+        ...draft,
+        canonical_files: (draft.canonical_files ?? []).map(remap),
+        code_files: (draft.code_files ?? []).map(remap),
+        workspace: { id: workspaceId, root: workspaceRoot },
+        canonical_baseline: record.canonical_baseline_hash,
+      },
+      { stage: 'EXECUTE' },
+    ),
+  );
+  if (supervisedTaskHash(expectedTask) !== record.task_hash) return null;
+  return PhaseRepairReceiptSchema.parse({
+    version: 1,
+    phase: phaseId,
+    kind: 'review',
+    loop,
+    status: 'PENDING',
+    task: spec,
+    created_at: ctx.now().toISOString(),
+    controlled_updates: [],
+  });
 }
 
 function writePhaseRecoveryBaseline(
@@ -1856,6 +1973,10 @@ async function executePhase(
   let reviewLoops = 0;
   let evidences: CommandEvidence[] = [];
   let acceptedReviewInputHash: string | null = null;
+  const legacyRepair = readPhaseRepairReceipt(pp)
+    ? null
+    : recoverLegacyPendingReviewRepair(ctx, pp, phase.id, plan);
+  if (legacyRepair) persistPhaseRepairReceipt(ctx, pp, legacyRepair);
   const resumedRepair = readPhaseRepairReceipt(pp);
   if (resumedRepair) {
     reviewLoops = resumedRepair.loop;
@@ -2292,20 +2413,7 @@ async function runRepairAttempt(
   plan: PhasePlan,
   spec: RepairSpec,
 ): Promise<WorkflowOutcome | string> {
-  const repairTask: AgentTaskDraft = {
-    id: spec.id,
-    role: 'worker',
-    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do not edit the phase plan during a code repair. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
-    canonical_files: [pp.plan].filter(exists),
-    code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
-    write_scope: plan.tasks.flatMap((t) => t.write_scope),
-    acceptance_criteria: spec.acceptance,
-    verification_commands: spec.commands,
-    return_format: 'JSON payload: {done: boolean, notes: string}',
-    notes: spec.notes,
-    workspace: null,
-    canonical_baseline: null,
-  };
+  const repairTask = repairTaskDraft(ctx, pp, plan, spec);
   const handle = replaceableAttempt(ctx, repairTask, {}, { stage: 'EXECUTE' });
   let preserveNativeWorkspace = false;
   try {

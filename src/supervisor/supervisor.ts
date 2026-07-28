@@ -61,6 +61,46 @@ type AttemptOutcome =
   | { kind: 'failed'; reason: string; record: TaskRecord }
   | { kind: 'cancelled'; reason: string; record: TaskRecord };
 
+export function supervisedTaskHash(task: AgentTask): string {
+  const disposableRoots = [
+    task.workspace?.root,
+    task.workspace?.replay_source?.root,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => path.resolve(value))
+    .sort((left, right) => right.length - left.length);
+  const semanticString = (value: string): string => {
+    let normalized = value;
+    for (const root of disposableRoots) {
+      normalized = normalized.split(root).join('$WORKSPACE');
+      const portableRoot = root.split(path.sep).join('/');
+      normalized = normalized.split(portableRoot).join('$WORKSPACE');
+    }
+    return normalized;
+  };
+  const semanticStrings = (values: string[]): string[] =>
+    values.map(semanticString);
+  const notes = semanticString(task.notes)
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith('[supervisor] previous attempt '))
+    .join('\n');
+  return sha256(JSON.stringify({
+    id: task.id,
+    role: task.role,
+    tier: task.tier ?? null,
+    objective: semanticString(task.objective),
+    canonical_files: semanticStrings(task.canonical_files),
+    code_files: semanticStrings(task.code_files),
+    write_scope: semanticStrings(task.write_scope),
+    acceptance_criteria: semanticStrings(task.acceptance_criteria),
+    verification_commands: semanticStrings(task.verification_commands),
+    return_format: semanticString(task.return_format),
+    notes,
+    expert_profiles: semanticStrings(task.expert_profiles),
+    canonical_baseline: task.canonical_baseline,
+  }));
+}
+
 interface ActiveTask {
   logicalId: string;
   record: TaskRecord;
@@ -246,46 +286,6 @@ export class Supervisor {
     return { ...task, notes: task.notes ? `${task.notes}\n${note}` : note };
   }
 
-  private taskHash(task: AgentTask): string {
-    const disposableRoots = [
-      task.workspace?.root,
-      task.workspace?.replay_source?.root,
-    ]
-      .filter((value): value is string => Boolean(value))
-      .map((value) => path.resolve(value))
-      .sort((left, right) => right.length - left.length);
-    const semanticString = (value: string): string => {
-      let normalized = value;
-      for (const root of disposableRoots) {
-        normalized = normalized.split(root).join('$WORKSPACE');
-        const portableRoot = root.split(path.sep).join('/');
-        normalized = normalized.split(portableRoot).join('$WORKSPACE');
-      }
-      return normalized;
-    };
-    const semanticStrings = (values: string[]): string[] =>
-      values.map(semanticString);
-    const notes = semanticString(task.notes)
-      .split(/\r?\n/)
-      .filter((line) => !line.startsWith('[supervisor] previous attempt '))
-      .join('\n');
-    return sha256(JSON.stringify({
-      id: task.id,
-      role: task.role,
-      tier: task.tier ?? null,
-      objective: semanticString(task.objective),
-      canonical_files: semanticStrings(task.canonical_files),
-      code_files: semanticStrings(task.code_files),
-      write_scope: semanticStrings(task.write_scope),
-      acceptance_criteria: semanticStrings(task.acceptance_criteria),
-      verification_commands: semanticStrings(task.verification_commands),
-      return_format: semanticString(task.return_format),
-      notes,
-      expert_profiles: semanticStrings(task.expert_profiles),
-      canonical_baseline: task.canonical_baseline,
-    }));
-  }
-
   private blockedResult(
     record: TaskRecord,
     failures: string[],
@@ -405,7 +405,7 @@ export class Supervisor {
     const role: ModelRole = opts.role ?? task.role;
     const logicalId = task.id;
     const startedWall = this.clock.now();
-    const taskHash = this.taskHash(task);
+    const taskHash = supervisedTaskHash(task);
     const idempotencyKey = sha256(`${this.workflowEpoch}:${logicalId}`).slice(0, 32);
 
     let prior = this.store.read(logicalId);

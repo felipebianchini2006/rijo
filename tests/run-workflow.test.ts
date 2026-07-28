@@ -13,6 +13,7 @@ import { FakeShellRunner, type ShellRunner } from '../src/core/commands.js';
 import { defaultConfig } from '../src/core/config.js';
 import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 import { TaskStore } from '../src/supervisor/store.js';
+import { reconcileSupervisedTasks } from '../src/supervisor/recover.js';
 import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds, newMappedReference } from './helpers.js';
 
 function milestoneDir(root: string): string {
@@ -386,6 +387,37 @@ describe('rijo run', () => {
     await expect(runWorkflow(root, {}, runtime)).rejects.toThrow(
       'NATIVE_RESULT_REQUIRED: The native result bundle has no result for task review-fix-01-l1',
     );
+    const legacyReceiptPath = path.join(
+      milestoneDir(root),
+      'phases',
+      '01-catalog',
+      'REPAIR.json',
+    );
+    fs.rmSync(legacyReceiptPath);
+    touchManifest(new RijoPaths(root), () => {}, () => new Date('2026-07-23T12:00:00.000Z'));
+    const repairStore = new TaskStore(new RijoPaths(root));
+    const pendingRepair = repairStore.read('review-fix-01-l1')!;
+    const restartingRepair = repairStore.transition(
+      pendingRepair,
+      'STARTING',
+      {},
+      { reason: 'Simulated replacement start before a process crash.' },
+    );
+    repairStore.transition(
+      restartingRepair,
+      'RUNNING',
+      {},
+      { reason: 'Simulated process crash during the replacement attempt.' },
+    );
+    await reconcileSupervisedTasks(new RijoPaths(root), {
+      maxReplacements: 2,
+      unknownTimeoutMs: 1,
+    });
+    expect(repairStore.read('review-fix-01-l1')).toMatchObject({
+      state: 'REPLACING',
+      workspace_id: null,
+      revoked_leases: [pendingRepair.lease_id],
+    });
     await expect(runWorkflow(root, {}, runtime)).rejects.toThrow(
       'NATIVE_RESULT_REQUIRED: The native result bundle has no result for task code-review-01-l1',
     );
