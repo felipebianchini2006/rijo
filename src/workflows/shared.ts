@@ -445,7 +445,10 @@ export async function dispatch(
   ctx: WorkflowContext,
   task: AgentTaskDraft,
   routing: DispatchRouting = {},
-  options: { prepareReplacement?: SupervisedDispatch['prepareReplacement'] } = {},
+  options: {
+    prepareReplacement?: SupervisedDispatch['prepareReplacement'];
+    replaceAfterValidationFailure?: SupervisedDispatch['replaceAfterValidationFailure'];
+  } = {},
 ): Promise<ValidatedAgentEnvelope> {
   const routed = prepareDispatchedTask(ctx.config, task, routing);
   const full: AgentTask = AgentTaskSchema.parse(routed);
@@ -453,6 +456,9 @@ export async function dispatch(
     task: full,
     role: full.role,
     ...(options.prepareReplacement ? { prepareReplacement: options.prepareReplacement } : {}),
+    ...(options.replaceAfterValidationFailure
+      ? { replaceAfterValidationFailure: options.replaceAfterValidationFailure }
+      : {}),
   });
   if (result.summary.includes('native result bundle has no result for task')) {
     throw new Error(
@@ -473,12 +479,22 @@ export async function dispatchBatch(
   max?: number,
   routing?: (task: AgentTaskDraft, index: number) => DispatchRouting,
   replacement?: (task: AgentTaskDraft, index: number) => SupervisedDispatch['prepareReplacement'],
+  validationReplacement?: (
+    task: AgentTaskDraft,
+    index: number,
+  ) => SupervisedDispatch['replaceAfterValidationFailure'],
 ): Promise<ValidatedAgentEnvelope[]> {
   const reqs: SupervisedDispatch[] = tasks.map((t, i) => {
     const routed = prepareDispatchedTask(ctx.config, t, routing ? routing(t, i) : {});
     const full: AgentTask = AgentTaskSchema.parse(routed);
     const prep = replacement?.(t, i);
-    return { task: full, role: full.role, ...(prep ? { prepareReplacement: prep } : {}) };
+    const validation = validationReplacement?.(t, i);
+    return {
+      task: full,
+      role: full.role,
+      ...(prep ? { prepareReplacement: prep } : {}),
+      ...(validation ? { replaceAfterValidationFailure: validation } : {}),
+    };
   });
   const results = await ctx.executor.runBatch(reqs, max ?? ctx.config.limits.max_parallel_agents);
   const pendingNativeResult = results.find((result) =>

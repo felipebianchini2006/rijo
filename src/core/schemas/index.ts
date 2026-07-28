@@ -201,7 +201,10 @@ const SUPERVISED_TRANSITIONS: Record<SupervisedTaskState, SupervisedTaskState[]>
   CANCELLING: ['CANCELLED', 'FAILED', 'ORPHANED'],
   CANCELLED: ['REPLACING', 'EXHAUSTED'],
   REPLACING: ['STARTING', 'EXHAUSTED'],
-  SUCCEEDED: [],
+  // A host result can pass protocol validation and still fail a later
+  // deterministic gate, such as the framework-owned TDD RED replay. RIJO can
+  // then invalidate that success and start one bounded replacement generation.
+  SUCCEEDED: ['REPLACING', 'EXHAUSTED'],
   FAILED: ['REPLACING', 'EXHAUSTED'],
   EXHAUSTED: [],
   ORPHANED: ['CANCELLING', 'CANCELLED', 'REPLACING', 'EXHAUSTED'],

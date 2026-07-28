@@ -60,6 +60,7 @@ import {
 } from '../codebase/context.js';
 import { readMapState } from '../codebase/state.js';
 import { ensureCodebaseMap } from './map.js';
+import { TaskStore } from '../supervisor/store.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -88,6 +89,16 @@ interface TddRedEvidence {
   commands: CommandEvidence[];
 }
 
+const TddRedRetrySchema = z.object({
+  schema_version: z.literal(1),
+  logical_task_id: z.string().min(1),
+  task_id: z.string().min(1),
+  replacement_count: z.number().int().min(1),
+  rejected_generation: z.number().int().min(1),
+  reason: z.string().min(1),
+});
+type TddRedRetry = z.infer<typeof TddRedRetrySchema>;
+
 const TEST_PATH_PATTERN =
   /(^|\/)(__tests__|tests?|spec)(\/|\.|$)|\.(test|spec)\.[^.]+$/i;
 
@@ -103,6 +114,34 @@ function isTestHarnessPath(relativePath: string): boolean {
     base === 'package-lock.json' ||
     /^(vitest|jest|playwright|cypress|tsconfig)(\.|$)/i.test(base)
   );
+}
+
+function tddRedRetryPath(
+  ctx: WorkflowContext,
+  milestoneId: string,
+  phaseId: string,
+  taskId: string,
+): string {
+  return path.join(
+    ctx.paths.runtimeDir,
+    'tdd-red-retries',
+    `${milestoneId}-${phaseId}-${taskId}.json`,
+  );
+}
+
+function readTddRedRetry(target: string): TddRedRetry | null {
+  const parsed = TddRedRetrySchema.safeParse(readJsonIfExists<unknown>(target));
+  return parsed.success ? parsed.data : null;
+}
+
+function tddRedCorrectionNotes(reason: string): string {
+  return [
+    'The prior result failed deterministic TDD RED validation.',
+    reason,
+    'Return a corrected test and implementation.',
+    'Make the test fail for the missing behavior before the implementation exists.',
+    'Include every declared test file in the result.',
+  ].join(' ');
 }
 
 export function normalizeResearchCheckedAt(value: string): string {
@@ -1103,6 +1142,8 @@ async function executePhase(
       };
     };
     const attempts: ReplaceableAttempt[] = [];
+    const workerTasks: AgentTaskDraft[] = [];
+    const tddRetries: Array<TddRedRetry | null> = [];
     for (const t of pending) {
       const taskOwnsTestPath = t.write_scope.some((scope) =>
         /(^|\/)(__tests__|tests?|spec)(\/|\.|$)|\.(test|spec)\.[^.]+$/i.test(scope),
@@ -1113,6 +1154,9 @@ async function executePhase(
           : t.tdd
             ? 'Tests for this change are allocated to a separate task; do not edit them or any path outside this task write scope. '
             : '';
+      const retry = readTddRedRetry(
+        tddRedRetryPath(ctx, milestone.id, phase.id, t.id),
+      );
       const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
@@ -1123,10 +1167,12 @@ async function executePhase(
         acceptance_criteria: [t.evidence_expected],
         verification_commands: t.tests,
         return_format: 'JSON payload: {done: boolean, notes: string}. Also list files_written.',
-        notes: '',
+        notes: retry ? tddRedCorrectionNotes(retry.reason) : '',
         workspace: null,
         canonical_baseline: null,
       };
+      tddRetries.push(retry);
+      workerTasks.push(workerTask);
       attempts.push(replaceableAttempt(ctx, workerTask, {}, routingFor(workerTask)));
     }
 
@@ -1148,6 +1194,21 @@ async function executePhase(
         undefined,
         (task) => routingFor(task),
         (_task, i) => attempts[i]!.prepareReplacement,
+        (_task, i) => {
+          const retry = tddRetries[i];
+          if (!retry) return undefined;
+          const record = new TaskStore(paths).read(retry.logical_task_id);
+          if (
+            record?.state !== 'SUCCEEDED' ||
+            record.generation !== retry.rejected_generation
+          ) {
+            return undefined;
+          }
+          return {
+            reason: retry.reason,
+            maxReplacements: config.supervisor.max_replacements_per_task,
+          };
+        },
       );
     } catch (err) {
       if (isNativeResultRequired(err)) throw err;
@@ -1184,8 +1245,13 @@ async function executePhase(
     // against the pre-task checkout before its implementation patch reaches
     // the controlled tree. RIJO overlays only test harness files into a fresh
     // isolated workspace. The real command must fail for a test reason.
+    //
+    // A protocol-valid writer result can still fail this deterministic gate.
+    // Replace that result with a new fenced generation. Keep earlier groups
+    // applied. Keep unrelated workspaces in this group until the corrected
+    // result is available. A native helper pause discards them safely and
+    // replays their exact successful results into fresh workspaces next turn.
     for (let i = 0; i < attempts.length; i++) {
-      const attempt = attempts[i]!;
       const task = pending[i]!;
       if (
         !task.tdd ||
@@ -1194,16 +1260,96 @@ async function executePhase(
       ) {
         continue;
       }
-      const red = runTddRedProof(ctx, phase.id, task, attempt);
-      if (!red.ok) {
-        discardAll();
-        transition(task.id, 'FAILED', 'TDD RED proof failed');
-        return blocked(ctx, `Phase ${phase.id}: task ${task.id} has no valid TDD RED evidence.`, [
-          red.reason,
-        ]);
+
+      const retryPath = tddRedRetryPath(ctx, milestone.id, phase.id, task.id);
+      for (;;) {
+        const red = runTddRedProof(ctx, phase.id, task, attempts[i]!);
+        if (red.ok) {
+          tddRedEvidences.push({ task_id: task.id, commands: red.commands });
+          writeJsonAtomic(tddRedPath, tddRedEvidences);
+          fs.rmSync(retryPath, { force: true });
+          break;
+        }
+
+        const previousRetry = readTddRedRetry(retryPath);
+        const replacementCount = previousRetry?.replacement_count ?? 0;
+        const maxReplacements = config.supervisor.max_replacements_per_task;
+        if (replacementCount >= maxReplacements) {
+          discardAll();
+          pending.forEach((candidate) =>
+            transition(candidate.id, 'FAILED', `TDD RED replacement exhausted at ${task.id}`),
+          );
+          return blocked(
+            ctx,
+            `Phase ${phase.id}: task ${task.id} has no valid TDD RED evidence after ${replacementCount} replacement attempt(s).`,
+            [red.reason],
+          );
+        }
+
+        const retry = TddRedRetrySchema.parse({
+          schema_version: 1,
+          logical_task_id: attempts[i]!.attempt.task.id,
+          task_id: task.id,
+          replacement_count: replacementCount + 1,
+          rejected_generation: results[i]!.generation,
+          reason: red.reason,
+        });
+        writeJsonAtomic(retryPath, retry);
+
+        // The rejected workspace can never be applied. Build the corrected
+        // request from the original bounded draft plus durable factual notes.
+        attempts[i]!.attempt.workspace.discard();
+        const correctedDraft: AgentTaskDraft = {
+          ...workerTasks[i]!,
+          notes: tddRedCorrectionNotes(red.reason),
+        };
+        const corrected = replaceableAttempt(
+          ctx,
+          correctedDraft,
+          {},
+          routingFor(correctedDraft),
+        );
+        attempts[i] = corrected;
+
+        let replacementResult: ValidatedAgentEnvelope;
+        try {
+          replacementResult = await dispatch(
+            ctx,
+            corrected.attempt.task,
+            routingFor(corrected.attempt.task),
+            {
+              prepareReplacement: corrected.prepareReplacement,
+              replaceAfterValidationFailure: {
+                reason: red.reason,
+                maxReplacements,
+              },
+            },
+          );
+        } catch (error) {
+          if (isNativeResultRequired(error)) {
+            discardAll();
+            throw error;
+          }
+          discardAll();
+          pending.forEach((candidate) =>
+            transition(candidate.id, 'FAILED', `TDD RED replacement dispatch failed at ${task.id}`),
+          );
+          return blocked(ctx, `Phase ${phase.id}: task ${task.id} replacement dispatch failed.`, [
+            String((error as Error).message),
+          ]);
+        }
+        if (!replacementResult.ok) {
+          discardAll();
+          pending.forEach((candidate) =>
+            transition(candidate.id, 'FAILED', `TDD RED replacement failed at ${task.id}`),
+          );
+          return blocked(ctx, `Phase ${phase.id}: task ${task.id} replacement failed.`, [
+            replacementResult.summary,
+            ...replacementResult.scope_requests.map((scope) => `scope request: ${scope}`),
+          ]);
+        }
+        results[i] = replacementResult;
       }
-      tddRedEvidences.push({ task_id: task.id, commands: red.commands });
-      writeJsonAtomic(tddRedPath, tddRedEvidences);
     }
 
     // Authoritative scope enforcement per INDIVIDUAL task: the real filesystem

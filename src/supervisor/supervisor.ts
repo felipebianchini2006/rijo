@@ -25,6 +25,14 @@ export interface SuperviseOptions {
    * previous failure — never the previous scratchpad or patch.
    */
   prepareAttempt?: (generation: number, previousFailure: string) => PreparedAttempt | Promise<PreparedAttempt>;
+  /**
+   * A deterministic workflow gate rejected the prior SUCCEEDED result.
+   * Start a new fenced generation instead of replaying that result.
+   */
+  replaceAfterValidationFailure?: {
+    reason: string;
+    maxReplacements: number;
+  };
   /** Receives a progress emitter bound to this task; call it whenever the attempt makes progress. */
   onProgress?: (emitProgress: () => void) => void;
   /** External kill switch. Aborting cancels the active attempt and stops (no replacement). */
@@ -283,6 +291,13 @@ export class Supervisor {
     const idempotencyKey = sha256(logicalId).slice(0, 32);
 
     const prior = this.store.read(logicalId);
+    const validationPrior =
+      prior?.state === 'SUCCEEDED' && opts.replaceAfterValidationFailure
+        ? prior
+        : null;
+    const validationReplacement = validationPrior
+      ? opts.replaceAfterValidationFailure!
+      : null;
     const replay = this.controller.replayAttempt?.(task) ?? null;
     const replayMatchesPrior =
       prior !== null &&
@@ -300,8 +315,13 @@ export class Supervisor {
       prior?.state === 'SUCCEEDED' &&
       replayMatchesPrior &&
       !prior.revoked_leases.includes(prior.lease_id);
-    const reusesNativeIdentity = resumesNativeRequest || replaysValidatedNativeResult;
-    let generation = reusesNativeIdentity ? prior.generation : 1;
+    const reusesNativeIdentity =
+      !validationReplacement && (resumesNativeRequest || replaysValidatedNativeResult);
+    let generation = validationPrior
+      ? validationPrior.generation + 1
+      : reusesNativeIdentity
+        ? prior.generation
+        : 1;
     let identity: AttemptIdentity = reusesNativeIdentity
       ? {
           attempt_id: prior.attempt_id,
@@ -310,8 +330,9 @@ export class Supervisor {
         }
       : this.mkIdentity(logicalId, generation);
 
-    const supersededLeases =
-      prior?.state === 'AWAITING_NATIVE_RESULT' && !resumesNativeRequest
+    const supersededLeases = validationPrior
+      ? [...new Set([...validationPrior.revoked_leases, validationPrior.lease_id])]
+      : prior?.state === 'AWAITING_NATIVE_RESULT' && !resumesNativeRequest
         ? [...new Set([...prior.revoked_leases, prior.lease_id])]
         : [];
     if (supersededLeases.length > 0) {
@@ -319,7 +340,9 @@ export class Supervisor {
         attempt_id: prior?.attempt_id,
         generation: prior?.generation,
         lease_id: prior?.lease_id,
-        reason: 'The task content changed before native result validation.',
+        reason: validationReplacement
+          ? `Deterministic validation rejected the result: ${validationReplacement.reason.slice(0, 400)}`
+          : 'The task content changed before native result validation.',
       });
     }
     const initial = TaskRecordSchema.parse({
@@ -339,9 +362,68 @@ export class Supervisor {
       revoked_leases: supersededLeases,
     });
 
+    if (
+      validationPrior &&
+      validationReplacement &&
+      validationPrior.replacement_count >= validationReplacement.maxReplacements
+    ) {
+      const exhausted = this.store.transition(
+        validationPrior,
+        'EXHAUSTED',
+        {
+          finished_at: this.toIso(),
+          last_error: validationReplacement.reason,
+          revoked_leases: supersededLeases,
+        },
+        {
+          reason: validationReplacement.reason,
+          source: 'deterministic_validation',
+        },
+      );
+      return this.blockedResult(
+        exhausted,
+        [validationReplacement.reason],
+        exhausted.replacement_count,
+        'validation replacement budget',
+      );
+    }
+
+    const activeRecord = validationPrior && validationReplacement
+      ? this.store.transition(
+          validationPrior,
+          'REPLACING',
+          {
+            attempt_id: identity.attempt_id,
+            generation,
+            lease_id: identity.lease_id,
+            replacement_count: validationPrior.replacement_count + 1,
+            last_error: validationReplacement.reason,
+            finished_at: null,
+            revoked_leases: supersededLeases,
+            role,
+            expert_profiles: opts.expertProfiles ?? task.expert_profiles ?? [],
+            workspace_id: task.workspace?.id ?? null,
+            workspace_path: task.workspace?.root ?? null,
+            canonical_baseline_hash: task.canonical_baseline ?? null,
+            host_session_id: null,
+            host_thread_id: null,
+            host_turn_id: null,
+            host_process_id: null,
+            host_native_handle: null,
+          },
+          {
+            reason: validationReplacement.reason,
+            source: 'deterministic_validation',
+            revoked_lease_id: validationPrior.lease_id,
+          },
+        )
+      : resumesNativeRequest
+        ? prior
+        : this.store.create(initial);
+
     const st: ActiveTask = {
       logicalId,
-      record: resumesNativeRequest ? prior : this.store.create(initial),
+      record: activeRecord,
       lastProgressAt: startedWall,
       disposing: false,
     };

@@ -19,6 +19,15 @@ export interface SupervisedDispatch {
   task: AgentTask;
   role: ModelRole;
   prepareReplacement?: (generation: number, previousFailure: string) => PreparedAttempt | Promise<PreparedAttempt>;
+  /**
+   * Replace a protocol-valid result that a later deterministic workflow gate
+   * rejected. The workflow supplies the bounded replacement budget because a
+   * native result bridge normally disables in-process timeout replacements.
+   */
+  replaceAfterValidationFailure?: {
+    reason: string;
+    maxReplacements: number;
+  };
 }
 
 /**
@@ -76,6 +85,9 @@ export class SupervisedExecutor implements TaskExecutor {
       role: req.role,
       expertProfiles: req.task.expert_profiles,
       ...(req.prepareReplacement ? { prepareAttempt: req.prepareReplacement } : {}),
+      ...(req.replaceAfterValidationFailure
+        ? { replaceAfterValidationFailure: req.replaceAfterValidationFailure }
+        : {}),
     });
     return this.validate(req.task, raw);
   }

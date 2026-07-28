@@ -16,6 +16,7 @@ import { defaultExecutor } from '../src/workflows/executor.js';
 import { defaultConfig } from '../src/core/config.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { startWorkflow } from '../src/workflows/run.js';
+import { TaskStore } from '../src/supervisor/store.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
 
 describe('native result ingestion', () => {
@@ -226,6 +227,178 @@ describe('native result ingestion', () => {
       .toBe('export const feature = true;\n');
     expect(fs.existsSync(workspaceA)).toBe(false);
     expect(fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/)).toHaveLength(1);
+  });
+
+  it('replaces a native writer result rejected by deterministic validation with a new fenced identity', async () => {
+    const root = tmpProject('rijo-native-validation-replacement-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    const bundle = path.join(root, 'results.json');
+    const requestFile = path.join(root, 'native-requests.jsonl');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 0,
+      replacement_backoff_ms: [],
+    };
+    const makeTask = (workspaceId: string, notes = '') => {
+      const workspace = path.join(paths.runtimeDir, 'workspaces', workspaceId);
+      fs.mkdirSync(workspace, { recursive: true });
+      return AgentTaskSchema.parse({
+        id: 'exec-01-T03',
+        role: 'worker',
+        objective: 'Implement the tested behavior.',
+        canonical_files: [path.join(workspace, '.rijo', 'RULES.md')],
+        code_files: [
+          path.join(workspace, 'src', 'feature.ts'),
+          path.join(workspace, 'test', 'feature.test.ts'),
+        ],
+        write_scope: ['src/feature.ts', 'test/feature.test.ts'],
+        acceptance_criteria: ['The test proves the behavior.'],
+        verification_commands: ['node --test test/feature.test.ts'],
+        return_format: 'JSON payload: {done: boolean}.',
+        notes,
+        workspace: { id: workspaceId, root: workspace },
+        canonical_baseline: 'baseline-01',
+      });
+    };
+
+    const firstTask = makeTask('ws-native-validation-g1');
+    const firstPending = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: firstTask, role: 'worker' });
+    expect(firstPending.ok).toBe(false);
+    const firstRequest = JSON.parse(fs.readFileSync(requestFile, 'utf8').trim());
+    fs.writeFileSync(
+      bundle,
+      JSON.stringify({
+        version: 2,
+        results: [{
+          ...firstRequest,
+          ok: true,
+          summary: 'Implemented the first result.',
+          payload: { done: true },
+          files: {
+            'src/feature.ts': 'export const feature = true;\n',
+            'test/feature.test.ts': "import '../src/missing.ts';\n",
+          },
+          files_written: ['src/feature.ts', 'test/feature.test.ts'],
+          scope_requests: [],
+          decision_proposals: [],
+          artifacts: [],
+        }],
+      }),
+    );
+    const accepted = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: firstTask, role: 'worker' });
+    expect(accepted.ok).toBe(true);
+
+    const correctionReason =
+      'The RED command failed because the test environment was incomplete: ENOENT missing test module.';
+    const replacementTask = makeTask(
+      'ws-native-validation-g2',
+      `The prior result failed deterministic TDD RED validation. ${correctionReason}`,
+    );
+    const replacementPending = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({
+      task: replacementTask,
+      role: 'worker',
+      replaceAfterValidationFailure: {
+        reason: correctionReason,
+        maxReplacements: 2,
+      },
+    });
+
+    expect(replacementPending.ok).toBe(false);
+    expect(replacementPending.summary).toContain('no result for task exec-01-T03');
+    const requests = fs
+      .readFileSync(requestFile, 'utf8')
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    expect(requests).toHaveLength(2);
+    expect(requests[1].generation).toBe(firstRequest.generation + 1);
+    expect(requests[1].attempt_id).not.toBe(firstRequest.attempt_id);
+    expect(requests[1].lease_id).not.toBe(firstRequest.lease_id);
+    expect(requests[1].request_id).not.toBe(firstRequest.request_id);
+    expect(requests[1].canonical_files[0]).toContain('ws-native-validation-g2');
+    expect(requests[1].code_files[0]).toContain('ws-native-validation-g2');
+    const record = new TaskStore(paths).read(firstTask.id);
+    expect(record?.state).toBe('AWAITING_NATIVE_RESULT');
+    expect(record?.generation).toBe(2);
+    expect(record?.replacement_count).toBe(1);
+    expect(record?.revoked_leases).toContain(firstRequest.lease_id);
+
+    const secondRequest = requests[1]!;
+    const stored = JSON.parse(fs.readFileSync(bundle, 'utf8')) as {
+      version: 2;
+      results: Array<Record<string, unknown>>;
+    };
+    stored.results.push({
+      ...secondRequest,
+      ok: true,
+      summary: 'Implemented the corrected result.',
+      payload: { done: true },
+      files: {
+        'src/feature.ts': 'export const feature = true;\n',
+        'test/feature.test.ts': "throw new Error('expected RED');\n",
+      },
+      files_written: ['src/feature.ts', 'test/feature.test.ts'],
+      scope_requests: [],
+      decision_proposals: [],
+      artifacts: [],
+    });
+    fs.writeFileSync(bundle, JSON.stringify(stored));
+    fs.rmSync(replacementTask.workspace!.root, { recursive: true, force: true });
+    const resumedTask = makeTask(
+      'ws-native-validation-g2-resumed',
+      `The prior result failed deterministic TDD RED validation. ${correctionReason}`,
+    );
+    const resumed = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: resumedTask, role: 'worker' });
+
+    expect(resumed.ok).toBe(true);
+    expect(resumed.generation).toBe(2);
+    expect(resumed.attempt_id).toBe(secondRequest.attempt_id);
+    expect(resumed.lease_id).toBe(secondRequest.lease_id);
+    expect(
+      fs.readFileSync(
+        path.join(resumedTask.workspace!.root, 'test', 'feature.test.ts'),
+        'utf8',
+      ),
+    ).toContain('expected RED');
+    expect(fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/)).toHaveLength(2);
+
+    const exhausted = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({
+      task: makeTask(
+        'ws-native-validation-exhausted',
+        'The corrected result still has no valid RED evidence.',
+      ),
+      role: 'worker',
+      replaceAfterValidationFailure: {
+        reason: 'The corrected result still has no valid RED evidence.',
+        maxReplacements: 1,
+      },
+    });
+    expect(exhausted.ok).toBe(false);
+    expect(exhausted.summary).toContain('validation replacement budget');
+    expect(new TaskStore(paths).read(firstTask.id)?.state).toBe('EXHAUSTED');
+    expect(fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/)).toHaveLength(2);
   });
 
   it('fences a pending identity when task content changes before resume', async () => {

@@ -9,6 +9,8 @@ import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { readPlan } from '../src/core/plan.js';
 import { FakeShellRunner } from '../src/core/commands.js';
+import { defaultConfig } from '../src/core/config.js';
+import { TaskStore } from '../src/supervisor/store.js';
 import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds, newMappedReference } from './helpers.js';
 
 function milestoneDir(root: string): string {
@@ -522,6 +524,184 @@ describe('rijo run', () => {
     expect(verification).toContain('## TDD RED evidence');
     expect(verification).toContain('expected RED exit 1');
   });
+
+  it.each([
+    ['a missing declared test file', 'missing-test'],
+    ['an incomplete RED test environment', 'incomplete-environment'],
+  ])(
+    'replaces a writer generation after %s and preserves earlier task work',
+    async (_caseName, failureMode) => {
+      const redAwareShell = {
+        run(command: string, options: { cwd?: string } = {}) {
+          const cwd = options.cwd ?? root;
+          if (command.includes('feature.test.mjs')) {
+            const testFile = path.join(cwd, 'test', 'feature.test.mjs');
+            const testText = fs.existsSync(testFile)
+              ? fs.readFileSync(testFile, 'utf8')
+              : '';
+            if (testText.includes('missing-module')) {
+              return {
+                command,
+                exit_code: 1,
+                summary: 'ENOENT: missing-module could not be loaded.',
+                duration_ms: 1,
+                blocked: false,
+                category: 'test' as const,
+                sandbox: 'test-double',
+                trust: 'repository-script',
+                network: 'none',
+              };
+            }
+            const implemented = fs.existsSync(path.join(cwd, 'src', 'feature.mjs'));
+            return {
+              command,
+              exit_code: implemented ? 0 : 1,
+              summary: implemented
+                ? 'pass'
+                : 'AssertionError: expected the feature behavior.',
+              duration_ms: 1,
+              blocked: false,
+              category: 'test' as const,
+              sandbox: 'test-double',
+              trust: 'repository-script',
+              network: 'none',
+            };
+          }
+          return {
+            command,
+            exit_code: 0,
+            summary: 'pass',
+            duration_ms: 1,
+            blocked: false,
+            category: 'test' as const,
+            sandbox: 'test-double',
+            trust: 'repository-script',
+            network: 'none',
+          };
+        },
+      };
+      const d = deps(root, {
+        planPayload: (phaseId) => ({
+          phase: phaseId,
+          tasks: [
+            {
+              id: 'T01',
+              name: 'Create the phase foundation',
+              requirement_ids: [],
+              technical_justification: 'The foundation is required by the tested behavior.',
+              files: ['src/foundation.mjs'],
+              mapped_references: [newMappedReference('src/foundation.mjs')],
+              write_scope: ['src/foundation.mjs'],
+              depends_on: [],
+              parallel: false,
+              tdd: false,
+              tests: ['node --check src/foundation.mjs'],
+              evidence_expected: 'The foundation syntax is valid.',
+              done: false,
+            },
+            {
+              id: 'T02',
+              name: 'Add the tested behavior',
+              requirement_ids: phaseReqIds(root, phaseId),
+              technical_justification: null,
+              files: ['src/feature.mjs', 'test/feature.test.mjs'],
+              mapped_references: [
+                newMappedReference('src/feature.mjs'),
+                newMappedReference('test/feature.test.mjs'),
+              ],
+              write_scope: ['src/feature.mjs', 'test/feature.test.mjs'],
+              depends_on: ['T01'],
+              parallel: false,
+              tdd: true,
+              tests: ['node --test test/feature.test.mjs'],
+              evidence_expected: 'The behavior test passes.',
+              done: false,
+            },
+            {
+              id: 'T03',
+              name: 'Record the bounded integration',
+              requirement_ids: [],
+              technical_justification: 'The marker records the phase integration.',
+              files: ['src/integration.mjs'],
+              mapped_references: [newMappedReference('src/integration.mjs')],
+              write_scope: ['src/integration.mjs'],
+              depends_on: ['T02'],
+              parallel: false,
+              tdd: false,
+              tests: [],
+              evidence_expected: 'The integration marker exists.',
+              done: false,
+            },
+          ],
+        }),
+      });
+      d.runner.on(
+        (task) => task.id === 'exec-01-T02',
+        (task) => {
+          const workspace = task.workspace!.root;
+          fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+          fs.writeFileSync(
+            path.join(workspace, 'src', 'feature.mjs'),
+            'export const feature = true;\n',
+          );
+          const correction = task.notes.includes(
+            'The prior result failed deterministic TDD RED validation.',
+          );
+          const written = ['src/feature.mjs'];
+          if (correction || failureMode === 'incomplete-environment') {
+            fs.mkdirSync(path.join(workspace, 'test'), { recursive: true });
+            fs.writeFileSync(
+              path.join(workspace, 'test', 'feature.test.mjs'),
+              correction
+                ? "throw new Error('expected the feature behavior');\n"
+                : "import './missing-module.mjs';\n",
+            );
+            written.push('test/feature.test.mjs');
+          }
+          return ok(task, {
+            files_written: written,
+            payload: { done: true, notes: correction ? 'corrected' : 'first result' },
+          });
+        },
+      );
+      const wired = {
+        ...d,
+        shell: redAwareShell,
+        supervisorConfig: {
+          ...defaultConfig().supervisor,
+          max_replacements_per_task: 2,
+          replacement_backoff_ms: [],
+        },
+      };
+
+      await newWorkflow(root, { planFile: '@PLAN.md' }, wired);
+      const outcome = await runWorkflow(root, { target: '01' }, wired);
+
+      expect(outcome.ok, outcome.message).toBe(true);
+      const foundationRuns = d.runner.executed.filter(
+        (task) => task.id === 'exec-01-T01',
+      );
+      const featureRuns = d.runner.executed.filter(
+        (task) => task.id === 'exec-01-T02',
+      );
+      expect(foundationRuns).toHaveLength(1);
+      expect(featureRuns).toHaveLength(2);
+      expect(featureRuns.map((task) => task.attempt?.generation)).toEqual([1, 2]);
+      expect(featureRuns[0]!.workspace?.id).not.toBe(featureRuns[1]!.workspace?.id);
+      expect(fs.existsSync(path.join(root, 'src', 'foundation.mjs'))).toBe(true);
+      expect(fs.existsSync(path.join(root, 'src', 'feature.mjs'))).toBe(true);
+      expect(
+        fs.existsSync(
+          path.join(root, '.rijo', 'runtime', 'tdd-red-retries', 'M001-01-T02.json'),
+        ),
+      ).toBe(false);
+      const record = new TaskStore(new RijoPaths(root)).read('exec-01-T02');
+      expect(record?.state).toBe('SUCCEEDED');
+      expect(record?.generation).toBe(2);
+      expect(record?.replacement_count).toBe(1);
+      expect(record?.revoked_leases).toHaveLength(1);
+    },
+  );
 
   it('resumes from the last verified checkpoint without repeating work', async () => {
     const d = deps(root);
