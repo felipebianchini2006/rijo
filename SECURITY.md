@@ -35,7 +35,7 @@
 - **Destructive operations stop.** Unknown local changes are never discarded,
   overwritten or auto-stashed; RIJO blocks with a diagnostic. Historic
   milestones are immutable.
-- **`rijo check` never deploys** or changes production. It only evaluates and
+- **`$rijo test` never deploys** or changes production. It only evaluates and
   reports.
 - Executed commands and their exit codes are recorded in `events.jsonl` and
   VERIFICATION.md for audit.

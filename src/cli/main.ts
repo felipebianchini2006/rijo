@@ -46,8 +46,8 @@ import { SystemShellRunner } from '../core/commands.js';
 import { openQaCheckpoint } from '../workflows/qa-checkpoint.js';
 
 /**
- * Workflow commands: new, run, ui, fix, check.
- * Read-only invocations: rijo | rijo --status [--json] | rijo --watch.
+ * Workflow commands: map-codebase, new, ui, start, test, fix, finish, next, and resume.
+ * Read-only invocation: rijo status [--json].
  * `deps` is injectable for tests (fake agent runner, fake shell, fake git).
  */
 export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = process.cwd()): Promise<number> {
@@ -868,7 +868,7 @@ Commands:
   rijo new @PLAN.md
   rijo ui @design.zip | @index.html | @dir/
   rijo start
-  rijo test [--fix]
+  rijo test
   rijo fix "problem description" [@evidence]
   rijo finish
   rijo next @NEXT-PLAN.md
