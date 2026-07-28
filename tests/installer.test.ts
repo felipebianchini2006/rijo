@@ -33,6 +33,13 @@ describe('native installer API', () => {
     expect(ignore).toContain('node_modules/');
     expect(ignore).toContain('.rijo/runtime/');
     expect(ignore.match(/# RIJO:BEGIN/g)).toHaveLength(1);
+    expect(report.binding?.managedPaths).toEqual(
+      expect.arrayContaining([
+        { path: 'package.json', created_by_rijo: true },
+        { path: 'package-lock.json', created_by_rijo: true },
+        { path: '.gitignore', created_by_rijo: true },
+      ]),
+    );
   });
 
   it('uses provider user locations and is byte-idempotent', () => {
@@ -72,6 +79,29 @@ describe('native installer API', () => {
     expect(instructions.match(/<!-- RIJO:END -->/g)).toHaveLength(1);
     expect(fs.readFileSync(path.join(root, '.gitignore'), 'utf8').match(/# RIJO:BEGIN/g))
       .toHaveLength(1);
+  });
+
+  it('does not claim pre-existing project tooling files', () => {
+    const root = tmpProject('rijo-install-owned-files-');
+    roots.push(root);
+    fs.writeFileSync(
+      path.join(root, 'package.json'),
+      JSON.stringify({ name: 'user-project', private: true }, null, 2),
+    );
+    fs.writeFileSync(path.join(root, '.gitignore'), 'coverage/\n');
+
+    const first = installRijo({ root, hosts: ['codex'], scope: 'project' });
+    const second = installRijo({ root, hosts: ['codex'], scope: 'project' });
+
+    for (const report of [first, second]) {
+      expect(report.binding?.managedPaths).toEqual(
+        expect.arrayContaining([
+          { path: 'package.json', created_by_rijo: false },
+          { path: '.gitignore', created_by_rijo: false },
+          { path: 'package-lock.json', created_by_rijo: true },
+        ]),
+      );
+    }
   });
 
   it('rejects a provider destination that escapes through a symbolic link', () => {

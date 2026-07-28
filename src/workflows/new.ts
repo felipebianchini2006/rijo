@@ -2,9 +2,11 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import {
+  assertContainedWithoutSymlinks,
   ensureDir,
   exists,
   inventory,
+  readJsonIfExists,
   readText,
   readTextIfExists,
   sha256,
@@ -58,6 +60,47 @@ import {
 } from './shared.js';
 import { buildContextPacket, gapsAffectingScope } from '../codebase/context.js';
 import { readMapState } from '../codebase/state.js';
+
+const ToolingBindingOwnershipSchema = z.object({
+  managed_paths: z
+    .array(
+      z.object({
+        path: z.string().min(1),
+        created_by_rijo: z.boolean(),
+      }),
+    )
+    .default([]),
+});
+
+function rijoCreatedToolingPaths(projectRoot: string): string[] {
+  const receipt = ToolingBindingOwnershipSchema.safeParse(
+    readJsonIfExists<unknown>(
+      path.join(projectRoot, '.rijo', 'tooling-binding.json'),
+    ),
+  );
+  if (!receipt.success) return [];
+  const paths: string[] = [];
+  for (const entry of receipt.data.managed_paths) {
+    if (!entry.created_by_rijo) continue;
+    const absolute = path.resolve(projectRoot, entry.path);
+    const relative = path.relative(projectRoot, absolute);
+    if (
+      relative === '' ||
+      path.isAbsolute(relative) ||
+      relative.split(path.sep).includes('..') ||
+      !exists(absolute)
+    ) {
+      continue;
+    }
+    try {
+      assertContainedWithoutSymlinks(projectRoot, absolute);
+    } catch {
+      continue;
+    }
+    paths.push(relative.split(path.sep).join('/'));
+  }
+  return [...new Set(paths)].sort();
+}
 
 export interface NewOptions {
   planFile: string;
@@ -912,10 +955,11 @@ export async function newWorkflow(
       const adapterPaths = adapterReport.generated
         .map((g) => g.split(' ')[0]!)
         .filter((g) => exists(path.resolve(projectRoot, g)));
+      const toolingPaths = rijoCreatedToolingPaths(projectRoot);
       const baselineCommit = ctx.git.commitPaths(
         projectRoot,
         `rijo(${milestone.id}): milestone initialized`,
-        [rijoRel, ...adapterPaths],
+        [...new Set([rijoRel, ...adapterPaths, ...toolingPaths])],
       );
       if (!baselineCommit) {
         return blocked(ctx, `Milestone ${milestone.id}: baseline commit failed while git commits are enabled.`, [

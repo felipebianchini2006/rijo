@@ -35,6 +35,12 @@ export interface ProjectBinding {
   manifest: string;
   lockfile: string;
   launcher: string;
+  managedPaths: ProjectManagedPath[];
+}
+
+export interface ProjectManagedPath {
+  path: string;
+  created_by_rijo: boolean;
 }
 
 export interface ProjectDependencyInstallOptions {
@@ -108,6 +114,21 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
   const manifest = path.join(toolingRoot, 'package.json');
   const lockfile = path.join(toolingRoot, 'package-lock.json');
   const launcher = path.join(projectRoot, '.rijo', 'bin', 'rijo.cjs');
+  const ignore = path.join(projectRoot, '.gitignore');
+  const bindingFile = path.join(projectRoot, '.rijo', 'tooling-binding.json');
+  const priorBinding = readJsonIfExists<{
+    managed_paths?: ProjectManagedPath[];
+  }>(bindingFile);
+  const priorOwnership = new Map(
+    (priorBinding?.managed_paths ?? []).map((entry) => [entry.path, entry.created_by_rijo]),
+  );
+  const managedPaths = [manifest, lockfile, ignore].map((target) => {
+    const relativePath = relative(projectRoot, target);
+    return {
+      path: relativePath,
+      created_by_rijo: priorOwnership.get(relativePath) ?? !exists(target),
+    };
+  });
   for (const target of [toolingRoot, manifest, lockfile, launcher]) {
     assertContainedWithoutSymlinks(projectRoot, target);
   }
@@ -137,7 +158,7 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
       toolingRootRelative: path.relative(path.dirname(launcher), toolingRoot),
     }),
   );
-  writeJsonAtomic(path.join(projectRoot, '.rijo', 'tooling-binding.json'), {
+  writeJsonAtomic(bindingFile, {
     schema_version: 1,
     rijo_version: RIJO_VERSION,
     isolated,
@@ -145,6 +166,7 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
     manifest: path.relative(projectRoot, manifest),
     lockfile: path.relative(projectRoot, lockfile),
     launcher: path.relative(projectRoot, launcher),
+    managed_paths: managedPaths,
   });
   return {
     projectRoot,
@@ -154,6 +176,7 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
     manifest,
     lockfile,
     launcher,
+    managedPaths,
   };
 }
 

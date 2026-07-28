@@ -12,6 +12,7 @@ import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { defaultConfig, loadConfig, saveConfig } from '../src/core/config.js';
 import { tmpProject, cleanup, writePlanFile, deps, EXTRACTION_PAYLOAD } from './helpers.js';
+import { installRijo } from '../src/install/index.js';
 
 it('rejects extraction that omits an explicit phase count or dependency', () => {
   const plan = [
@@ -69,6 +70,50 @@ describe('rijo new (greenfield)', () => {
     expect(state.milestone).toBe('M001');
     expect(fs.existsSync(path.join(mdir, 'SCOPE.md'))).toBe(true);
     expect(fs.existsSync(path.join(mdir, 'RESEARCH.md'))).toBe(true);
+  });
+
+  it('commits only tooling files that the project installer created', async () => {
+    installRijo({ root, hosts: ['codex'], scope: 'project' });
+    fs.writeFileSync(
+      path.join(root, 'package-lock.json'),
+      JSON.stringify({ lockfileVersion: 3, packages: {} }, null, 2),
+    );
+    const bindingPath = path.join(root, '.rijo', 'tooling-binding.json');
+    const binding = JSON.parse(fs.readFileSync(bindingPath, 'utf8'));
+    binding.managed_paths.push({
+      path: '../outside-project.txt',
+      created_by_rijo: true,
+    });
+    fs.writeFileSync(bindingPath, JSON.stringify(binding, null, 2));
+    const d = deps(root);
+
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, d)).ok).toBe(true);
+
+    const initialization = d.git.commits.find((commit) =>
+      commit.message.includes('milestone initialized'),
+    )!;
+    expect(initialization.paths).toEqual(
+      expect.arrayContaining(['package.json', 'package-lock.json', '.gitignore']),
+    );
+    expect(initialization.paths).not.toContain('../outside-project.txt');
+  });
+
+  it('does not commit pre-existing user tooling files', async () => {
+    fs.writeFileSync(
+      path.join(root, 'package.json'),
+      JSON.stringify({ name: 'user-project', private: true }, null, 2),
+    );
+    fs.writeFileSync(path.join(root, '.gitignore'), 'coverage/\n');
+    installRijo({ root, hosts: ['codex'], scope: 'project' });
+    const d = deps(root);
+
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, d)).ok).toBe(true);
+
+    const initialization = d.git.commits.find((commit) =>
+      commit.message.includes('milestone initialized'),
+    )!;
+    expect(initialization.paths).not.toContain('package.json');
+    expect(initialization.paths).not.toContain('.gitignore');
   });
 
   it('preserves a valid preconfigured runtime instead of replacing it with defaults', async () => {
