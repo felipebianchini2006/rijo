@@ -90,7 +90,9 @@ describe('verified workspace patch transactions', () => {
     const operations = JSON.parse(
       fs.readFileSync(path.join(transactionRoot, transaction, 'operations.json'), 'utf8'),
     ) as { operations: Array<Record<string, unknown>> };
-    expect(operations.operations).toContainEqual({
+    expect(
+      operations.operations.find((operation) => operation['path'] === 'src/current.txt'),
+    ).toMatchObject({
       type: 'symlink',
       path: 'src/current.txt',
       target: 'link-target-b.txt',
@@ -118,5 +120,37 @@ describe('verified workspace patch transactions', () => {
       rolledBack: [],
     });
     expect(diffTrees(expected, snapshotTree(root)).changed).toEqual([]);
+  });
+
+  it('does not overwrite an external edit made after a retained patch commit', () => {
+    const root = tmpProject('rijo-workspace-retained-conflict-');
+    roots.push(root);
+    seedProject(root);
+    const workspace = AttemptWorkspace.create(root, {
+      taskId: 'exec-01-T01',
+      writeScope: ['src/binary.dat'],
+    });
+    fs.writeFileSync(
+      path.join(workspace.root, 'src', 'binary.dat'),
+      Buffer.from([9, 8, 7, 6]),
+    );
+
+    const applied = workspace.applyVerifiedPatch({
+      taskPatch: { milestone: 'M001', phase: '01', task: 'T01' },
+    });
+    expect(applied.transaction_id).not.toBeNull();
+    fs.writeFileSync(path.join(root, 'src', 'binary.dat'), Buffer.from('external edit'));
+
+    expect(() => reconcileTransactions(new RijoPaths(root))).toThrow(
+      /did not overwrite these paths/,
+    );
+    expect(fs.readFileSync(path.join(root, 'src', 'binary.dat'))).toEqual(
+      Buffer.from('external edit'),
+    );
+    expect(
+      fs.existsSync(
+        path.join(root, '.rijo', 'runtime', 'transactions', applied.transaction_id!),
+      ),
+    ).toBe(true);
   });
 });

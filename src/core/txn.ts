@@ -16,7 +16,21 @@ export interface TxnIntent {
   prev: string | null;
   next: string;
   created_at: string;
+  task_patch?: TaskPatchProjection;
 }
+
+export interface TaskPatchProjection {
+  milestone: string;
+  phase: string;
+  task: string;
+  worker_task: string;
+  retain_after_apply: true;
+}
+
+export type TxnPathState =
+  | { kind: 'absent' }
+  | { kind: 'file'; sha256: string }
+  | { kind: 'symlink'; target: string };
 
 export interface TxnHooks {
   /** Test seam. A thrown error simulates a process crash after a durable step. */
@@ -31,6 +45,7 @@ interface DirectoryOperation {
 interface DeleteOperation {
   type: 'delete';
   path: string;
+  before?: TxnPathState;
 }
 
 interface FileOperation {
@@ -39,12 +54,14 @@ interface FileOperation {
   sha256: string;
   size: number;
   mode: number;
+  before?: TxnPathState;
 }
 
 interface SymlinkOperation {
   type: 'symlink';
   path: string;
   target: string;
+  before?: TxnPathState;
 }
 
 type TxnOperation = DirectoryOperation | DeleteOperation | FileOperation | SymlinkOperation;
@@ -57,6 +74,7 @@ interface OperationDocument {
 interface CommitMarkerV2 {
   version: 2;
   operations_sha256: string;
+  intent_sha256?: string;
   committed_at: string;
 }
 
@@ -214,7 +232,12 @@ export class MilestoneTransaction {
   }
 
   /** Stage the full final bytes of one project-relative regular file. */
-  stageBytes(relPath: string, content: Buffer, mode = 0o644): void {
+  stageBytes(
+    relPath: string,
+    content: Buffer,
+    mode = 0o644,
+    before?: TxnPathState,
+  ): void {
     const normalized = normalizeTxnPath(relPath);
     const staged = path.join(this.dir, 'staged', normalized);
     writeDurableAtomic(staged, content, mode);
@@ -224,24 +247,30 @@ export class MilestoneTransaction {
       sha256: sha256(content),
       size: content.byteLength,
       mode: mode & 0o777,
+      ...(before ? { before } : {}),
     });
     this.receipt(`staged:${normalized}`);
     this.hooks.afterWrite?.(`stage:${normalized}`);
   }
 
   /** Record a path that must not exist in the final project tree. */
-  stageDelete(relPath: string): void {
+  stageDelete(relPath: string, before?: TxnPathState): void {
     const normalized = normalizeTxnPath(relPath);
-    this.setOperation({ type: 'delete', path: normalized });
+    this.setOperation({ type: 'delete', path: normalized, ...(before ? { before } : {}) });
     this.receipt(`delete:${normalized}`);
     this.hooks.afterWrite?.(`delete:${normalized}`);
   }
 
   /** Record a relative, project-contained symbolic link as explicit intent. */
-  stageSymlink(relPath: string, target: string): void {
+  stageSymlink(relPath: string, target: string, before?: TxnPathState): void {
     const normalized = normalizeTxnPath(relPath);
     assertSafeSymlink(this.projectRoot, normalized, target);
-    this.setOperation({ type: 'symlink', path: normalized, target });
+    this.setOperation({
+      type: 'symlink',
+      path: normalized,
+      target,
+      ...(before ? { before } : {}),
+    });
     this.receipt(`symlink:${normalized}`);
     this.hooks.afterWrite?.(`symlink:${normalized}`);
   }
@@ -271,6 +300,7 @@ export class MilestoneTransaction {
     const marker: CommitMarkerV2 = {
       version: 2,
       operations_sha256: sha256(serialized),
+      intent_sha256: sha256(fs.readFileSync(path.join(this.dir, 'intent.json'))),
       committed_at: new Date().toISOString(),
     };
     writeDurableAtomic(path.join(this.dir, 'commit.json'), `${JSON.stringify(marker, null, 2)}\n`);
@@ -337,6 +367,10 @@ function readV2Operations(dir: string): TxnOperation[] | null {
       throw new Error(`Transaction operation path is duplicate or invalid: ${String(raw.path)}`);
     }
     seen.add(normalized);
+    const before = parsePathState(
+      (raw as Partial<FileOperation | DeleteOperation | SymlinkOperation>).before,
+      normalized,
+    );
     if (raw.type === 'file') {
       if (
         typeof raw.sha256 !== 'string' ||
@@ -353,17 +387,47 @@ function readV2Operations(dir: string): TxnOperation[] | null {
         sha256: raw.sha256,
         size: Number(raw.size),
         mode: Number(raw.mode) & 0o777,
+        ...(before ? { before } : {}),
       });
     } else if (raw.type === 'symlink') {
       if (typeof raw.target !== 'string') {
         throw new Error(`Transaction symlink operation is invalid: ${normalized}`);
       }
-      operations.push({ type: 'symlink', path: normalized, target: raw.target });
+      operations.push({
+        type: 'symlink',
+        path: normalized,
+        target: raw.target,
+        ...(before ? { before } : {}),
+      });
     } else {
-      operations.push({ type: raw.type, path: normalized });
+      operations.push({
+        type: raw.type,
+        path: normalized,
+        ...(raw.type === 'delete' && before ? { before } : {}),
+      });
     }
   }
   return operations;
+}
+
+function parsePathState(raw: unknown, rel: string): TxnPathState | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || !('kind' in raw)) {
+    throw new Error(`Transaction preimage is invalid: ${rel}`);
+  }
+  const candidate = raw as Record<string, unknown>;
+  if (candidate['kind'] === 'absent') return { kind: 'absent' };
+  if (
+    candidate['kind'] === 'file' &&
+    typeof candidate['sha256'] === 'string' &&
+    /^[a-f0-9]{64}$/.test(candidate['sha256'])
+  ) {
+    return { kind: 'file', sha256: candidate['sha256'] };
+  }
+  if (candidate['kind'] === 'symlink' && typeof candidate['target'] === 'string') {
+    return { kind: 'symlink', target: candidate['target'] };
+  }
+  throw new Error(`Transaction preimage is invalid: ${rel}`);
 }
 
 function removeDestination(projectRoot: string, rel: string): void {
@@ -476,6 +540,48 @@ function isSymbolicLink(candidate: string): boolean {
   }
 }
 
+function readPathState(projectRoot: string, rel: string): TxnPathState | { kind: 'other' } {
+  const candidate = path.join(projectRoot, rel);
+  try {
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink()) {
+      return { kind: 'symlink', target: fs.readlinkSync(candidate) };
+    }
+    if (stat.isFile()) return { kind: 'file', sha256: sha256(fs.readFileSync(candidate)) };
+    return { kind: 'other' };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' };
+    throw error;
+  }
+}
+
+function statesEqual(
+  left: TxnPathState | { kind: 'other' },
+  right: TxnPathState | { kind: 'other' },
+): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === 'file' && right.kind === 'file') return left.sha256 === right.sha256;
+  if (left.kind === 'symlink' && right.kind === 'symlink') return left.target === right.target;
+  return true;
+}
+
+function finalState(operation: TxnOperation): TxnPathState | { kind: 'other' } {
+  if (operation.type === 'file') return { kind: 'file', sha256: operation.sha256 };
+  if (operation.type === 'symlink') return { kind: 'symlink', target: operation.target };
+  if (operation.type === 'delete') return { kind: 'absent' };
+  return { kind: 'other' };
+}
+
+export class TransactionApplyConflictError extends Error {
+  constructor(public readonly transaction: string, public readonly conflicts: string[]) {
+    super(
+      `Committed transaction ${transaction} found external path states: ${conflicts.join(', ')}. ` +
+        'RIJO did not overwrite these paths.',
+    );
+    this.name = 'TransactionApplyConflictError';
+  }
+}
+
 function applyV2Operations(
   dir: string,
   projectRoot: string,
@@ -483,6 +589,16 @@ function applyV2Operations(
   hooks: TxnHooks,
 ): string[] {
   validateOperationSet(dir, projectRoot, operations);
+  const conflicts = operations
+    .filter((operation) => {
+      if (operation.type === 'directory' || !operation.before) return false;
+      const current = readPathState(projectRoot, operation.path);
+      return !statesEqual(current, operation.before) && !statesEqual(current, finalState(operation));
+    })
+    .map((operation) => operation.path);
+  if (conflicts.length > 0) {
+    throw new TransactionApplyConflictError(path.basename(dir), conflicts);
+  }
   const applied: string[] = [];
   const deletes = operations
     .filter((operation): operation is DeleteOperation => operation.type === 'delete')
@@ -556,6 +672,103 @@ function applyStaged(dir: string, projectRoot: string, hooks: TxnHooks = {}): st
     : applyV2Operations(dir, projectRoot, operations, hooks);
 }
 
+function readCommittedIntent(dir: string): TxnIntent {
+  const intentPath = path.join(dir, 'intent.json');
+  const serialized = fs.readFileSync(intentPath);
+  const commit = JSON.parse(fs.readFileSync(path.join(dir, 'commit.json'), 'utf8')) as Partial<CommitMarkerV2>;
+  if (commit.intent_sha256 && commit.intent_sha256 !== sha256(serialized)) {
+    throw new Error(`Transaction intent integrity check failed: ${path.basename(dir)}`);
+  }
+  const intent = JSON.parse(serialized.toString('utf8')) as Partial<TxnIntent>;
+  if (
+    typeof intent.kind !== 'string' ||
+    !('prev' in intent) ||
+    typeof intent.next !== 'string' ||
+    typeof intent.created_at !== 'string'
+  ) {
+    throw new Error(`Transaction intent is invalid: ${path.basename(dir)}`);
+  }
+  return intent as TxnIntent;
+}
+
+export interface PendingTaskPatch {
+  transaction_id: string;
+  milestone: string;
+  phase: string;
+  task: string;
+  worker_task: string;
+  controlled_updates: Array<{ path: string; hash: string | null }>;
+  final_state_matches: boolean;
+}
+
+function pendingTaskPatchFromDir(dir: string, projectRoot: string): PendingTaskPatch | null {
+  const intent = readCommittedIntent(dir);
+  const projection = intent.task_patch;
+  if (
+    intent.kind !== 'task-patch' ||
+    !projection ||
+    projection.retain_after_apply !== true ||
+    !projection.milestone ||
+    !projection.phase ||
+    !projection.task ||
+    !projection.worker_task
+  ) {
+    return null;
+  }
+  const operations = readV2Operations(dir);
+  if (!operations) throw new Error(`Retained task patch has no operation document: ${path.basename(dir)}`);
+  const controlledUpdates = operations
+    .filter((operation) => operation.type !== 'directory')
+    .map((operation) => ({
+      path: operation.path,
+      hash: operation.type === 'file' ? operation.sha256 : null,
+    }));
+  return {
+    transaction_id: path.basename(dir),
+    milestone: projection.milestone,
+    phase: projection.phase,
+    task: projection.task,
+    worker_task: projection.worker_task,
+    controlled_updates: controlledUpdates,
+    final_state_matches: operations.every((operation) =>
+      operation.type === 'directory'
+        ? true
+        : statesEqual(readPathState(projectRoot, operation.path), finalState(operation)),
+    ),
+  };
+}
+
+export function listPendingTaskPatches(paths: RijoPaths): PendingTaskPatch[] {
+  const transactionRoot = path.join(paths.runtimeDir, 'transactions');
+  if (!exists(transactionRoot)) return [];
+  const pending: PendingTaskPatch[] = [];
+  for (const entry of fs.readdirSync(transactionRoot, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(transactionRoot, entry.name);
+    if (!exists(path.join(dir, 'commit.json'))) continue;
+    const patch = pendingTaskPatchFromDir(dir, paths.projectRoot);
+    if (patch) pending.push(patch);
+  }
+  return pending;
+}
+
+export function completeRetainedTaskPatch(paths: RijoPaths, transactionId: string): void {
+  const transactionRoot = path.join(paths.runtimeDir, 'transactions');
+  const dir = path.join(transactionRoot, normalizeTxnPath(transactionId));
+  if (path.dirname(dir) !== transactionRoot) {
+    throw new Error(`Transaction id is invalid: ${transactionId}`);
+  }
+  const pending = pendingTaskPatchFromDir(dir, paths.projectRoot);
+  if (!pending || !pending.final_state_matches) {
+    throw new Error(`Task patch is not ready to complete: ${transactionId}`);
+  }
+  writeDurableAtomic(path.join(dir, 'projection-complete.json'), `${JSON.stringify({
+    completed_at: new Date().toISOString(),
+  })}\n`);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fsyncDirectory(transactionRoot);
+}
+
 export interface ReconcileReport {
   rolledForward: string[];
   rolledBack: string[];
@@ -578,8 +791,13 @@ export function reconcileTransactions(paths: RijoPaths): ReconcileReport {
     } else {
       report.rolledBack.push(entry.name);
     }
-    fs.rmSync(dir, { recursive: true, force: true });
-    fsyncDirectory(transactionRoot);
+    const retained =
+      exists(path.join(dir, 'commit.json')) &&
+      pendingTaskPatchFromDir(dir, paths.projectRoot) !== null;
+    if (!retained) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fsyncDirectory(transactionRoot);
+    }
   }
   return report;
 }

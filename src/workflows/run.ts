@@ -70,6 +70,12 @@ import {
 import { readMapState } from '../codebase/state.js';
 import { ensureCodebaseMap } from './map.js';
 import { TaskStore } from '../supervisor/store.js';
+import {
+  completeRetainedTaskPatch,
+  listPendingTaskPatches,
+  TransactionApplyConflictError,
+  type PendingTaskPatch,
+} from '../core/txn.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -1172,7 +1178,63 @@ async function executePhase(
   }
   const phaseBaseline: FileSnapshot = recoveredBaseline?.snapshot ?? snapshotFiles(ctx.projectRoot);
   const dirtyAtStart = recoveredBaseline?.dirtyAtStart ?? initialDirtyAtStart;
-  let controlledSnapshot = recoveredBaseline?.controlledSnapshot ?? phaseBaseline;
+  let controlledSnapshot = recoveredBaseline?.controlledSnapshot ?? new Map(phaseBaseline);
+  const checkpointTaskPatches = (patches: PendingTaskPatch[]): WorkflowOutcome | null => {
+    for (const patch of patches) {
+      if (!patch.final_state_matches) {
+        return blocked(ctx, `Phase ${phase.id}: committed task patch ${patch.transaction_id} no longer matches its verified bytes.`, [
+          'RIJO did not overwrite or appropriate the conflicting path state.',
+        ]);
+      }
+      for (const update of patch.controlled_updates) {
+        if (update.path === '.rijo' || update.path.startsWith('.rijo/')) continue;
+        if (update.hash === null) controlledSnapshot.delete(update.path);
+        else controlledSnapshot.set(update.path, update.hash);
+      }
+    }
+    writePhaseRecoveryBaseline(
+      recoveryBaselinePath,
+      phaseBaseline,
+      dirtyAtStart,
+      controlledSnapshot,
+    );
+    for (const patch of patches) completeRetainedTaskPatch(paths, patch.transaction_id);
+    return null;
+  };
+  const recoveredTaskPatches = listPendingTaskPatches(paths).filter(
+    (patch) => patch.milestone === milestone.id && patch.phase === phase.id,
+  );
+  if (recoveredTaskPatches.length > 0) {
+    if (!recoveredBaseline) {
+      return blocked(ctx, `Phase ${phase.id}: source baseline needed for committed task patch recovery is missing.`, [
+        'RIJO kept the task patch receipt and did not claim the changed source as a new baseline.',
+      ]);
+    }
+    const invalidPatch = recoveredTaskPatches.find((patch) => !patch.final_state_matches);
+    if (invalidPatch) {
+      return blocked(ctx, `Phase ${phase.id}: committed task patch ${invalidPatch.transaction_id} no longer matches its verified bytes.`, [
+        'RIJO left the task projection unchanged and did not overwrite the conflicting path state.',
+      ]);
+    }
+    for (const patch of recoveredTaskPatches) {
+      const task = readPlan(pp.plan).tasks.find((candidate) => candidate.id === patch.task);
+      if (!task) {
+        return blocked(ctx, `Phase ${phase.id}: retained task patch references unknown task ${patch.task}.`, []);
+      }
+      if (task.status === 'RUNNING') {
+        transition(task.id, 'IMPLEMENTED', 'recovered committed task patch');
+      } else if (!['IMPLEMENTED', 'VERIFYING', 'VERIFIED', 'DONE'].includes(task.status)) {
+        return blocked(ctx, `Phase ${phase.id}: retained task patch cannot advance task ${task.id} from ${task.status}.`, []);
+      }
+    }
+    const recoveredCheckpoint = checkpointTaskPatches(recoveredTaskPatches);
+    if (recoveredCheckpoint) return recoveredCheckpoint;
+    bus.emit(
+      'run.task_patch_recovered',
+      { message: `Recovered ${recoveredTaskPatches.length} committed task patch(es).` },
+      { transactions: recoveredTaskPatches.map((patch) => patch.transaction_id) },
+    );
+  }
   if (recoveredBaseline) {
     const resumeDelta = diffSnapshots(controlledSnapshot, snapshotFiles(ctx.projectRoot));
     const overlapping = resumeDelta.changed.filter((changed) =>
@@ -1479,13 +1541,27 @@ async function executePhase(
 
     // Apply the validated patches to the controlled checkout. A conflict with a
     // concurrent (user) change blocks with no partial merge.
+    const retainedPatchIds: string[] = [];
     for (let i = 0; i < attempts.length; i++) {
       const a = attempts[i]!;
       const t = pending[i]!;
+      let transactionId: string;
       try {
-        a.attempt.workspace.applyVerifiedPatch();
+        const applied = a.attempt.workspace.applyVerifiedPatch({
+          taskPatch: {
+            milestone: milestone.id,
+            phase: phase.id,
+            task: t.id,
+          },
+        });
+        transactionId = applied.transaction_id!;
       } catch (err) {
         discardAll();
+        if (err instanceof TransactionApplyConflictError) {
+          return blocked(ctx, `Phase ${phase.id}: ${err.message}`, [
+            'The committed task patch journal remains available. Resolve the external path state, then resume.',
+          ]);
+        }
         transition(t.id, 'FAILED', 'patch conflict');
         if (err instanceof PatchConflictError) {
           return blocked(ctx, `Phase ${phase.id}: ${err.message}`, [
@@ -1494,7 +1570,22 @@ async function executePhase(
         }
         throw err;
       }
+      ctx.taskPatchHooks.afterApplied?.(transactionId, t.id);
+      retainedPatchIds.push(transactionId);
       a.attempt.workspace.discard();
+    }
+    const retainedPatches = listPendingTaskPatches(paths).filter((patch) =>
+      retainedPatchIds.includes(patch.transaction_id),
+    );
+    if (
+      retainedPatches.length !== retainedPatchIds.length ||
+      retainedPatches.some((patch) => !patch.final_state_matches)
+    ) {
+      return blocked(ctx, `Phase ${phase.id}: retained task patch receipts are incomplete or conflict with the checkout.`, [
+        'RIJO left every task projection unchanged. The retained journals remain available for safe recovery.',
+      ]);
+    }
+    for (const t of pending) {
       transition(t.id, 'IMPLEMENTED');
       bus.emit('run.task_done', {
         completedUnits: readPlan(pp.plan).tasks.filter((x) => x.status !== 'PENDING' && x.status !== 'RUNNING').length,
@@ -1503,7 +1594,8 @@ async function executePhase(
       });
     }
     for (const result of results) commitDecisionProposals(ctx, result);
-    checkpointControlledSnapshot();
+    const taskPatchCheckpoint = checkpointTaskPatches(retainedPatches);
+    if (taskPatchCheckpoint) return taskPatchCheckpoint;
   }
 
   // ---- Evidence gate: a phase MUST produce real command evidence. A task may

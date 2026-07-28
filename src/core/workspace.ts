@@ -4,7 +4,12 @@ import * as path from 'node:path';
 import { ensureDir, exists, sha256 } from './fsx.js';
 import { RijoPaths } from './paths.js';
 import { pathInScope } from './scope.js';
-import { MilestoneTransaction, type TxnHooks } from './txn.js';
+import {
+  MilestoneTransaction,
+  type TaskPatchProjection,
+  type TxnHooks,
+  type TxnPathState,
+} from './txn.js';
 import { isSensitivePath } from '../security/sensitive.js';
 
 /**
@@ -239,6 +244,11 @@ export class PatchConflictError extends Error {
 export interface AppliedPatch {
   applied: string[];
   renamed: Array<{ from: string; to: string }>;
+  transaction_id: string | null;
+}
+
+export interface ApplyVerifiedPatchOptions {
+  taskPatch?: Pick<TaskPatchProjection, 'milestone' | 'phase' | 'task'>;
 }
 
 export interface AttemptWorkspaceOptions {
@@ -365,7 +375,7 @@ export class AttemptWorkspace {
    * baseline (no concurrent user or sibling change); one conflict aborts the
    * whole apply with no partial merge.
    */
-  applyVerifiedPatch(): AppliedPatch {
+  applyVerifiedPatch(options: ApplyVerifiedPatchOptions = {}): AppliedPatch {
     const delta = this.validate();
     const current = snapshotTree(this.projectRoot);
     const conflicts: string[] = [];
@@ -392,23 +402,48 @@ export class AttemptWorkspace {
             changed: delta.changed,
           }),
         ),
+        ...(options.taskPatch
+          ? {
+              task_patch: {
+                ...options.taskPatch,
+                worker_task: this.taskId,
+                retain_after_apply: true as const,
+              },
+            }
+          : {}),
       },
       this.transactionHooks,
     );
-    for (const rel of delta.removed) transaction.stageDelete(rel);
+    const beforeState = (rel: string): TxnPathState => {
+      const entry = this.baseline.get(rel);
+      if (!entry) return { kind: 'absent' };
+      return entry.symlinkTarget === null
+        ? { kind: 'file', sha256: entry.hash! }
+        : { kind: 'symlink', target: entry.symlinkTarget };
+    };
+    for (const rel of delta.removed) transaction.stageDelete(rel, beforeState(rel));
     for (const rel of [...delta.added, ...delta.modified]) {
       const source = path.join(this.root, rel);
       const entry = after.get(rel)!;
       if (entry.symlinkTarget !== null) {
-        transaction.stageSymlink(rel, entry.symlinkTarget);
+        transaction.stageSymlink(rel, entry.symlinkTarget, beforeState(rel));
       } else {
-        transaction.stageBytes(rel, fs.readFileSync(source), fs.statSync(source).mode & 0o777);
+        transaction.stageBytes(
+          rel,
+          fs.readFileSync(source),
+          fs.statSync(source).mode & 0o777,
+          beforeState(rel),
+        );
       }
     }
     transaction.commitPoint();
     transaction.apply();
-    transaction.finish();
-    return { applied: delta.changed, renamed: delta.renamed };
+    if (!options.taskPatch) transaction.finish();
+    return {
+      applied: delta.changed,
+      renamed: delta.renamed,
+      transaction_id: options.taskPatch ? transaction.id : null,
+    };
   }
 
   /** Remove the workspace entirely. Idempotent. */

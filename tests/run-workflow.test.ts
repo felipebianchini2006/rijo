@@ -472,6 +472,80 @@ describe('rijo run', () => {
     expect(resumed.details?.join('\n')).toContain('src/a.ts');
   });
 
+  it('recovers a committed worker patch after a crash before the task projection', async () => {
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    let injected = false;
+
+    await expect(
+      runWorkflow(root, {}, {
+        ...d,
+        taskPatchHooks: {
+          afterApplied: () => {
+            if (injected) return;
+            injected = true;
+            throw new Error('INJECTED-CRASH after task patch apply');
+          },
+        },
+      }),
+    ).rejects.toThrow('INJECTED-CRASH after task patch apply');
+
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalog', 'PLAN.md');
+    expect(readPlan(planPath).tasks[0]!.status).toBe('RUNNING');
+    expect(fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8')).toContain('exec-01-T01');
+    const transactionRoot = path.join(root, '.rijo', 'runtime', 'transactions');
+    expect(fs.readdirSync(transactionRoot)).toHaveLength(1);
+    const firstTaskRuns = d.runner.executed.filter((task) => task.id === 'exec-01-T01').length;
+
+    fs.writeFileSync(path.join(root, 'external-note.txt'), 'external and unrelated\n');
+    const resumed = await runWorkflow(root, {}, d);
+
+    expect(resumed.ok, resumed.message).toBe(true);
+    expect(d.runner.executed.filter((task) => task.id === 'exec-01-T01')).toHaveLength(
+      firstTaskRuns,
+    );
+    expect(fs.readFileSync(path.join(root, 'external-note.txt'), 'utf8')).toBe(
+      'external and unrelated\n',
+    );
+    expect(d.git.commits.flatMap((commit) => commit.paths)).not.toContain(
+      'external-note.txt',
+    );
+    expect(fs.readdirSync(transactionRoot)).toEqual([]);
+  });
+
+  it('keeps a task running when external bytes conflict with its retained patch', async () => {
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    let injected = false;
+    const crashDeps = {
+      ...d,
+      taskPatchHooks: {
+        afterApplied: () => {
+          if (injected) return;
+          injected = true;
+          throw new Error('INJECTED-CRASH after task patch apply');
+        },
+      },
+    };
+    await expect(runWorkflow(root, {}, crashDeps)).rejects.toThrow(
+      'INJECTED-CRASH after task patch apply',
+    );
+    fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'external conflicting bytes\n');
+
+    await expect(runWorkflow(root, {}, d)).rejects.toThrow(
+      /did not overwrite these paths/,
+    );
+
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalog', 'PLAN.md');
+    expect(readPlan(planPath).tasks[0]!.status).toBe('RUNNING');
+    expect(fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8')).toBe(
+      'external conflicting bytes\n',
+    );
+    expect(
+      fs.readdirSync(path.join(root, '.rijo', 'runtime', 'transactions')),
+    ).toHaveLength(1);
+  });
+
   it('verification failure does not advance state (atomicity) and bounded repair applies', async () => {
     const d = deps(root);
     // shell always fails for the plan's test command

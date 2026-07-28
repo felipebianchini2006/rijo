@@ -107,6 +107,10 @@ export interface WorkflowContext {
     afterPlanWritten?: () => void;
     afterReplanned?: () => void;
   };
+  /** Test seam for a crash after source apply and before task projection. */
+  taskPatchHooks: {
+    afterApplied?: (transactionId: string, taskId: string) => void;
+  };
 }
 
 export interface WorkflowDeps {
@@ -135,6 +139,8 @@ export interface WorkflowDeps {
   decisionHooks?: DecisionCommitHooks;
   /** test seam: fault injection across durable plan invalidation/re-planning. */
   planHooks?: WorkflowContext['planHooks'];
+  /** test seam: fault injection between task patch apply and task projection. */
+  taskPatchHooks?: WorkflowContext['taskPatchHooks'];
 }
 
 export function createContext(projectRoot: string, deps: WorkflowDeps = {}): WorkflowContext {
@@ -177,6 +183,7 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     openDecisionEnvelopes: new Set(),
     decisionHooks: deps.decisionHooks ?? {},
     planHooks: deps.planHooks ?? {},
+    taskPatchHooks: deps.taskPatchHooks ?? {},
   };
 }
 
