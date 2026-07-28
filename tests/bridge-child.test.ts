@@ -114,14 +114,6 @@ function fakeHostResult(task: AgentTaskWire, root: string) {
     const phaseId = task.id.match(/plan-(\d{2})/)?.[1] ?? '01';
     return okResult({ payload: localPlanPayload(phaseId) });
   }
-  if (task.id.startsWith('spec-')) {
-    const specPath = path.isAbsolute(task.write_scope[0]!)
-      ? task.write_scope[0]!
-      : path.join(base, task.write_scope[0]!);
-    fs.mkdirSync(path.dirname(specPath), { recursive: true });
-    fs.writeFileSync(specPath, `# Spec\n\nObservable acceptance scenarios.\n`, 'utf8');
-    return okResult({ files_written: [task.write_scope[0]!] });
-  }
   if (task.id.startsWith('new-research')) {
     return okResult({
       payload: {
@@ -341,7 +333,8 @@ describe('host↔core JSON-RPC bridge (real child process)', () => {
         expect(runResp.id).toBe(2);
         expect('result' in runResp || 'error' in runResp).toBe(true);
         const runTasks = host.seenTasks.slice(before);
-        expect(runTasks).toContain('spec-01');
+        expect(runTasks.some((id) => id.startsWith('spec-'))).toBe(false);
+        expect(runTasks).toContain('plan-01-r0');
         expect(runTasks.some((id) => id.startsWith('exec-01-'))).toBe(true);
 
         // clean shutdown: stdin end resolves serve() and the process exits 0

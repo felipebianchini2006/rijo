@@ -279,7 +279,7 @@ export interface SupervisorOverrides {
  * Tiers: the bulk-cost roles (worker, researcher, qa, lead) run on the cheapest
  * `economical-research` tier (haiku for Claude / gpt-5.6-luna for Codex). The
  * two roles that must emit STRICT structured JSON to drive the multi-agent
- * protocol — the planner (plan/spec) and the reviewer (plan/code verdicts) — run
+ * protocol — the planner and the reviewer (plan/code verdicts) — run
  * on `balanced-reasoning`: at the very cheapest tier those roles do not reliably
  * return a schema-valid verdict, so the phase cannot converge. This is still a
  * cost-minimal choice (a handful of reasoning-tier calls per phase; every write

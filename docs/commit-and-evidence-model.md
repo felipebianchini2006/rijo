@@ -18,7 +18,7 @@ between them is checked to contain nothing else.**
  [verified patches applied from per-task workspaces]
      |
      v
- PERSIST: SPEC.md, PLAN.md, VERIFICATION.md (tested_commit: null,
+ PERSIST: PLAN.md, VERIFICATION.md (tested_commit: null,
           evidence_commit: null), SUMMARY.md, REVIEW.md,
           REQUIREMENTS.md, ROADMAP.md, STATE.md, manifest.json
           all written to disk — nothing committed yet

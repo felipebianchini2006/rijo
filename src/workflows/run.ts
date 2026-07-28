@@ -736,60 +736,6 @@ async function executePhase(
     touchManifest(paths, () => {}, now);
   }
 
-  // ---- SPEC_READY
-  if (!exists(pp.spec)) {
-    stage('SPEC_READY', 'Generate the phase specification.');
-    const reqDoc = readRequirements(milestone.paths.requirements);
-    const phaseReqs = reqDoc.requirements.filter((r) => r.phase === phase.id);
-    const specMapContext = buildContextPacket(
-      ctx.projectRoot,
-      [phase.name, ...phaseReqs.flatMap((requirement) => [requirement.description, requirement.acceptance])].join('\n'),
-      config.context_budget_bytes,
-    );
-    const specRel = path.relative(ctx.projectRoot, pp.spec).split(path.sep).join('/');
-    const specTask: AgentTaskDraft = {
-      id: `spec-${phase.id}`,
-      role: 'planner',
-      objective: `Write the SPEC.md for phase ${phase.id} (${phase.name}). It must be actionable, testable, tied to real code surfaces, complete and coherent, with observable acceptance scenarios for each requirement.`,
-      canonical_files: [
-        paths.rules,
-        milestone.paths.scope,
-        milestone.paths.requirements,
-        milestone.paths.research,
-        pp.research,
-      ].filter(exists),
-      code_files: [],
-      write_scope: [specRel],
-      acceptance_criteria: phaseReqs.map((r) => `${r.id}: ${r.acceptance}`),
-      verification_commands: [],
-      return_format: 'Write SPEC.md to disk (inside your workspace); return a one-line confirmation.',
-      notes: [
-        `Requirements in this phase:\n${phaseReqs.map((r) => `- ${r.id}: ${r.description}`).join('\n')}`,
-        specMapContext.text,
-      ].join('\n\n'),
-      workspace: null,
-      canonical_baseline: null,
-    };
-    // The spec is a canonical artifact: this is an explicitly core-authorized
-    // canonical write, isolated in a workspace and applied only after validation.
-    const spec = replaceableAttempt(ctx, specTask, { canonicalWriteScope: [specRel] }, { stage: 'SPEC_READY' });
-    const res = await dispatch(ctx, spec.attempt.task, { stage: 'SPEC_READY' }, { prepareReplacement: spec.prepareReplacement });
-    try {
-      if (!res.ok || !exists(path.join(spec.attempt.workspace.root, specRel))) {
-        return blocked(ctx, `Phase ${phase.id}: spec generation failed.`, [res.summary]);
-      }
-      spec.attempt.workspace.applyVerifiedPatch();
-      touchManifest(paths, () => {}, now);
-      commitDecisionProposals(ctx, res);
-    } catch (err) {
-      return blocked(ctx, `Phase ${phase.id}: spec generation violated workspace boundaries.`, [String((err as Error).message)]);
-    } finally {
-      spec.attempt.workspace.discard();
-    }
-  } else {
-    stage('SPEC_READY', 'Validated the existing specification.');
-  }
-
   // ---- PLAN + PLAN_LINT + PLAN_REVIEW (bounded loop)
   const reqDoc = readRequirements(milestone.paths.requirements);
   const knownReqs = new Set(reqDoc.requirements.map((r) => r.id));
@@ -819,7 +765,6 @@ async function executePhase(
         canonical_files: [
           paths.rules,
           pp.research,
-          pp.spec,
           milestone.paths.requirements,
         ].filter(exists),
         code_files: [],
@@ -961,8 +906,8 @@ async function executePhase(
     const reviewTask: AgentTaskDraft = {
       id: `plan-review-${phase.id}-r${revisions}`,
       role: 'reviewer',
-      objective: `Independent brief review of the phase plan: completeness, coherence, risk, requirement coverage, adherence to rules. You receive spec and plan, never the author's reasoning.`,
-      canonical_files: [paths.rules, pp.spec, pp.plan].filter(exists),
+      objective: `Independent brief review of the phase plan: completeness, coherence, risk, requirement coverage, adherence to rules. You receive the plan, never the author's reasoning.`,
+      canonical_files: [paths.rules, pp.plan].filter(exists),
       code_files: [],
       write_scope: [],
       acceptance_criteria: [],
@@ -1137,7 +1082,7 @@ async function executePhase(
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
         objective: `Implement task ${t.id}: ${t.name}. ${tddInstruction}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
-        canonical_files: [ctx.paths.rules, pp.spec, pp.plan].filter(exists),
+        canonical_files: [ctx.paths.rules, pp.plan].filter(exists),
         code_files: t.files.map((f) => path.resolve(ctx.projectRoot, f)),
         write_scope: t.write_scope,
         acceptance_criteria: [t.evidence_expected],
@@ -1362,8 +1307,8 @@ async function executePhase(
       id: `code-review-${phase.id}-l${reviewLoops}`,
       role: 'reviewer',
       objective:
-        'Independent code review. You receive the spec, the plan, the diff and the verification evidence — never the implementer reasoning. RIJO runs framework-owned UI smoke after this review. Do not reject only because that future smoke evidence is absent. Check whether the requested smoke journey can prove the UI acceptance criteria. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject.',
-      canonical_files: [pp.spec, pp.plan].filter(exists),
+        'Independent code review. You receive the plan, the diff and the verification evidence — never the implementer reasoning. RIJO runs framework-owned UI smoke after this review. Do not reject only because that future smoke evidence is absent. Check whether the requested smoke journey can prove the UI acceptance criteria. Classify each finding as intent_gap, spec_gap, implementation_bug, test_gap, security_risk, quality_issue, defer or reject.',
+      canonical_files: [pp.plan].filter(exists),
       code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
       write_scope: [],
       acceptance_criteria: [],
@@ -1436,7 +1381,7 @@ async function executePhase(
         role: 'reviewer',
         objective:
           'Review only the changed high-risk surface. Check authorization, trust boundaries, secret handling, destructive actions, upload validation, money movement, and data integrity as applicable. Return only evidence-backed findings. Do not change files.',
-        canonical_files: [pp.spec, pp.plan].filter(exists),
+        canonical_files: [pp.plan].filter(exists),
         code_files: plan.tasks.flatMap((task) =>
           task.files.map((file) => path.resolve(ctx.projectRoot, file)),
         ),
@@ -1480,14 +1425,14 @@ async function executePhase(
     writeReviewDoc(pp, reviewData, reviewLoops, now);
     touchManifest(paths, () => {}, now);
     const blockingSeverities = new Set(['blocker', 'critical', 'high']);
-    const specGaps = reviewData.findings.filter(
+    const contractGaps = reviewData.findings.filter(
       (f) => (f.type === 'intent_gap' || f.type === 'spec_gap') && blockingSeverities.has(f.severity),
     );
-    if (specGaps.length > 0) {
+    if (contractGaps.length > 0) {
       return blocked(
         ctx,
-        `Phase ${phase.id}: review found spec/intent gaps; returning to specification instead of patching locally.`,
-        specGaps.map((f) => `${f.type}: ${f.description}`),
+        `Phase ${phase.id}: review found plan/intent gaps; returning to planning instead of patching locally.`,
+        contractGaps.map((f) => `${f.type}: ${f.description}`),
       );
     }
     // Medium/low review observations are recorded in REVIEW.md, but cannot
@@ -1536,7 +1481,7 @@ async function executePhase(
         id: `ui-smoke-${phase.id}`,
         role: 'qa',
         objective: 'UI smoke: load the changed surface, check console and network for errors, exercise the main navigation, capture a minimal screenshot.',
-        canonical_files: [pp.spec].filter(exists),
+        canonical_files: [pp.plan].filter(exists),
         code_files: [],
         write_scope: [screenshotScope],
         acceptance_criteria: ['No unhandled console errors', 'No failing network requests on the main flow'],
@@ -1606,8 +1551,8 @@ async function runRepairAttempt(
   const repairTask: AgentTaskDraft = {
     id: spec.id,
     role: 'worker',
-    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do not edit the phase specification or plan during a code repair. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
-    canonical_files: [pp.spec, pp.plan].filter(exists),
+    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do not edit the phase plan during a code repair. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
+    canonical_files: [pp.plan].filter(exists),
     code_files: plan.tasks.flatMap((t) => t.files.map((f) => path.resolve(ctx.projectRoot, f))),
     write_scope: plan.tasks.flatMap((t) => t.write_scope),
     acceptance_criteria: spec.acceptance,

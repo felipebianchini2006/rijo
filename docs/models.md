@@ -13,12 +13,12 @@ model.
 |---|---|---|---|
 | `lead` | Thin orchestration and defect diagnosis | `strongest` | Few calls with small context |
 | `reviewer` | Independent plan, code, and visual review | `strongest-independent` | One or two calls per phase |
-| `planner` | Phase research, specification, and planning | `balanced-reasoning` | One to three calls per phase |
+| `planner` | Phase research and planning | `balanced-reasoning` | One to three calls per phase |
 | `worker` | One implementation task with a strict write scope | `economical-coding` | Two to four calls per phase |
 | `researcher` | Focused research from primary sources | `economical-research` | Up to four parallel calls |
 | `qa` | Browser or simulator journeys | `economical-browser` | One call per journey |
 
-The reviewer receives the specification, diff, and evidence. The reviewer does
+The reviewer receives the plan, diff, and evidence. The reviewer does
 not receive the author reasoning.
 
 ## Secondary adapter configuration
@@ -50,7 +50,7 @@ subagents runs roles in sequence. RIJO records the real host capability.
 Agent work uses tokens for these operations:
 
 - Project and phase research.
-- Phase specifications and plans.
+- Phase plans.
 - Implementation tasks.
 - Independent reviews.
 - Product Quality Assurance journeys.

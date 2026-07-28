@@ -771,7 +771,7 @@ describe('rijo new brownfield map integration', () => {
     expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
     const run = await runWorkflow(root, {}, { ...d, git: new SystemGit() });
     expect(run.ok).toBe(true);
-    expect(d.runner.executed.find((task) => task.id === 'spec-01')?.notes).toContain('CODEBASE MAP CONTEXT');
+    expect(d.runner.executed.some((task) => task.id.startsWith('spec-'))).toBe(false);
     expect(d.runner.executed.find((task) => task.id.startsWith('plan-01-r'))?.notes).toContain(
       'CODEBASE MAP CONTEXT',
     );
@@ -790,8 +790,8 @@ describe('rijo new brownfield map integration', () => {
     const state = JSON.parse(fs.readFileSync(new RijoPaths(root).codebaseMapState, 'utf8'));
     expect(state.last_operation).toBe('incremental');
     expect(state.changed_paths_since_map).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts']));
-    const secondSpec = d.runner.executed.find((task) => task.id === 'spec-02')!;
-    expect(secondSpec.notes).toContain('src/a.ts');
+    const secondPlan = d.runner.executed.find((task) => task.id.startsWith('plan-02-r'))!;
+    expect(secondPlan.notes).toContain('src/a.ts');
     expect(
       d.runner.executed.filter((task) => task.id.startsWith('map-shard-')).some((task) =>
         task.notes.includes('src/a.ts'),

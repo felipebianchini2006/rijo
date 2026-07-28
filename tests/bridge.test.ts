@@ -141,14 +141,6 @@ function fakeHostResult(task: AgentTask, root: string): AgentResult {
     const phaseId = task.id.match(/plan-(\d{2})/)?.[1] ?? '01';
     return okResult(task, { payload: localPlanPayload(phaseId) });
   }
-  // spec writer: write SPEC.md to the declared write scope, report it
-  if (task.id.startsWith('spec-')) {
-    const specBase = task.workspace?.root ?? root;
-    const specPath = path.isAbsolute(task.write_scope[0]!) ? task.write_scope[0]! : path.join(specBase, task.write_scope[0]!);
-    fs.mkdirSync(path.dirname(specPath), { recursive: true });
-    fs.writeFileSync(specPath, `# Spec\n\nObservable acceptance scenarios.\n`, 'utf8');
-    return okResult(task, { files_written: [task.write_scope[0]!] });
-  }
   if (task.id.startsWith('map-shard-')) {
     return okResult(task, { payload: mapFragmentFor(task) });
   }
@@ -302,19 +294,20 @@ describe('host↔core JSON-RPC bridge', () => {
     expect(runResp.id).toBe(2);
     expect('result' in runResp || 'error' in runResp).toBe(true);
 
-    // the run drove real orchestration work over the bridge: spec + first-phase
-    // execution tasks were dispatched to the host and answered.
+    // the run drove real orchestration work over the bridge. PLAN.md is the
+    // only detailed phase contract.
     const runTasks = host.seenTasks.slice(before);
-    expect(runTasks).toContain('spec-01');
+    expect(runTasks.some((id) => id.startsWith('spec-'))).toBe(false);
+    expect(runTasks).toContain('plan-01-r0');
     expect(runTasks.some((id) => id.startsWith('exec-01-'))).toBe(true);
 
-    // the host's spec reply was applied through the orchestrator: SPEC.md on disk
     const paths = new RijoPaths(root);
     const manifest = readManifest(paths)!;
     const m = manifest.milestones[0]!;
     const mdir = paths.milestoneDir(m.id, m.slug);
     const phase01 = readRoadmap(path.join(mdir, 'ROADMAP.md')).phases.find((p) => p.id === '01')!;
-    const specPath = path.join(mdir, 'phases', `01-${phase01.slug}`, 'SPEC.md');
-    expect(fs.existsSync(specPath), specPath).toBe(true);
+    const phaseDir = path.join(mdir, 'phases', `01-${phase01.slug}`);
+    expect(fs.existsSync(path.join(phaseDir, 'PLAN.md'))).toBe(true);
+    expect(fs.existsSync(path.join(phaseDir, 'SPEC.md'))).toBe(false);
   });
 });

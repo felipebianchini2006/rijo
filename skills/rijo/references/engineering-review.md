@@ -1,7 +1,7 @@
 # Engineering review
 
 Use an independent native reviewer.
-Give the reviewer the goal, specification, plan, diff, rules, and verification evidence.
+Give the reviewer the goal, plan, diff, rules, and verification evidence.
 Do not give the reviewer author reasoning.
 
 Check:

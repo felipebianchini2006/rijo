@@ -34,9 +34,11 @@ describe('rijo run', () => {
 
     const mdir = milestoneDir(root);
     const phaseDir = path.join(mdir, 'phases', '01-catalog');
-    for (const f of ['SPEC.md', 'PLAN.md', 'SUMMARY.md', 'REVIEW.md', 'VERIFICATION.md']) {
+    for (const f of ['PLAN.md', 'SUMMARY.md', 'REVIEW.md', 'VERIFICATION.md']) {
       expect(fs.existsSync(path.join(phaseDir, f)), f).toBe(true);
     }
+    expect(fs.existsSync(path.join(phaseDir, 'SPEC.md'))).toBe(false);
+    expect(d.runner.executed.some((task) => task.id.startsWith('spec-'))).toBe(false);
     // evidence: commands with exit codes recorded
     const verification = fs.readFileSync(path.join(phaseDir, 'VERIFICATION.md'), 'utf8');
     expect(verification).toContain('echo test-a');
@@ -82,6 +84,25 @@ describe('rijo run', () => {
     expect(codeReviewer.objective).toContain(
       'Do not reject only because that future smoke evidence is absent.',
     );
+  });
+
+  it('preserves but does not consume a legacy SPEC.md artifact', async () => {
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const legacySpec = path.join(milestoneDir(root), 'phases', '01-catalog', 'SPEC.md');
+    fs.mkdirSync(path.dirname(legacySpec), { recursive: true });
+    fs.writeFileSync(legacySpec, '# Legacy phase specification\n', 'utf8');
+
+    const outcome = await runWorkflow(root, {}, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    expect(fs.readFileSync(legacySpec, 'utf8')).toBe('# Legacy phase specification\n');
+    expect(d.runner.executed.some((task) => task.id.startsWith('spec-'))).toBe(false);
+    expect(
+      d.runner.executed
+        .filter((task) => task.id.startsWith('plan-') || task.id.startsWith('exec-') || task.id.startsWith('code-review-'))
+        .every((task) => !task.canonical_files.includes(legacySpec)),
+    ).toBe(true);
   });
 
   it('run all completes every phase respecting dependencies', async () => {
@@ -262,7 +283,7 @@ describe('rijo run', () => {
     expect(reviews).toBe(2);
   });
 
-  it('rejects a diff that violates the spec (code review findings) and returns to spec on spec_gap', async () => {
+  it('returns a legacy spec_gap finding to phase planning', async () => {
     const d = deps(root);
     // override reviewer: approve plan reviews, flag spec_gap on code review
     d.runner.on(
@@ -272,7 +293,7 @@ describe('rijo run', () => {
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.status).toBe('blocked');
-    expect(outcome.message).toContain('returning to specification');
+    expect(outcome.message).toContain('returning to planning');
     // phase must NOT be marked done
     const roadmap = readRoadmap(path.join(milestoneDir(root), 'ROADMAP.md'));
     expect(roadmap.phases[0]!.status).not.toBe('DONE');
@@ -499,8 +520,9 @@ describe('rijo run', () => {
     expect(second.ok, second.message).toBe(true);
     // T01 was NOT re-executed on resume (it was re-VERIFIED, never re-implemented)
     expect(d.runner.executed.filter((t) => t.id === 'exec-01-T01').length).toBe(execCountAfterFirst);
-    // spec/plan not regenerated
-    expect(d.runner.executed.filter((t) => t.id === 'spec-01').length).toBe(1);
+    // plan was not regenerated and no redundant spec task was dispatched
+    expect(d.runner.executed.filter((t) => t.id === 'plan-01-r0').length).toBe(1);
+    expect(d.runner.executed.some((t) => t.id.startsWith('spec-'))).toBe(false);
     // both tasks reached DONE through the full lifecycle
     const finalPlan = readPlan(planPath);
     expect(finalPlan.tasks.every((t) => t.status === 'DONE' && t.done)).toBe(true);

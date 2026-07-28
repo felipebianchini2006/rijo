@@ -301,7 +301,7 @@ export interface StandardRunnerOpts {
 
 /**
  * A FakeAgentRunner wired with the standard happy-path handlers:
- * planner extraction, spec writer, plan payload, approving reviewer,
+ * planner extraction, plan payload, approving reviewer,
  * succeeding workers, researcher with sources.
  */
 export function standardRunner(root: string, opts: StandardRunnerOpts = {}): FakeAgentRunner {
@@ -342,17 +342,6 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
             rationale: 'The phases deliver observable behavior in dependency order.',
           },
         }),
-    )
-    .on(
-      (t) => t.id.startsWith('spec-'),
-      (t) => {
-        // spec writer runs in an isolated workspace; the relative spec path is its write scope
-        const base = t.workspace?.root ?? root;
-        const specPath = path.isAbsolute(t.write_scope[0]!) ? t.write_scope[0]! : path.join(base, t.write_scope[0]!);
-        fs.mkdirSync(path.dirname(specPath), { recursive: true });
-        fs.writeFileSync(specPath, `# Spec\n\nObservable acceptance scenarios.\n`, 'utf8');
-        return ok(t, { files_written: [t.write_scope[0]!] });
-      },
     )
     .on(
       (t) => t.id.startsWith('plan-') && !t.id.startsWith('plan-review'),
