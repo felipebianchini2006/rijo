@@ -145,6 +145,8 @@ describe('generateAdapters', () => {
     expect(agentsMd).toContain('The Codex project skill is at `.agents/skills/rijo/SKILL.md`.');
     expect(agentsMd).toContain('Do not search outside the active project skill directory');
     expect(agentsMd).toContain('[RIJO M002 F03/05] EXECUTE T02/04');
+    expect(agentsMd).toContain('`fork_turns` to `none`');
+    expect(agentsMd).toContain('Omit `agent_type`');
     expect(agentsMd).toContain('Publish one short transition message');
   });
 

@@ -98,6 +98,8 @@ export function generateCodexAdapter(projectRoot: string, options: CodexAdapterO
     '- Publish one short transition message for each RIJO stage change.',
     '- Use this format: `[RIJO M002 F03/05] EXECUTE T02/04  Integrate the payment gateway.`',
     '- Keep each native subagent bounded and inspectable.',
+    '- Set `fork_turns` to `none` when a Codex delegation selects an explicit `agent_type`.',
+    '- Omit `agent_type` when a Codex delegation inherits the full conversation history.',
     '- Record a recoverable lease when the host cannot stop a failed subagent.',
   ].join('\n');
   upsertMarkerFile(instructionFile, codexNotes);

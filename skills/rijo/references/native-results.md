@@ -24,6 +24,8 @@ Copy the complete request to `.rijo/runtime/native-dispatch/<request_id>.json`.
 Run `node .rijo/bin/rijo.cjs internal task-dispatch @.rijo/runtime/native-dispatch/<request_id>.json`.
 The helper confirms that the durable task record exists before delegation.
 Delegate the exact request to one native subagent.
+In Codex, set `fork_turns` to `none` when you select an explicit `agent_type`.
+In Codex, omit `agent_type` when you inherit the full conversation history.
 Record the real host handle when the host provides one.
 Run `node .rijo/bin/rijo.cjs internal task-start @.rijo/runtime/native-dispatch/<request_id>.json --host <host> --handle <handle>`.
 Run `task-observe` only for useful progress.
