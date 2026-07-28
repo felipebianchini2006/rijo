@@ -36,6 +36,9 @@ export function assertProviderDestinationsSafe(root: string, destinations: strin
 export function rijoInstructionBlock(): string {
   return [
     'RIJO project memory is in `.rijo/`.',
+    'The Codex project skill is at `.agents/skills/rijo/SKILL.md`.',
+    'The Claude Code project skill is at `.claude/skills/rijo/SKILL.md`.',
+    'Do not search outside the active project skill directory for RIJO instructions.',
     '',
     '1. Use `$rijo` for RIJO work in Codex. Use `/rijo` for RIJO work in Claude Code.',
     '2. Read `.rijo/STATE.md` first when it exists.',

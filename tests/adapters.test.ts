@@ -142,6 +142,8 @@ describe('generateAdapters', () => {
     expect(fs.existsSync(path.join(root, '.agents', 'skills', 'rijo-run', 'SKILL.md'))).toBe(true);
     const agentsMd = fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8');
     expect(agentsMd).toContain(BEGIN);
+    expect(agentsMd).toContain('The Codex project skill is at `.agents/skills/rijo/SKILL.md`.');
+    expect(agentsMd).toContain('Do not search outside the active project skill directory');
     expect(agentsMd).toContain('[RIJO M002 F03/05] EXECUTE T02/04');
     expect(agentsMd).toContain('Publish one short transition message');
   });

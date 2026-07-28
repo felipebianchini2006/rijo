@@ -24,6 +24,7 @@ Use `.rijo/bin/rijo.cjs` for every deterministic helper.
 Use English for every host message.
 Never use Portuguese in a RIJO message.
 Do not inspect the RIJO implementation source.
+Do not search the user home directory for RIJO instructions.
 Invoke the documented internal helper without probing its help output.
 Do not expose private reasoning.
 Show only meaningful RIJO stage transitions.
