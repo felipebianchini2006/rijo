@@ -14,13 +14,22 @@ import { detectDrift } from '../src/core/manifest.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readStatus } from '../src/core/progress.js';
 import { readState } from '../src/core/state.js';
+import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 import { runCli } from '../src/cli/main.js';
 import { defaultExecutor } from '../src/workflows/executor.js';
 import { defaultConfig } from '../src/core/config.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { startWorkflow } from '../src/workflows/run.js';
 import { TaskStore } from '../src/supervisor/store.js';
-import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
+import {
+  cleanup,
+  deps,
+  ok,
+  phaseReqIds,
+  planPayloadFor,
+  tmpProject,
+  writePlanFile,
+} from './helpers.js';
 
 describe('native result ingestion', () => {
   const roots: string[] = [];
@@ -1769,6 +1778,177 @@ describe('native result ingestion', () => {
     expect(fs.existsSync(path.join(paths.runtimeDir, 'native-requests.jsonl'))).toBe(true);
     expect(readState(paths)?.phase).toBeNull();
     expect(readStatus(paths)?.phase?.id).toBe('01');
+  });
+
+  it('replays the exact pending plan cycle revision across native helper turns', async () => {
+    const root = tmpProject('rijo-native-plan-review-resume-');
+    roots.push(root);
+    writePlanFile(root, 'PLAN.md');
+    const runtime = deps(root);
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, runtime)).ok).toBe(true);
+    const paths = new RijoPaths(root);
+    const bundle = path.join(paths.runtimeDir, 'native-results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const workflowEpoch = createWorkflowEpoch();
+    const fake = runtime.runner;
+    fake.on(
+      (task) => task.id === 'plan-01-r0',
+      (task) => {
+        const payload = planPayloadFor('01', phaseReqIds(root, '01'));
+        payload.tasks[0]!.tests = ['npm test && echo invalid'];
+        return ok(task, { payload });
+      },
+    );
+
+    const requests = (): Array<Record<string, unknown>> =>
+      fs
+        .readFileSync(path.join(paths.runtimeDir, 'native-requests.jsonl'), 'utf8')
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const appendFakeResult = async (request: Record<string, unknown>): Promise<void> => {
+      const task = AgentTaskSchema.parse({
+        id: request['logical_task_id'],
+        role: request['role'],
+        tier: request['tier'],
+        objective: request['objective'],
+        canonical_files: request['canonical_files'],
+        code_files: request['code_files'],
+        write_scope: request['write_scope'],
+        acceptance_criteria: request['acceptance_criteria'],
+        verification_commands: request['verification_commands'],
+        return_format: request['return_format'],
+        notes: request['notes'],
+        expert_profiles: request['expert_profiles'],
+        attempt: {
+          workflow_epoch: request['workflow_epoch'],
+          logical_task_id: request['logical_task_id'],
+          attempt_id: request['attempt_id'],
+          generation: request['generation'],
+          lease_id: request['lease_id'],
+          idempotency_key: request['idempotency_key'],
+          canonical_baseline_hash: null,
+          workspace_id: null,
+        },
+      });
+      const result = await fake.runTask(task);
+      const stored = JSON.parse(fs.readFileSync(bundle, 'utf8')) as {
+        version: 2;
+        results: Array<Record<string, unknown>>;
+      };
+      stored.results.push({
+        ...request,
+        ok: result.ok,
+        summary: result.summary,
+        payload: result.payload,
+        files: {},
+        files_written: result.files_written,
+        scope_requests: result.scope_requests,
+        decision_proposals: result.decision_proposals ?? [],
+        artifacts: [],
+        preserved_files: [],
+        deleted_paths: [],
+        renames: [],
+      });
+      fs.writeFileSync(bundle, JSON.stringify(stored));
+    };
+    const runUntilPending = async (expectedId: string): Promise<Record<string, unknown>> => {
+      await expect(
+        startWorkflow(root, {
+          ...runtime,
+          workflowEpoch,
+          runner: new NativeResultRunner(bundle, workflowEpoch),
+        }),
+      ).rejects.toThrow('NATIVE_RESULT_REQUIRED');
+      const request = requests().at(-1)!;
+      expect(request['logical_task_id']).toBe(expectedId);
+      return request;
+    };
+
+    await appendFakeResult(await runUntilPending('new-research-phase-01-r0'));
+    await appendFakeResult(await runUntilPending('plan-01-r0'));
+    const correctedPlanner = await runUntilPending('plan-01-r1');
+    const correctedPlannerReplay = await runUntilPending('plan-01-r1');
+    expect(correctedPlannerReplay).toMatchObject({
+      request_id: correctedPlanner['request_id'],
+      attempt_id: correctedPlanner['attempt_id'],
+      generation: correctedPlanner['generation'],
+      lease_id: correctedPlanner['lease_id'],
+    });
+    expect(
+      requests().filter((request) => request['logical_task_id'] === 'plan-01-r1'),
+    ).toHaveLength(1);
+    expect(detectDrift(paths)).toEqual({ drifted: [], missing: [] });
+    const cycle = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          paths.milestonesDir,
+          'M001-simple-store',
+          'phases',
+          '01-catalog',
+          'PLAN-CYCLE.json',
+        ),
+        'utf8',
+      ),
+    ) as { step: string; revision: number; review_notes: string[] };
+    expect(cycle).toMatchObject({ step: 'PLAN', revision: 1 });
+    expect(cycle.review_notes.join('\n')).toContain('INVALID_TEST_COMMAND');
+    const requestLog = path.join(paths.runtimeDir, 'native-requests.jsonl');
+    const exactRequestLog = fs.readFileSync(requestLog, 'utf8');
+    fs.writeFileSync(
+      requestLog,
+      exactRequestLog
+        .split(/\r?\n/)
+        .filter(
+          (line) =>
+            !line.includes(
+              String(correctedPlanner['request_id']),
+            ),
+        )
+        .filter(Boolean)
+        .join('\n') + '\n',
+    );
+    const unrecoverable = await startWorkflow(root, {
+      ...runtime,
+      workflowEpoch,
+      runner: new NativeResultRunner(bundle, workflowEpoch),
+    });
+    expect(unrecoverable.ok).toBe(false);
+    expect(unrecoverable.message).toContain(
+      'active native planning request cannot be recovered',
+    );
+    expect(new TaskStore(paths).read('plan-01-r1')?.state).toBe(
+      'AWAITING_NATIVE_RESULT',
+    );
+    fs.writeFileSync(requestLog, exactRequestLog);
+    await appendFakeResult(correctedPlanner);
+    const reviewer = await runUntilPending('plan-review-01-r1');
+
+    const replay = await runUntilPending('plan-review-01-r1');
+    expect(replay).toMatchObject({
+      request_id: reviewer['request_id'],
+      attempt_id: reviewer['attempt_id'],
+      generation: reviewer['generation'],
+      lease_id: reviewer['lease_id'],
+    });
+    expect(
+      requests().filter(
+        (request) => request['logical_task_id'] === 'plan-review-01-r1',
+      ),
+    ).toHaveLength(1);
+    expect(
+      requests().some(
+        (request) => request['logical_task_id'] === 'plan-review-01-r0',
+      ),
+    ).toBe(false);
+    expect(new TaskStore(paths).read('plan-review-01-r1')?.state).toBe(
+      'AWAITING_NATIVE_RESULT',
+    );
+
+    await appendFakeResult(reviewer);
+    await runUntilPending('exec-01-T01');
+    expect(new TaskStore(paths).read('plan-review-01-r1')?.state).toBe('SUCCEEDED');
   });
 
   it('completes project setup across native helper turns without regenerating validated tasks', async () => {

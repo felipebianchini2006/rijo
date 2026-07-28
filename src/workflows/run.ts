@@ -357,12 +357,130 @@ const PlanApprovalSchema = z.object({
   approved_at: z.string().datetime(),
 });
 
+const PlanCycleStateSchema = z.object({
+  schema_version: z.literal(1),
+  phase: z.string(),
+  revision: z.number().int().min(0),
+  step: z.enum(['PLAN', 'REVIEW', 'APPROVED']),
+  review_notes: z.array(z.string()),
+  updated_at: z.string().datetime(),
+});
+type PlanCycleState = z.infer<typeof PlanCycleStateSchema>;
+
 function planInvalidationPath(ctx: WorkflowContext, milestone: string, phase: string): string {
   return path.join(ctx.paths.runtimeDir, 'plan-invalidations', `${milestone}-${phase}.json`);
 }
 
 function planApprovalPath(ctx: WorkflowContext, milestone: string, phase: string): string {
   return path.join(ctx.paths.runtimeDir, 'plan-approvals', `${milestone}-${phase}.json`);
+}
+
+function planCycleStatePath(phaseDir: string): string {
+  return path.join(phaseDir, 'PLAN-CYCLE.json');
+}
+
+interface PendingPlanCycleAttempt {
+  step: 'PLAN' | 'REVIEW';
+  revision: number;
+  review_notes: string[];
+  logical_task_id: string;
+}
+
+type PendingPlanCycleRecovery =
+  | { status: 'none' }
+  | { status: 'invalid'; logical_task_id: string; reason: string }
+  | { status: 'ok'; attempt: PendingPlanCycleAttempt };
+
+function recoverPlannerReviewNotes(notes: string, revision: number): string[] | null {
+  if (revision === 0) return [];
+  const start = 'Previous review issues to address within the active phase boundary:\n';
+  const end =
+    '\nA reviewer finding does not expand the phase. If it asks for an outcome assigned to a later phase, preserve the roadmap boundary instead of adding that work.';
+  const startIndex = notes.indexOf(start);
+  if (startIndex < 0) return null;
+  const bodyStart = startIndex + start.length;
+  const endIndex = notes.indexOf(end, bodyStart);
+  if (endIndex < 0) return null;
+  return notes
+    .slice(bodyStart, endIndex)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function pendingPlanCycleAttempt(
+  ctx: WorkflowContext,
+  phase: string,
+): PendingPlanCycleRecovery {
+  const escapedPhase = phase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`^(plan|plan-review)-${escapedPhase}-r(\\d+)$`);
+  const records = new TaskStore(ctx.paths)
+    .listNonTerminal()
+    .filter(
+      (record) =>
+        record.workflow_epoch === ctx.workflowEpoch &&
+        ['STARTING', 'RUNNING', 'AWAITING_NATIVE_RESULT', 'REPLACING'].includes(
+          record.state,
+        ),
+    )
+    .flatMap((record) => {
+      const match = pattern.exec(record.logical_task_id);
+      if (!match) return [];
+      const revision = Number(match[2]);
+      if (!Number.isSafeInteger(revision) || revision > ctx.config.limits.plan_revisions) {
+        return [];
+      }
+      return [{ record, step: match[1] === 'plan-review' ? ('REVIEW' as const) : ('PLAN' as const), revision }];
+    })
+    .sort((left, right) => right.revision - left.revision);
+  const pending = records[0];
+  if (!pending) return { status: 'none' };
+  const requestLog = readTextIfExists(path.join(ctx.paths.runtimeDir, 'native-requests.jsonl'));
+  const request = requestLog
+    ?.split(/\r?\n/)
+    .filter(Boolean)
+    .reverse()
+    .flatMap((line) => {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>;
+        return value['workflow_epoch'] === ctx.workflowEpoch &&
+          value['logical_task_id'] === pending.record.logical_task_id
+          ? [value]
+          : [];
+      } catch {
+        return [];
+      }
+    })[0];
+  if (!request) {
+    return {
+      status: 'invalid',
+      logical_task_id: pending.record.logical_task_id,
+      reason: 'The exact native request is missing from native-requests.jsonl.',
+    };
+  }
+  const notes =
+    pending.step === 'PLAN'
+      ? recoverPlannerReviewNotes(
+          typeof request['notes'] === 'string' ? request['notes'] : '',
+          pending.revision,
+        )
+      : [];
+  if (notes === null) {
+    return {
+      status: 'invalid',
+      logical_task_id: pending.record.logical_task_id,
+      reason: 'The planner correction notes cannot be reconstructed from the exact native request.',
+    };
+  }
+  return {
+    status: 'ok',
+    attempt: {
+      step: pending.step,
+      revision: pending.revision,
+      review_notes: notes,
+      logical_task_id: pending.record.logical_task_id,
+    },
+  };
 }
 
 function writePlanInvalidation(
@@ -1225,7 +1343,90 @@ async function executePhase(
     'Boundary rule: REQUIREMENTS.md and ROADMAP.md own phase allocation. Apply milestone-wide RULES.md constraints to behavior changed now, but do not treat an outcome allocated to a later phase as missing from the active plan.',
   ].join('\n');
   const hasPlanningMap = readMapState(paths) !== null;
-  let plan: PhasePlan | null = exists(pp.plan) && !forceReplan ? readPlan(pp.plan) : null;
+  const existingPlan: PhasePlan | null =
+    exists(pp.plan) && !forceReplan ? readPlan(pp.plan) : null;
+  const storedPlanCycle = PlanCycleStateSchema.safeParse(
+    readJsonIfExists<unknown>(planCycleStatePath(phaseDir)),
+  );
+  const pendingPlanCycleRecovery = pendingPlanCycleAttempt(ctx, phase.id);
+  if (pendingPlanCycleRecovery.status === 'invalid') {
+    return blocked(ctx, `Phase ${phase.id}: the active native planning request cannot be recovered.`, [
+      `${pendingPlanCycleRecovery.logical_task_id}: ${pendingPlanCycleRecovery.reason}`,
+      'RIJO preserved the task lease and did not review a stale plan.',
+    ]);
+  }
+  const pendingPlanCycle =
+    pendingPlanCycleRecovery.status === 'ok'
+      ? pendingPlanCycleRecovery.attempt
+      : null;
+  const planCycleFileExists = exists(planCycleStatePath(phaseDir));
+  if (
+    !forceReplan &&
+    storedPlanCycle.success &&
+    storedPlanCycle.data.phase === phase.id &&
+    pendingPlanCycle &&
+    (storedPlanCycle.data.step !== pendingPlanCycle.step ||
+      storedPlanCycle.data.revision !== pendingPlanCycle.revision ||
+      (pendingPlanCycle.step === 'PLAN' &&
+        JSON.stringify(storedPlanCycle.data.review_notes) !==
+          JSON.stringify(pendingPlanCycle.review_notes)))
+  ) {
+    return blocked(ctx, `Phase ${phase.id}: the portable plan cycle conflicts with the active native request.`, [
+      `Portable cycle: ${storedPlanCycle.data.step} revision ${storedPlanCycle.data.revision}.`,
+      `Native request: ${pendingPlanCycle.logical_task_id}.`,
+      'RIJO preserved both records and did not reuse a stale task identity.',
+    ]);
+  }
+  if (!forceReplan && planCycleFileExists && !storedPlanCycle.success) {
+    return blocked(ctx, `Phase ${phase.id}: PLAN-CYCLE.json is invalid.`, [
+      'Restore the portable planning checkpoint before resuming this phase.',
+    ]);
+  }
+  let planCycle: PlanCycleState =
+    storedPlanCycle.success && storedPlanCycle.data.phase === phase.id && !forceReplan
+      ? storedPlanCycle.data
+      : PlanCycleStateSchema.parse({
+          schema_version: 1,
+          phase: phase.id,
+          revision: pendingPlanCycle?.revision ?? 0,
+          step:
+            forceReplan
+              ? 'PLAN'
+              : pendingPlanCycle
+              ? pendingPlanCycle.step
+              : existingPlan
+                ? 'REVIEW'
+                : 'PLAN',
+          review_notes: forceReplan
+            ? [
+                'The previous plan was invalidated by deterministic freshness checks. Create a new plan from the current canonical context.',
+              ]
+            : pendingPlanCycle?.review_notes ?? [],
+          updated_at: now().toISOString(),
+        });
+  let revisions = planCycle.revision;
+  let reviewNotes = [...planCycle.review_notes];
+  let plan: PhasePlan | null = existingPlan;
+  if (planCycle.step === 'PLAN') {
+    // A planning correction can pause after an older draft was written.
+    // Replay the exact pending revision with its durable review notes.
+    plan = null;
+  }
+  const persistPlanCycle = (
+    step: PlanCycleState['step'],
+    notes: string[] = reviewNotes,
+  ): void => {
+    planCycle = PlanCycleStateSchema.parse({
+      schema_version: 1,
+      phase: phase.id,
+      revision: revisions,
+      step,
+      review_notes: notes,
+      updated_at: now().toISOString(),
+    });
+    writeJsonAtomic(planCycleStatePath(phaseDir), planCycle);
+    touchManifest(paths, () => {}, now);
+  };
   let planApproved = false;
   const approvalTarget = planApprovalPath(ctx, milestone.id, phase.id);
   if (plan) {
@@ -1275,13 +1476,12 @@ async function executePhase(
       );
     }
   }
-  let revisions = 0;
-  let reviewNotes: string[] = [];
   let planEnvelope: ValidatedAgentEnvelope | null = null;
   let planReviewEnvelope: ValidatedAgentEnvelope | null = null;
   while (true) {
     if (!plan) {
       stage('PLAN', `Plan tasks (revision ${revisions}).`);
+      persistPlanCycle('PLAN');
       const planTask: AgentTaskDraft = {
         id: `plan-${phase.id}-r${revisions}`,
         role: 'planner',
@@ -1340,6 +1540,7 @@ async function executePhase(
         reviewNotes = [
           `The previous planning attempt returned no usable plan (${res.summary.slice(0, 200)}). Return the plan ONLY as the JSON payload described in the return format — do not write any file.`,
         ];
+        persistPlanCycle('PLAN');
         plan = null;
         continue;
       }
@@ -1360,6 +1561,7 @@ async function executePhase(
         reviewNotes = parsed.error.issues.map(
           (i) => `Invalid plan payload at ${i.path.join('.') || '(root)'}: ${i.message}. Every task needs a non-empty files[] and write_scope[]; ids must be T01..T06; return a payload matching the PhasePlan schema exactly.`,
         );
+        persistPlanCycle('PLAN');
         plan = null;
         continue;
       }
@@ -1386,6 +1588,8 @@ async function executePhase(
       planApproved = false;
       ctx.planHooks.afterPlanWritten?.();
       markPlanReplanned(ctx, milestone.id, phase.id, pp.plan);
+      reviewNotes = [];
+      persistPlanCycle('REVIEW');
       touchManifest(paths, () => {}, now);
     }
 
@@ -1472,6 +1676,7 @@ async function executePhase(
       }
       revisions++;
       reviewNotes = lintIssues.map((i) => `${i.code}: ${i.message} — ${i.fix}`);
+      persistPlanCycle('PLAN');
       plan = null;
       continue;
     }
@@ -1479,6 +1684,7 @@ async function executePhase(
     if (planApproved) break;
 
     stage('PLAN_REVIEW', 'Run an independent plan review.');
+    persistPlanCycle('REVIEW');
     const reviewTask: AgentTaskDraft = {
       id: `plan-review-${phase.id}-r${revisions}`,
       role: 'reviewer',
@@ -1500,7 +1706,12 @@ async function executePhase(
       verification_commands: [],
       return_format:
         'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}. type MUST be exactly one of intent_gap|spec_gap|implementation_bug|test_gap|security_risk|quality_issue|defer|reject; severity MUST be blocker|critical|high|medium|low.',
-      notes: phaseBoundaryContext,
+      // Bind the native reviewer identity to the exact planner-owned contract.
+      // Canonical file paths alone do not change when PLAN.md bytes change.
+      notes: [
+        phaseBoundaryContext,
+        `Plan contract SHA-256: ${planContractHash(plan)}`,
+      ].join('\n\n'),
       workspace: null,
       canonical_baseline: null,
     };
@@ -1522,6 +1733,7 @@ async function executePhase(
       }
       revisions++;
       reviewNotes = [`The previous review returned no usable verdict (${reviewRes.summary.slice(0, 200)}).`];
+      persistPlanCycle('PLAN');
       plan = null;
       continue;
     }
@@ -1550,6 +1762,7 @@ async function executePhase(
     reviewNotes = review.success
       ? blockingFindings.map((f) => `${f.type}/${f.severity}: ${f.description}`)
       : [`Reviewer verdict (unstructured): ${reviewRes.summary}`];
+    persistPlanCycle('PLAN');
     plan = null;
   }
   if (!plan.approved_plan) {
@@ -1564,6 +1777,7 @@ async function executePhase(
     writePlan(pp.plan, plan, `Generated for ${phase.name}.`);
     touchManifest(paths, () => {}, now);
   }
+  persistPlanCycle('APPROVED', []);
   const portableApproval = plan.approved_plan;
   if (!portableApproval) throw new Error(`Phase ${phase.id}: approved plan provenance was not persisted.`);
   writeJsonAtomic(

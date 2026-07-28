@@ -195,6 +195,11 @@ describe('rijo run', () => {
     expect(planReviewer.notes).toContain('Active phase: 01 — Catalog');
     expect(planReviewer.notes).toContain('Later phase allocations:');
     expect(planReviewer.notes).toMatch(/02 — Checkout: M001-REQ-\d+/);
+    expect(planReviewer.notes).toContain(
+      `Plan contract SHA-256: ${planContractHash(
+        readPlan(path.join(phaseDir, 'PLAN.md')),
+      )}`,
+    );
     const codeReviewer = d.runner.executed.find((task) => task.id.startsWith('code-review-01-'))!;
     expect(codeReviewer.objective).toContain(
       'RIJO runs framework-owned UI smoke after this review.',
