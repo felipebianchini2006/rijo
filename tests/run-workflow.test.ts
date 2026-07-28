@@ -23,6 +23,100 @@ function milestoneDir(root: string): string {
   return paths.milestoneDir(m.id, m.slug);
 }
 
+function toolingBindingPlan(root: string, phaseId: string) {
+  const existingReference = (relativePath: string) => ({
+    path: relativePath,
+    intent: 'existing' as const,
+    file_hash: sha256File(path.join(root, relativePath)),
+  });
+  return {
+    phase: phaseId,
+    tasks: [
+      {
+        id: 'T01',
+        name: 'Update the project manifest',
+        requirement_ids: phaseReqIds(root, phaseId),
+        technical_justification: null,
+        files: ['package.json', 'package-lock.json'],
+        mapped_references: [
+          existingReference('package.json'),
+          existingReference('package-lock.json'),
+        ],
+        write_scope: ['package.json', 'package-lock.json'],
+        depends_on: [],
+        parallel: false,
+        tdd: false,
+        tests: ['npm run typecheck'],
+        evidence_expected: 'The project manifest preserves its tooling binding.',
+      },
+      {
+        id: 'T02',
+        name: 'Add the source module',
+        requirement_ids: [],
+        technical_justification: 'The source module implements the bounded behavior.',
+        files: ['src/a.ts'],
+        mapped_references: [newMappedReference('src/a.ts')],
+        write_scope: ['src/a.ts'],
+        depends_on: ['T01'],
+        parallel: false,
+        tdd: false,
+        tests: ['npm run typecheck'],
+        evidence_expected: 'The source module passes the type check.',
+      },
+      {
+        id: 'T03',
+        name: 'Add the integration entry point',
+        requirement_ids: [],
+        technical_justification: 'The entry point connects the source module.',
+        files: ['src/index.ts'],
+        mapped_references: [newMappedReference('src/index.ts')],
+        write_scope: ['src/index.ts'],
+        depends_on: ['T02'],
+        parallel: false,
+        tdd: false,
+        tests: ['npm run typecheck'],
+        evidence_expected: 'The entry point passes the type check.',
+      },
+    ],
+  };
+}
+
+function writeToolingBindingFixture(
+  root: string,
+  exactVersion: string,
+  isolated = false,
+): { manifest: string; lock: string } {
+  const manifest = JSON.stringify({
+    private: true,
+    devDependencies: isolated ? {} : { rijo: exactVersion },
+  }, null, 2) + '\n';
+  const lock = JSON.stringify({
+    lockfileVersion: 3,
+    packages: isolated
+      ? { '': {} }
+      : {
+          '': { devDependencies: { rijo: exactVersion } },
+          'node_modules/rijo': { version: exactVersion },
+        },
+  }, null, 2) + '\n';
+  fs.writeFileSync(path.join(root, 'package.json'), manifest);
+  fs.writeFileSync(path.join(root, 'package-lock.json'), lock);
+  fs.writeFileSync(
+    path.join(root, '.rijo', 'tooling-binding.json'),
+    JSON.stringify({
+      schema_version: 1,
+      rijo_version: exactVersion,
+      isolated,
+      tooling_root: isolated ? '.rijo/tooling' : '.',
+      manifest: isolated ? '.rijo/tooling/package.json' : 'package.json',
+      lockfile: isolated ? '.rijo/tooling/package-lock.json' : 'package-lock.json',
+      launcher: '.rijo/bin/rijo.cjs',
+      managed_paths: [],
+    }, null, 2) + '\n',
+  );
+  return { manifest, lock };
+}
+
 describe('rijo run', () => {
   let root: string;
   beforeEach(async () => {
@@ -77,6 +171,9 @@ describe('rijo run', () => {
     );
     const planner = d.runner.executed.find((task) => task.id === 'plan-01-r0')!;
     expect(planner.objective).toContain('tests[] entry must be an executable verification command');
+    expect(planner.objective).toContain(
+      'If a task edits an existing npm package.json and package-lock.json exists',
+    );
     expect(planner.return_format).toContain('executable command strings only');
     expect(planner.return_format).toContain('parent_module:"project-root"');
     expect(planner.return_format).toContain('package.json as the existing project-root bootstrap contract');
@@ -209,6 +306,261 @@ describe('rijo run', () => {
       allowInstall: true,
       timeoutMs: 10 * 60 * 1000,
     });
+  });
+
+  it.each([
+    { failure: 'scope', expected: 'NPM_LOCK_SCOPE' },
+    { failure: 'missing-reference', expected: 'NPM_LOCK_REFERENCE' },
+    { failure: 'stale-reference', expected: 'NPM_LOCK_REFERENCE' },
+  ])('rejects an npm manifest plan with invalid lockfile $failure', async ({
+    failure,
+    expected,
+  }) => {
+    const d = deps(root, {
+      planPayload: (phaseId) => {
+        const requirementIds = phaseReqIds(root, phaseId);
+        const includesLockScope = failure !== 'scope';
+        const lockReferences =
+          failure === 'scope' || failure === 'missing-reference'
+            ? []
+            : [
+                {
+                  path: 'package-lock.json',
+                  intent: 'existing' as const,
+                  file_hash: '0'.repeat(64),
+                },
+              ];
+        return {
+          phase: phaseId,
+          tasks: [
+            {
+              id: 'T01',
+              name: 'Update the project manifest',
+              requirement_ids: requirementIds,
+              technical_justification: null,
+              files: includesLockScope
+                ? ['package.json', 'package-lock.json']
+                : ['package.json'],
+              mapped_references: [
+                {
+                  path: 'package.json',
+                  intent: 'existing' as const,
+                  file_hash: sha256File(path.join(root, 'package.json')),
+                },
+                ...lockReferences,
+              ],
+              write_scope: includesLockScope
+                ? ['package.json', 'package-lock.json']
+                : ['package.json'],
+              depends_on: [],
+              parallel: false,
+              tdd: false,
+              tests: ['npm run typecheck'],
+              evidence_expected: 'The project manifest defines the build.',
+            },
+            {
+              id: 'T02',
+              name: 'Add the source module',
+              requirement_ids: [],
+              technical_justification: 'The source module implements the bounded behavior.',
+              files: ['src/a.ts'],
+              mapped_references: [newMappedReference('src/a.ts')],
+              write_scope: ['src/a.ts'],
+              depends_on: ['T01'],
+              parallel: false,
+              tdd: false,
+              tests: ['npm run typecheck'],
+              evidence_expected: 'The source module passes the type check.',
+            },
+            {
+              id: 'T03',
+              name: 'Add the integration entry point',
+              requirement_ids: [],
+              technical_justification: 'The entry point connects the source module.',
+              files: ['src/index.ts'],
+              mapped_references: [newMappedReference('src/index.ts')],
+              write_scope: ['src/index.ts'],
+              depends_on: ['T02'],
+              parallel: false,
+              tdd: false,
+              tests: ['npm run typecheck'],
+              evidence_expected: 'The entry point passes the type check.',
+            },
+          ],
+        };
+      },
+    });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    fs.writeFileSync(path.join(root, 'package.json'), '{"private":true}\n');
+    fs.writeFileSync(
+      path.join(root, 'package-lock.json'),
+      '{"lockfileVersion":3,"packages":{"":{"private":true}}}\n',
+    );
+
+    const outcome = await runWorkflow(root, {}, d);
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.details?.join('\n')).toContain(expected);
+    const planner = d.runner.executed.find((task) => task.id === 'plan-01-r0')!;
+    expect(planner.canonical_files).toEqual(
+      expect.arrayContaining([
+        path.join(root, 'package.json'),
+        path.join(root, 'package-lock.json'),
+      ]),
+    );
+  });
+
+  it.each([
+    {
+      caseName: 'manifest requirement',
+      target: 'package.json',
+      content: '{"private":true,"devDependencies":{"typescript":"^5.9.0"}}\n',
+      expected: 'package.json must preserve',
+    },
+    {
+      caseName: 'root lock requirement',
+      target: 'package-lock.json',
+      content:
+        '{"lockfileVersion":3,"packages":{"":{},"node_modules/rijo":{"version":"0.2.0-rc.1"}}}\n',
+      expected: 'root RIJO devDependency',
+    },
+    {
+      caseName: 'installed lock package',
+      target: 'package-lock.json',
+      content:
+        '{"lockfileVersion":3,"packages":{"":{"devDependencies":{"rijo":"0.2.0-rc.1"}},"node_modules/rijo":{"version":"0.1.0"}}}\n',
+      expected: 'installed RIJO package',
+    },
+    {
+      caseName: 'malformed manifest',
+      target: 'package.json',
+      content: '{\n',
+      expected: 'package.json must contain valid JSON',
+    },
+    {
+      caseName: 'malformed lockfile',
+      target: 'package-lock.json',
+      content: '{\n',
+      expected: 'package-lock.json must contain valid JSON',
+    },
+  ])(
+    'rejects a worker that corrupts the project-local RIJO $caseName',
+    async ({ target, content, expected }) => {
+    const exactVersion = '0.2.0-rc.1';
+    const d = deps(root, {
+      planPayload: (phaseId) => toolingBindingPlan(root, phaseId),
+    });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const { manifest: originalManifest, lock: originalLock } =
+      writeToolingBindingFixture(root, exactVersion);
+    d.runner.on(
+      (task) => task.id === 'exec-01-T01',
+      (task) => {
+        fs.writeFileSync(
+          path.join(task.workspace!.root, target),
+          content,
+        );
+        return ok(task, {
+          files_written: [target],
+          payload: { done: true, notes: 'Updated project tooling.' },
+        });
+      },
+    );
+
+    const outcome = await runWorkflow(root, {}, d);
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('changed the project-local RIJO tooling binding');
+    expect(outcome.details?.join('\n')).toContain(expected);
+    expect(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).toBe(
+      originalManifest,
+    );
+    expect(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8')).toBe(
+      originalLock,
+    );
+  });
+
+  it('does not enforce the application manifest for an isolated tooling binding', async () => {
+    const exactVersion = '0.2.0-rc.1';
+    const d = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    writeToolingBindingFixture(root, exactVersion, true);
+
+    const outcome = await runWorkflow(root, {}, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+  });
+
+  it('rejects a repair worker that changes the project-local RIJO lock binding', async () => {
+    const exactVersion = '0.2.0-rc.1';
+    const d = deps(root, {
+      planPayload: (phaseId) => toolingBindingPlan(root, phaseId),
+    });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const { lock: originalLock } = writeToolingBindingFixture(root, exactVersion);
+    d.runner.on(
+      (task) => task.id === 'exec-01-T01',
+      (task) => {
+        fs.writeFileSync(
+          path.join(task.workspace!.root, 'package.json'),
+          JSON.stringify({
+            private: true,
+            scripts: { typecheck: 'node --test' },
+            devDependencies: { rijo: exactVersion },
+          }, null, 2) + '\n',
+        );
+        return ok(task, {
+          files_written: ['package.json'],
+          payload: { done: true, notes: 'Added the project script.' },
+        });
+      },
+    );
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-01-'),
+      (task) =>
+        ok(task, {
+          payload: {
+            approved: true,
+            findings: [
+              {
+                type: 'implementation_bug',
+                severity: 'high',
+                description: 'Repair the package integration.',
+                file: 'package-lock.json',
+              },
+            ],
+          },
+        }),
+    );
+    d.runner.on(
+      (task) => task.id.startsWith('review-fix-01-'),
+      (task) => {
+        fs.writeFileSync(
+          path.join(task.workspace!.root, 'package-lock.json'),
+          '{"lockfileVersion":3,"packages":{"":{}}}\n',
+        );
+        return ok(task, {
+          files_written: ['package-lock.json'],
+          payload: { done: true, notes: 'Changed the lockfile.' },
+        });
+      },
+    );
+
+    const outcome = await runWorkflow(root, {}, d);
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain(
+      'repair worker changed the project-local RIJO tooling binding',
+    );
+    expect(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8')).toBe(
+      originalLock,
+    );
+    const repair = d.runner.executed.find((task) =>
+      task.id.startsWith('review-fix-01-'),
+    )!;
+    expect(repair.objective).toContain(
+      'Preserve the exact project-local RIJO dependency',
+    );
   });
 
   it('rejects an inconsistent plan (lint) and blocks after the revision limit', async () => {

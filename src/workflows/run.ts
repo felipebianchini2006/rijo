@@ -204,6 +204,80 @@ function isTestHarnessPath(relativePath: string): boolean {
   );
 }
 
+function validateProjectToolingBinding(
+  projectRoot: string,
+  workspaceRoot: string,
+): string[] {
+  const binding = readJsonIfExists<{
+    isolated?: boolean;
+    manifest?: string;
+    lockfile?: string;
+    rijo_version?: string;
+  }>(path.join(projectRoot, '.rijo', 'tooling-binding.json'));
+  if (
+    !binding ||
+    binding.isolated ||
+    binding.manifest !== 'package.json' ||
+    binding.lockfile !== 'package-lock.json'
+  ) {
+    return [];
+  }
+
+  let manifest: {
+    devDependencies?: Record<string, string>;
+  } | null;
+  let lock: {
+    packages?: Record<
+      string,
+      {
+        version?: string;
+        devDependencies?: Record<string, string>;
+      }
+    >;
+  } | null;
+  try {
+    manifest = readJsonIfExists<{
+      devDependencies?: Record<string, string>;
+    }>(path.join(workspaceRoot, 'package.json'));
+  } catch {
+    return ['package.json must contain valid JSON and preserve the project-local RIJO dependency.'];
+  }
+  try {
+    lock = readJsonIfExists<{
+      packages?: Record<
+        string,
+        {
+          version?: string;
+          devDependencies?: Record<string, string>;
+        }
+      >;
+    }>(path.join(workspaceRoot, 'package-lock.json'));
+  } catch {
+    return ['package-lock.json must contain valid JSON and preserve the project-local RIJO dependency.'];
+  }
+  const expected = binding.rijo_version;
+  const manifestVersion = manifest?.devDependencies?.['rijo'];
+  const lockRequirement = lock?.packages?.['']?.devDependencies?.['rijo'];
+  const lockVersion = lock?.packages?.['node_modules/rijo']?.version;
+  const issues: string[] = [];
+  if (manifestVersion !== expected) {
+    issues.push(
+      `package.json must preserve the project-local RIJO devDependency at exact version ${expected ?? 'unknown'}, but the worker returned ${manifestVersion ?? 'no RIJO dependency'}.`,
+    );
+  }
+  if (lockRequirement !== expected) {
+    issues.push(
+      `package-lock.json must preserve the root RIJO devDependency at exact version ${expected ?? 'unknown'}, but the worker returned ${lockRequirement ?? 'no RIJO dependency'}.`,
+    );
+  }
+  if (lockVersion !== expected) {
+    issues.push(
+      `package-lock.json must preserve the installed RIJO package at exact version ${expected ?? 'unknown'}, but the worker returned ${lockVersion ?? 'no RIJO package'}.`,
+    );
+  }
+  return issues;
+}
+
 function tddRedRetryPath(
   ctx: WorkflowContext,
   milestoneId: string,
@@ -443,7 +517,7 @@ function repairTaskDraft(
   return {
     id: spec.id,
     role: 'worker',
-    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do not edit the phase plan during a code repair. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
+    objective: `${spec.objective} You MAY use the host's local file-inspection and patch/edit tools inside the isolated workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Preserve the exact project-local RIJO dependency in package.json and package-lock.json. Write only inside the isolated workspace. Do not edit the phase plan during a code repair. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework re-runs verification after you finish. Edit the code in your write scope and return ok:true; report ok:false ONLY if you genuinely could not make the change (never merely because you could not run the tests).`,
     canonical_files: [pp.plan].filter(exists),
     code_files: plan.tasks.flatMap((task) =>
       task.files.map((file) => path.resolve(ctx.projectRoot, file)),
@@ -1211,13 +1285,15 @@ async function executePhase(
       const planTask: AgentTaskDraft = {
         id: `plan-${phase.id}-r${revisions}`,
         role: 'planner',
-        objective: `Produce the execution plan for phase ${phase.id}: between 3 and 6 tasks, exact files or code regions, dependencies, per-worker write scope, executable test commands and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Do not create artificial tasks. Use the simplest design that supports this milestone and the next likely milestone. Reject abstractions without a consumer, duplicate layers, and speculative infrastructure. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Each tests[] entry must be an executable verification command such as "npm test", never a prose scenario or expected result. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
+        objective: `Produce the execution plan for phase ${phase.id}: between 3 and 6 tasks, exact files or code regions, dependencies, per-worker write scope, executable test commands and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Do not create artificial tasks. Use the simplest design that supports this milestone and the next likely milestone. Reject abstractions without a consumer, duplicate layers, and speculative infrastructure. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Each tests[] entry must be an executable verification command such as "npm test", never a prose scenario or expected result. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid. If a task edits an existing npm package.json and package-lock.json exists, assign both files to the same task. Preserve the exact project-local RIJO devDependency and other existing tooling dependencies.`,
         canonical_files: [
           paths.rules,
           milestone.paths.scope,
           pp.research,
           milestone.paths.requirements,
           milestone.paths.roadmap,
+          path.join(ctx.projectRoot, 'package.json'),
+          path.join(ctx.projectRoot, 'package-lock.json'),
         ].filter(exists),
         code_files: [],
         write_scope: [],
@@ -1227,7 +1303,7 @@ async function executePhase(
           'JSON payload matching PhasePlanDraft: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 exact path*/], mapped_references:[{path,intent:"existing",file_hash,symbol?}|{path,intent:"new",parent_module,placement_evidence:[{path,reason}]}] /* required and must cover every task file */, write_scope[/*only exact declared files*/], depends_on[], parallel, tdd, tests[/*executable command strings only, e.g. "npm test"*/], evidence_expected}]}. ' +
           (hasPlanningMap
             ? 'Existing paths must use current hashes; new paths must extend a mapped module and cite real placement evidence.'
-            : 'This is a greenfield phase with no codebase map: every task file is intent:"new", parent_module:"project-root", and placement_evidence must cite package.json as the existing project-root bootstrap contract.') +
+            : 'This is a greenfield phase with no codebase map. Existing bootstrap files such as package.json and package-lock.json must use intent:"existing" with their current SHA-256 hashes. New task files must use intent:"new", parent_module:"project-root", and placement_evidence must cite package.json as the existing project-root bootstrap contract.') +
           ' Never omit mapped_references. Put behavioral scenarios in evidence_expected, not tests[].',
         notes: [
           phaseBoundaryContext,
@@ -1316,6 +1392,43 @@ async function executePhase(
     stage('PLAN_LINT', 'Validate the plan deterministically.');
     const phaseRequirements = reqDoc.requirements.filter((r) => r.phase === phase.id).map((r) => r.id);
     const lintIssues = lintPlan(plan, { knownRequirements: knownReqs, phaseRequirements });
+    const packageManifestTask = plan.tasks.find((task) =>
+      task.write_scope.includes('package.json'),
+    );
+    if (
+      packageManifestTask &&
+      exists(path.join(ctx.projectRoot, 'package-lock.json')) &&
+      (!packageManifestTask.files.includes('package-lock.json') ||
+        !packageManifestTask.write_scope.includes('package-lock.json'))
+    ) {
+      lintIssues.push({
+        code: 'NPM_LOCK_SCOPE',
+        message: `${packageManifestTask.id}: package.json changes can update the existing package-lock.json during the managed dependency gate.`,
+        fix: `Add package-lock.json to ${packageManifestTask.id}.files, mapped_references, and write_scope so the generated lockfile is authorized and committed.`,
+      });
+    }
+    if (
+      packageManifestTask &&
+      exists(path.join(ctx.projectRoot, 'package-lock.json'))
+    ) {
+      const lockReference = packageManifestTask.mapped_references.find(
+        (reference) => reference.path === 'package-lock.json',
+      );
+      const currentLockHash = sha256File(
+        path.join(ctx.projectRoot, 'package-lock.json'),
+      );
+      if (
+        !lockReference ||
+        lockReference.intent !== 'existing' ||
+        lockReference.file_hash !== currentLockHash
+      ) {
+        lintIssues.push({
+          code: 'NPM_LOCK_REFERENCE',
+          message: `${packageManifestTask.id}: the existing package-lock.json mapped reference is missing or stale.`,
+          fix: `Use intent:"existing" and current SHA-256 ${currentLockHash} for package-lock.json.`,
+        });
+      }
+    }
     if (!exists(path.join(ctx.projectRoot, 'package.json'))) {
       const packageOwner = plan.tasks.find((task) => task.write_scope.includes('package.json'));
       if (packageOwner) {
@@ -1681,7 +1794,7 @@ async function executePhase(
       const workerTask: AgentTaskDraft = {
         id: `exec-${phase.id}-${t.id}`,
         role: 'worker',
-        objective: `Implement task ${t.id}: ${t.name}. ${tddInstruction}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Write only inside the isolated workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
+        objective: `Implement task ${t.id}: ${t.name}. ${tddInstruction}Work ONLY inside your isolated workspace; do not modify files outside your write scope; if you need to, stop and request a new allocation. You MAY use the host's local file-inspection and patch/edit tools inside that workspace. If a required dependency or active phase artifact is absent from the isolated workspace, read its project-root copy as read-only context. Preserve the exact project-local RIJO devDependency and existing tooling dependencies when package.json is in scope. Write only inside the isolated workspace. Do NOT execute repository code or run verification commands, tests, npm, git, network tools, or project processes yourself; the framework runs verification after you finish. Once the code is written into your write scope, return ok:true; report ok:false ONLY if you genuinely could not implement the change (never merely because you could not run the tests).`,
         canonical_files: [ctx.paths.rules, pp.plan].filter(exists),
         code_files: t.files.map((f) => path.resolve(ctx.projectRoot, f)),
         write_scope: t.write_scope,
@@ -1889,6 +2002,20 @@ async function executePhase(
         return blocked(ctx, `Phase ${phase.id}: ${err.message}`, []);
       }
       throw err;
+    }
+    const bindingIssues = attempts.flatMap((attempt) =>
+      validateProjectToolingBinding(ctx.projectRoot, attempt.attempt.workspace.root),
+    );
+    if (bindingIssues.length > 0) {
+      discardAll();
+      pending.forEach((task) =>
+        transition(task.id, 'FAILED', 'project tooling binding violation'),
+      );
+      return blocked(
+        ctx,
+        `Phase ${phase.id}: a worker changed the project-local RIJO tooling binding.`,
+        bindingIssues,
+      );
     }
 
     // Apply the validated patches to the controlled checkout. A conflict with a
@@ -2420,6 +2547,18 @@ async function runRepairAttempt(
     const res = await dispatch(ctx, handle.attempt.task, { stage: 'EXECUTE' }, { prepareReplacement: handle.prepareReplacement });
     if (!res.ok) {
       return blocked(ctx, `Phase ${phaseId}: repair worker failed.`, [res.summary]);
+    }
+    handle.attempt.workspace.validate();
+    const bindingIssues = validateProjectToolingBinding(
+      ctx.projectRoot,
+      handle.attempt.workspace.root,
+    );
+    if (bindingIssues.length > 0) {
+      return blocked(
+        ctx,
+        `Phase ${phaseId}: a repair worker changed the project-local RIJO tooling binding.`,
+        bindingIssues,
+      );
     }
     const applied = handle.attempt.workspace.applyVerifiedPatch({
       taskPatch: {
