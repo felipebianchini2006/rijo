@@ -27,14 +27,51 @@ const NativeIdentitySchema = z.object({
   idempotency_key: z.string().min(1),
 });
 
+const NativeRelativePathSchema = z.string().min(1).superRefine((value, context) => {
+  if (
+    value.includes('\0') ||
+    value.includes('\\') ||
+    path.posix.isAbsolute(value) ||
+    path.posix.normalize(value) !== value ||
+    value === '.' ||
+    value.split('/').includes('..')
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Native result paths must be normalized project-relative POSIX paths.',
+    });
+  }
+});
+
 export const NativeArtifactReferenceSchema = z.object({
-  target_path: z.string().min(1),
-  staged_path: z.string().min(1),
+  target_path: NativeRelativePathSchema,
+  staged_path: NativeRelativePathSchema,
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
   size: z.number().int().min(0),
   media_type: z.string().min(1),
 });
 export type NativeArtifactReference = z.infer<typeof NativeArtifactReferenceSchema>;
+
+export const NativePreservedFileSchema = z.object({
+  target_path: NativeRelativePathSchema,
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type NativePreservedFile = z.infer<typeof NativePreservedFileSchema>;
+
+export const NativeDeletedPathSchema = z.object({
+  path: NativeRelativePathSchema,
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type NativeDeletedPath = z.infer<typeof NativeDeletedPathSchema>;
+
+export const NativeRenameSchema = z.object({
+  source_path: NativeRelativePathSchema,
+  target_path: NativeRelativePathSchema,
+  source_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).refine((operation) => operation.source_path !== operation.target_path, {
+  message: 'A native rename source and target must be different.',
+});
+export type NativeRename = z.infer<typeof NativeRenameSchema>;
 
 export const NativeRequestV2Schema = NativeIdentitySchema.extend({
   role: z.string().min(1),
@@ -54,6 +91,9 @@ export const NativeRequestV2Schema = NativeIdentitySchema.extend({
     payload: z.string(),
     files: z.string(),
     artifacts: z.string(),
+    preserved_files: z.string(),
+    deleted_paths: z.string(),
+    renames: z.string(),
     decision_proposals: z.string(),
   }),
 });
@@ -63,11 +103,14 @@ export const NativeResultV2Schema = NativeIdentitySchema.extend({
   ok: z.boolean(),
   summary: z.string().min(1),
   payload: z.unknown().nullable().default(null),
-  files: z.record(z.string(), z.string()).default({}),
-  files_written: z.array(z.string()).default([]),
+  files: z.record(NativeRelativePathSchema, z.string()).default({}),
+  files_written: z.array(NativeRelativePathSchema).default([]),
   scope_requests: z.array(z.string()).default([]),
   decision_proposals: z.array(z.unknown()).default([]),
   artifacts: z.array(NativeArtifactReferenceSchema).default([]),
+  preserved_files: z.array(NativePreservedFileSchema).default([]),
+  deleted_paths: z.array(NativeDeletedPathSchema).default([]),
+  renames: z.array(NativeRenameSchema).default([]),
 });
 export type NativeResultV2 = z.infer<typeof NativeResultV2Schema>;
 
@@ -130,6 +173,9 @@ function requestHashInput(task: AgentTask): Omit<NativeRequestV2, 'request_id' |
       payload: 'A value that matches return_format.',
       files: 'Complete UTF-8 text keyed by project-relative target path.',
       artifacts: 'Binary files referenced by staged path, SHA-256, size, and media type.',
+      preserved_files: 'Files already present in the assigned workspace, with exact target path and SHA-256.',
+      deleted_paths: 'Deleted files with project-relative path and the expected pre-delete SHA-256.',
+      renames: 'Renamed files with source path, target path, and the expected source SHA-256.',
       decision_proposals: 'Material decisions for deterministic validation before patch application.',
     },
   };
@@ -266,77 +312,188 @@ export class NativeResultRunner implements AgentRunner {
 
     this.used.add(index);
     const entry = this.entries[index]!;
-    const reported = [...new Set([
-      ...entry.files_written,
-      ...Object.keys(entry.files),
-      ...entry.artifacts.map((artifact) => artifact.target_path),
-    ])];
-    if (task.workspace) {
-      for (const [relative, content] of Object.entries(entry.files)) {
-        if (!pathInScope(relative, task.write_scope)) {
-          return this.result(task, {
-            ok: false,
-            summary: `Native result file is outside the task write scope: ${relative}.`,
-            payload: null,
-            scope_requests: [],
-            decision_proposals: [],
-          });
-        }
-        const target = path.resolve(task.workspace.root, relative);
-        assertContainedWithoutSymlinks(task.workspace.root, target);
-        writeFileAtomic(target, content);
-      }
-      for (const artifact of entry.artifacts) {
-        if (!pathInScope(artifact.target_path, task.write_scope)) {
-          return this.result(task, {
-            ok: false,
-            summary: `Native result artifact is outside the task write scope: ${artifact.target_path}.`,
-            payload: null,
-            scope_requests: [],
-            decision_proposals: [],
-          });
-        }
-        const staged = path.resolve(this.bundleDirectory, artifact.staged_path);
-        assertContainedWithoutSymlinks(this.bundleDirectory, staged);
-        if (!exists(staged)) {
-          return this.result(task, {
-            ok: false,
-            summary: `Native result artifact is missing: ${artifact.staged_path}.`,
-            payload: null,
-            scope_requests: [],
-            decision_proposals: [],
-          });
-        }
-        const bytes = fs.readFileSync(staged);
-        if (bytes.length !== artifact.size || sha256File(staged) !== artifact.sha256) {
-          return this.result(task, {
-            ok: false,
-            summary: `Native result artifact integrity check failed: ${artifact.staged_path}.`,
-            payload: null,
-            scope_requests: [],
-            decision_proposals: [],
-          });
-        }
-        const target = path.resolve(task.workspace.root, artifact.target_path);
-        assertContainedWithoutSymlinks(task.workspace.root, target);
-        writeBufferAtomic(target, bytes);
-      }
-    } else if (Object.keys(entry.files).length > 0) {
-      return this.result(task, {
+    const reject = (summary: string): AgentResult =>
+      this.result(task, {
         ok: false,
-        summary: `Read-only task ${task.id} supplied file changes.`,
-          payload: null,
-          scope_requests: [],
-          decision_proposals: [],
-        });
-    } else if (entry.artifacts.length > 0) {
-      return this.result(task, {
-        ok: false,
-        summary: `Read-only task ${task.id} supplied binary artifacts.`,
+        summary,
         payload: null,
         scope_requests: [],
         decision_proposals: [],
       });
+    const inlinePaths = Object.keys(entry.files);
+    const artifactPaths = entry.artifacts.map((artifact) => artifact.target_path);
+    const preservedPaths = entry.preserved_files.map((file) => file.target_path);
+    const deletedPaths = entry.deleted_paths.map((operation) => operation.path);
+    const renamedPaths = entry.renames.flatMap((operation) => [
+      operation.source_path,
+      operation.target_path,
+    ]);
+    const reported = [...new Set([
+      ...entry.files_written,
+      ...inlinePaths,
+      ...artifactPaths,
+      ...preservedPaths,
+      ...deletedPaths,
+      ...renamedPaths,
+    ])];
+    if (task.workspace) {
+      for (const relative of reported) {
+        if (!pathInScope(relative, task.write_scope)) {
+          return reject(`Native result path is outside the task write scope: ${relative}.`);
+        }
+      }
+
+      const claimedBy = new Map<string, string>();
+      const claim = (relative: string, operation: string): AgentResult | null => {
+        const prior = claimedBy.get(relative);
+        if (prior) {
+          return reject(`Native result path ${relative} is claimed by both ${prior} and ${operation}.`);
+        }
+        claimedBy.set(relative, operation);
+        return null;
+      };
+      for (const relative of inlinePaths) {
+        const conflict = claim(relative, 'inline files');
+        if (conflict) return conflict;
+      }
+      for (const artifact of entry.artifacts) {
+        const conflict = claim(artifact.target_path, 'artifact references');
+        if (conflict) return conflict;
+      }
+      for (const file of entry.preserved_files) {
+        const conflict = claim(file.target_path, 'preserved files');
+        if (conflict) return conflict;
+      }
+      for (const operation of entry.deleted_paths) {
+        const conflict = claim(operation.path, 'deleted paths');
+        if (conflict) return conflict;
+      }
+      for (const operation of entry.renames) {
+        const sourceConflict = claim(operation.source_path, 'rename sources');
+        if (sourceConflict) return sourceConflict;
+        const targetConflict = claim(operation.target_path, 'rename targets');
+        if (targetConflict) return targetConflict;
+      }
+
+      for (const relative of entry.files_written) {
+        if (!claimedBy.has(relative)) {
+          return reject(
+            `Native result declared ${relative} in files_written without inline bytes, an artifact reference, ` +
+              'a preserved file hash, a deletion, or a rename.',
+          );
+        }
+      }
+
+      const absolute = (relative: string): string => {
+        const target = path.resolve(task.workspace!.root, relative);
+        assertContainedWithoutSymlinks(task.workspace!.root, target);
+        return target;
+      };
+      const verifiedFileHash = (relative: string, purpose: string): string | AgentResult => {
+        const target = absolute(relative);
+        if (!exists(target) || !fs.lstatSync(target).isFile()) {
+          return reject(`Native result ${purpose} source is missing or is not a regular file: ${relative}.`);
+        }
+        return sha256File(target);
+      };
+
+      const artifactBytes = new Map<string, Buffer>();
+      for (const artifact of entry.artifacts) {
+        const staged = path.resolve(this.bundleDirectory, artifact.staged_path);
+        assertContainedWithoutSymlinks(this.bundleDirectory, staged);
+        if (!exists(staged)) {
+          return reject(`Native result artifact is missing: ${artifact.staged_path}.`);
+        }
+        const bytes = fs.readFileSync(staged);
+        if (bytes.length !== artifact.size || sha256File(staged) !== artifact.sha256) {
+          return reject(`Native result artifact integrity check failed: ${artifact.staged_path}.`);
+        }
+        absolute(artifact.target_path);
+        artifactBytes.set(artifact.target_path, bytes);
+      }
+      for (const file of entry.preserved_files) {
+        const actual = verifiedFileHash(file.target_path, 'preserved file');
+        if (typeof actual !== 'string') return actual;
+        if (actual !== file.sha256) {
+          return reject(`Native result preserved file hash mismatch: ${file.target_path}.`);
+        }
+      }
+      for (const operation of entry.deleted_paths) {
+        const actual = verifiedFileHash(operation.path, 'deletion');
+        if (typeof actual !== 'string') return actual;
+        if (actual !== operation.sha256) {
+          return reject(`Native result deletion hash mismatch: ${operation.path}.`);
+        }
+      }
+      for (const operation of entry.renames) {
+        const actual = verifiedFileHash(operation.source_path, 'rename');
+        if (typeof actual !== 'string') return actual;
+        if (actual !== operation.source_sha256) {
+          return reject(`Native result rename hash mismatch: ${operation.source_path}.`);
+        }
+        const target = absolute(operation.target_path);
+        if (exists(target)) {
+          return reject(`Native result rename target already exists: ${operation.target_path}.`);
+        }
+      }
+
+      const before = new Map<string, string | null>();
+      for (const relative of reported) {
+        const target = absolute(relative);
+        before.set(relative, exists(target) && fs.lstatSync(target).isFile() ? sha256File(target) : null);
+      }
+      const predictedChanged = new Set<string>();
+      for (const [relative, content] of Object.entries(entry.files)) {
+        if (before.get(relative) !== sha256(content)) predictedChanged.add(relative);
+      }
+      for (const artifact of entry.artifacts) {
+        if (before.get(artifact.target_path) !== artifact.sha256) predictedChanged.add(artifact.target_path);
+      }
+      for (const operation of entry.deleted_paths) predictedChanged.add(operation.path);
+      for (const operation of entry.renames) {
+        predictedChanged.add(operation.source_path);
+        predictedChanged.add(operation.target_path);
+      }
+      const preserved = new Set(preservedPaths);
+      const unchangedDeclared = entry.files_written.filter(
+        (relative) => !predictedChanged.has(relative) && !preserved.has(relative),
+      );
+      if (unchangedDeclared.length > 0) {
+        return reject(
+          `Native result declared writes without a materialized delta: ${unchangedDeclared.join(', ')}.`,
+        );
+      }
+      if (entry.ok && reported.length > 0 && predictedChanged.size === 0 && preserved.size === 0) {
+        return reject(`Native writer result for task ${task.id} did not materialize any file delta.`);
+      }
+
+      for (const [relative, content] of Object.entries(entry.files)) {
+        writeFileAtomic(absolute(relative), content);
+      }
+      for (const artifact of entry.artifacts) {
+        writeBufferAtomic(absolute(artifact.target_path), artifactBytes.get(artifact.target_path)!);
+      }
+      for (const operation of entry.renames) {
+        const source = absolute(operation.source_path);
+        const target = absolute(operation.target_path);
+        ensureDir(path.dirname(target));
+        fs.renameSync(source, target);
+      }
+      for (const operation of entry.deleted_paths) {
+        fs.rmSync(absolute(operation.path));
+      }
+
+      const changed = new Set<string>();
+      for (const relative of reported) {
+        const target = absolute(relative);
+        const after = exists(target) && fs.lstatSync(target).isFile() ? sha256File(target) : null;
+        if (before.get(relative) !== after) changed.add(relative);
+      }
+      if ([...predictedChanged].some((relative) => !changed.has(relative))) {
+        return reject(`Native writer result for task ${task.id} did not produce its declared file delta.`);
+      }
+    } else if (reported.length > 0) {
+      return reject(`Read-only task ${task.id} supplied file changes.`);
     }
 
     return this.result(task, entry, reported);

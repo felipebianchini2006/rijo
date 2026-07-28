@@ -34,14 +34,20 @@ export type { AgentRunner, RunnerCapabilities } from './agents/runner.js';
 export { FakeAgentRunner, UnboundAgentRunner } from './agents/runner.js';
 export {
   NativeArtifactReferenceSchema,
+  NativeDeletedPathSchema,
   NativeProtocolUpgradeError,
+  NativePreservedFileSchema,
   NativeRequestV2Schema,
+  NativeRenameSchema,
   NativeResultBundleV2Schema,
   NativeResultRunner,
   NativeResultV2Schema,
   createNativeRequestV2,
   type NativeArtifactReference,
+  type NativeDeletedPath,
+  type NativePreservedFile,
   type NativeRequestV2,
+  type NativeRename,
   type NativeResultBundleV2,
   type NativeResultV2,
 } from './agents/native-results.js';

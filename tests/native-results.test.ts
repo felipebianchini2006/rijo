@@ -7,6 +7,7 @@ import {
   createNativeRequestV2,
 } from '../src/agents/native-results.js';
 import { AgentTaskSchema } from '../src/agents/protocol.js';
+import { sha256 } from '../src/core/fsx.js';
 import { detectDrift } from '../src/core/manifest.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readStatus } from '../src/core/progress.js';
@@ -149,6 +150,12 @@ describe('native result ingestion', () => {
     expect(replayed.attempt_id).toBe(request.attempt_id);
     expect(replayed.generation).toBe(request.generation);
     expect(replayed.lease_id).toBe(request.lease_id);
+    const replayRecord = new TaskStore(paths).read(task.id)!;
+    expect(replayRecord.replacement_count).toBe(0);
+    expect(replayRecord.revoked_leases).toEqual([]);
+    expect(
+      new TaskStore(paths).readEvents(task.id).filter((event) => event.type === 'task_created'),
+    ).toHaveLength(1);
   });
 
   it('reuses a writer identity after its old workspace is discarded and writes into the fresh workspace', async () => {
@@ -191,9 +198,8 @@ describe('native result ingestion', () => {
     expect(request.canonical_files).toEqual([path.join(workspaceA, '.rijo', 'RULES.md')]);
     expect(request.code_files).toEqual([path.join(workspaceA, 'src', 'feature.ts')]);
 
-    // The helper boundary removes the old attempt workspace. The next workflow
-    // turn creates a clean workspace with a different random absolute root.
-    fs.rmSync(workspaceA, { recursive: true, force: true });
+    // Startup keeps the active request workspace available to the helper. Once
+    // an exact result exists, replay supersedes it with a clean workspace.
     fs.mkdirSync(workspaceB, { recursive: true });
     fs.writeFileSync(
       bundle,
@@ -379,6 +385,13 @@ describe('native result ingestion', () => {
       ),
     ).toContain('expected RED');
     expect(fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/)).toHaveLength(2);
+    const resumedRecord = new TaskStore(paths).read(firstTask.id)!;
+    expect(resumedRecord.generation).toBe(2);
+    expect(resumedRecord.replacement_count).toBe(1);
+    expect(resumedRecord.revoked_leases).toContain(firstRequest.lease_id);
+    expect(
+      new TaskStore(paths).readEvents(firstTask.id).filter((event) => event.type === 'task_created'),
+    ).toHaveLength(1);
 
     const exhausted = await defaultExecutor(
       new NativeResultRunner(bundle),
@@ -443,6 +456,11 @@ describe('native result ingestion', () => {
     const record = new (await import('../src/supervisor/store.js')).TaskStore(paths).read(task.id);
     expect(record?.revoked_leases).toContain(firstRequest.lease_id);
     expect(record?.lease_id).toBe(requests[1].lease_id);
+    expect(record?.generation).toBe(firstRequest.generation + 1);
+    expect(record?.replacement_count).toBe(0);
+    expect(
+      new TaskStore(paths).readEvents(task.id).filter((event) => event.type === 'task_created'),
+    ).toHaveLength(1);
   });
 
   it('rejects a v1 bundle in the native workflow', () => {
@@ -555,6 +573,329 @@ describe('native result ingestion', () => {
     expect(fs.readFileSync(path.join(workspace, 'src', 'feature.ts'), 'utf8')).toContain(
       'feature = true',
     );
+  });
+
+  it('rejects a declared write when the result does not provide portable bytes', async () => {
+    const root = tmpProject('rijo-native-missing-bytes-');
+    roots.push(root);
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(workspace);
+    const bundle = path.join(root, 'results.json');
+    const task = AgentTaskSchema.parse({
+      id: 'exec-missing-bytes',
+      role: 'worker',
+      objective: 'Create one portable file.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: ['src/feature.ts'],
+      acceptance_criteria: ['The file exists.'],
+      verification_commands: [],
+      return_format: 'JSON result.',
+      workspace: { id: 'native-workspace', root: workspace },
+      attempt: { ...attempt, logical_task_id: 'exec-missing-bytes' },
+    });
+    const request = createNativeRequestV2(task);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Created the file.',
+        payload: { done: true },
+        files_written: ['src/feature.ts'],
+      }],
+    }));
+
+    const result = await new NativeResultRunner(bundle).runTask(task);
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('without inline bytes');
+    expect(fs.existsSync(path.join(workspace, 'src', 'feature.ts'))).toBe(false);
+  });
+
+  it('rejects a declared inline write when it produces an empty delta', async () => {
+    const root = tmpProject('rijo-native-empty-delta-');
+    roots.push(root);
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'src', 'feature.ts'), 'export const feature = true;\n');
+    const bundle = path.join(root, 'results.json');
+    const task = AgentTaskSchema.parse({
+      id: 'exec-empty-delta',
+      role: 'worker',
+      objective: 'Change the feature.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: ['src/feature.ts'],
+      acceptance_criteria: ['The feature changes.'],
+      verification_commands: [],
+      return_format: 'JSON result.',
+      workspace: { id: 'native-workspace', root: workspace },
+      attempt: { ...attempt, logical_task_id: 'exec-empty-delta' },
+    });
+    const request = createNativeRequestV2(task);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Changed the feature.',
+        payload: { done: true },
+        files: { 'src/feature.ts': 'export const feature = true;\n' },
+        files_written: ['src/feature.ts'],
+      }],
+    }));
+
+    const result = await new NativeResultRunner(bundle).runTask(task);
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('without a materialized delta');
+  });
+
+  it('accepts an exact preserved workspace file with a verified hash', async () => {
+    const root = tmpProject('rijo-native-preserved-file-');
+    roots.push(root);
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    const content = 'export const feature = true;\n';
+    fs.writeFileSync(path.join(workspace, 'src', 'feature.ts'), content);
+    const bundle = path.join(root, 'results.json');
+    const task = AgentTaskSchema.parse({
+      id: 'exec-preserved-file',
+      role: 'worker',
+      objective: 'Return the verified workspace file.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: ['src/feature.ts'],
+      acceptance_criteria: ['The exact file is present.'],
+      verification_commands: [],
+      return_format: 'JSON result.',
+      workspace: { id: 'native-workspace', root: workspace },
+      attempt: { ...attempt, logical_task_id: 'exec-preserved-file' },
+    });
+    const request = createNativeRequestV2(task);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Verified the preserved file.',
+        payload: { done: true },
+        files_written: ['src/feature.ts'],
+        preserved_files: [{ target_path: 'src/feature.ts', sha256: sha256(content) }],
+      }],
+    }));
+
+    const result = await new NativeResultRunner(bundle).runTask(task);
+
+    expect(result.ok).toBe(true);
+    expect(result.files_written).toEqual(['src/feature.ts']);
+  });
+
+  it('replays a hash-protected deletion across a native helper boundary', async () => {
+    const root = tmpProject('rijo-native-delete-');
+    roots.push(root);
+    const bundle = path.join(root, 'results.json');
+    const content = 'obsolete\n';
+    const makeTask = (workspaceName: string) => {
+      const workspace = path.join(root, workspaceName);
+      fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(workspace, 'src', 'obsolete.ts'), content);
+      return AgentTaskSchema.parse({
+        id: 'exec-delete',
+        role: 'worker',
+        objective: 'Delete the obsolete file.',
+        canonical_files: [],
+        code_files: [],
+        write_scope: ['src/obsolete.ts'],
+        acceptance_criteria: ['The obsolete file is absent.'],
+        verification_commands: [],
+        return_format: 'JSON result.',
+        workspace: { id: workspaceName, root: workspace },
+        attempt: { ...attempt, logical_task_id: 'exec-delete' },
+      });
+    };
+    const firstTask = makeTask('workspace-a');
+    const request = createNativeRequestV2(firstTask);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Deleted the obsolete file.',
+        payload: { done: true },
+        files_written: ['src/obsolete.ts'],
+        deleted_paths: [{ path: 'src/obsolete.ts', sha256: sha256(content) }],
+      }],
+    }));
+
+    const first = await new NativeResultRunner(bundle).runTask(firstTask);
+    const resumedTask = makeTask('workspace-b');
+    const resumed = await new NativeResultRunner(bundle).runTask(resumedTask);
+
+    expect(first.ok).toBe(true);
+    expect(resumed.ok).toBe(true);
+    expect(fs.existsSync(path.join(firstTask.workspace!.root, 'src', 'obsolete.ts'))).toBe(false);
+    expect(fs.existsSync(path.join(resumedTask.workspace!.root, 'src', 'obsolete.ts'))).toBe(false);
+  });
+
+  it('replays a hash-protected rename across a native helper boundary', async () => {
+    const root = tmpProject('rijo-native-rename-');
+    roots.push(root);
+    const bundle = path.join(root, 'results.json');
+    const content = 'export const value = 1;\n';
+    const makeTask = (workspaceName: string) => {
+      const workspace = path.join(root, workspaceName);
+      fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(workspace, 'src', 'old.ts'), content);
+      return AgentTaskSchema.parse({
+        id: 'exec-rename',
+        role: 'worker',
+        objective: 'Rename the source file.',
+        canonical_files: [],
+        code_files: [],
+        write_scope: ['src/old.ts', 'src/new.ts'],
+        acceptance_criteria: ['The new path contains the exact source.'],
+        verification_commands: [],
+        return_format: 'JSON result.',
+        workspace: { id: workspaceName, root: workspace },
+        attempt: { ...attempt, logical_task_id: 'exec-rename' },
+      });
+    };
+    const firstTask = makeTask('workspace-a');
+    const request = createNativeRequestV2(firstTask);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Renamed the source file.',
+        payload: { done: true },
+        files_written: ['src/old.ts', 'src/new.ts'],
+        renames: [{
+          source_path: 'src/old.ts',
+          target_path: 'src/new.ts',
+          source_sha256: sha256(content),
+        }],
+      }],
+    }));
+
+    const first = await new NativeResultRunner(bundle).runTask(firstTask);
+    const resumedTask = makeTask('workspace-b');
+    const resumed = await new NativeResultRunner(bundle).runTask(resumedTask);
+
+    expect(first.ok).toBe(true);
+    expect(resumed.ok).toBe(true);
+    expect(fs.existsSync(path.join(resumedTask.workspace!.root, 'src', 'old.ts'))).toBe(false);
+    expect(fs.readFileSync(path.join(resumedTask.workspace!.root, 'src', 'new.ts'), 'utf8')).toBe(content);
+  });
+
+  it('rejects path escape and write-scope violations for portable operations', async () => {
+    const root = tmpProject('rijo-native-operation-scope-');
+    roots.push(root);
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    const content = 'obsolete\n';
+    fs.writeFileSync(path.join(workspace, 'src', 'obsolete.ts'), content);
+    const task = AgentTaskSchema.parse({
+      id: 'exec-operation-scope',
+      role: 'worker',
+      objective: 'Delete one assigned file.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: ['src/allowed.ts'],
+      acceptance_criteria: ['Only the assigned path changes.'],
+      verification_commands: [],
+      return_format: 'JSON result.',
+      workspace: { id: 'native-workspace', root: workspace },
+      attempt: { ...attempt, logical_task_id: 'exec-operation-scope' },
+    });
+    const request = createNativeRequestV2(task);
+    const escaped = path.join(root, 'escaped.json');
+    fs.writeFileSync(escaped, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Deleted a file.',
+        files_written: ['../outside.ts'],
+        deleted_paths: [{ path: '../outside.ts', sha256: sha256(content) }],
+      }],
+    }));
+    expect(() => new NativeResultRunner(escaped)).toThrow(
+      'Native result paths must be normalized project-relative POSIX paths',
+    );
+
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Deleted a file.',
+        files_written: ['src/obsolete.ts'],
+        deleted_paths: [{ path: 'src/obsolete.ts', sha256: sha256(content) }],
+      }],
+    }));
+    const result = await new NativeResultRunner(bundle).runTask(task);
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('outside the task write scope');
+    expect(fs.existsSync(path.join(workspace, 'src', 'obsolete.ts'))).toBe(true);
+  });
+
+  it('does not apply a stale deletion result to the current attempt workspace', async () => {
+    const root = tmpProject('rijo-native-stale-delete-');
+    roots.push(root);
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    const content = 'keep\n';
+    fs.writeFileSync(path.join(workspace, 'src', 'keep.ts'), content);
+    const bundle = path.join(root, 'results.json');
+    const currentTask = AgentTaskSchema.parse({
+      id: 'exec-stale-delete',
+      role: 'worker',
+      objective: 'Delete the assigned file.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: ['src/keep.ts'],
+      acceptance_criteria: ['The file is absent.'],
+      verification_commands: [],
+      return_format: 'JSON result.',
+      workspace: { id: 'native-workspace', root: workspace },
+      attempt: {
+        ...attempt,
+        logical_task_id: 'exec-stale-delete',
+        generation: 2,
+        attempt_id: 'attempt-02',
+        lease_id: 'lease-02',
+      },
+    });
+    const staleRequest = createNativeRequestV2({
+      ...currentTask,
+      attempt: {
+        ...currentTask.attempt!,
+        generation: 1,
+        attempt_id: 'attempt-01',
+        lease_id: 'lease-01',
+      },
+    });
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...staleRequest,
+        ok: true,
+        summary: 'Deleted the file.',
+        files_written: ['src/keep.ts'],
+        deleted_paths: [{ path: 'src/keep.ts', sha256: sha256(content) }],
+      }],
+    }));
+
+    const result = await new NativeResultRunner(bundle).runTask(currentTask);
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('no exact native identity');
+    expect(fs.readFileSync(path.join(workspace, 'src', 'keep.ts'), 'utf8')).toBe(content);
   });
 
   it('rejects a stale generation and never stamps it as current', async () => {
