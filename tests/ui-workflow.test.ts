@@ -4,10 +4,7 @@ import AdmZip from 'adm-zip';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
 import { uiWorkflow } from '../src/workflows/ui.js';
-import { RijoPaths } from '../src/core/paths.js';
-import { tmpProject, cleanup, writePlanFile, deps, ok, wireUi, UI_MAPPING_PAYLOAD } from './helpers.js';
-
-const IMPORT_ID = '202607231200'; // fixed by helpers' now()
+import { tmpProject, cleanup, writePlanFile, deps, ok, wireUi, UI_MAPPING_PAYLOAD, uiOperation } from './helpers.js';
 
 describe('rijo ui (hardened import pipeline)', () => {
   let root: string;
@@ -62,13 +59,14 @@ describe('rijo ui (hardened import pipeline)', () => {
     fs.symlinkSync(outside, path.join(root, 'design-link'), 'dir');
     const d = deps(root);
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const ui = uiOperation(root, d);
 
-    const outcome = await uiWorkflow(root, { input: '@design-link' }, d);
+    const outcome = await uiWorkflow(root, { input: '@design-link' }, ui.deps);
 
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toMatch(/symbolic link/i);
     expect(
-      fs.existsSync(path.join(new RijoPaths(root).importsDir, IMPORT_ID, 'staging', 'secret.txt')),
+      fs.existsSync(path.join(ui.importDir, 'staging', 'secret.txt')),
     ).toBe(false);
     cleanup(outside);
   });
@@ -78,10 +76,11 @@ describe('rijo ui (hardened import pipeline)', () => {
     wireUi(d, root);
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const zipPath = makeDesignZip();
-    const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, d);
+    const ui = uiOperation(root, d);
+    const outcome = await uiWorkflow(root, { input: `@${path.basename(zipPath)}` }, ui.deps);
     expect(outcome.ok, outcome.message + ' :: ' + (outcome.details ?? []).join(' | ')).toBe(true);
 
-    const importDir = path.join(new RijoPaths(root).importsDir, IMPORT_ID);
+    const importDir = ui.importDir;
 
     const inventory = fs.readFileSync(path.join(importDir, 'INVENTORY.md'), 'utf8');
     expect(inventory).toContain('index.html');
@@ -113,14 +112,15 @@ describe('rijo ui (hardened import pipeline)', () => {
       '<html><body><h1>Home</h1></body></html>',
     );
 
+    const ui = uiOperation(root, d);
     const outcome = await uiWorkflow(
       root,
       { inputs: ['@index.html', `@${path.basename(zipPath)}`] },
-      d,
+      ui.deps,
     );
 
     expect(outcome.ok, outcome.message).toBe(true);
-    const importDir = path.join(new RijoPaths(root).importsDir, IMPORT_ID);
+    const importDir = ui.importDir;
     expect(
       fs.readdirSync(path.join(importDir, 'staging')).filter((name) => name === 'index.html'),
     ).toHaveLength(1);
@@ -336,12 +336,13 @@ describe('rijo ui (hardened import pipeline)', () => {
     zip.addFile('tools/helper.exe', Buffer.from('MZ...'));
     const p = path.join(root, 'design-exe.zip');
     zip.writeZip(p);
-    const outcome = await uiWorkflow(root, { input: '@design-exe.zip' }, d);
+    const ui = uiOperation(root, d);
+    const outcome = await uiWorkflow(root, { input: '@design-exe.zip' }, ui.deps);
     expect(outcome.ok, outcome.message + ' :: ' + (outcome.details ?? []).join(' | ')).toBe(true);
-    const staging = path.join(new RijoPaths(root).importsDir, IMPORT_ID, 'staging');
+    const staging = path.join(ui.importDir, 'staging');
     expect(fs.existsSync(path.join(staging, 'index.html'))).toBe(true);
     expect(fs.existsSync(path.join(staging, 'tools', 'helper.exe'))).toBe(false);
-    const inventory = fs.readFileSync(path.join(new RijoPaths(root).importsDir, IMPORT_ID, 'INVENTORY.md'), 'utf8');
+    const inventory = fs.readFileSync(path.join(ui.importDir, 'INVENTORY.md'), 'utf8');
     expect(inventory).toContain('Executable not extracted');
   });
 

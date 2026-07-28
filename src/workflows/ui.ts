@@ -19,6 +19,7 @@ import { activeMilestone } from '../core/milestones.js';
 import { readRoadmap, renderRoadmap } from '../core/roadmap.js';
 import { touchManifest } from '../core/manifest.js';
 import { readState, writeState, initialState } from '../core/state.js';
+import type { WorkflowEpoch } from '../core/workflow-epoch.js';
 import type { AgentTaskDraft } from '../agents/protocol.js';
 import {
   createContext,
@@ -40,6 +41,11 @@ export interface UiOptions {
   /** @design.zip, @index.html or @design-directory/ */
   input?: string;
   inputs?: string[];
+}
+
+/** Stable import identity derived from the owning workflow operation epoch. */
+export function uiImportId(workflowEpoch: WorkflowEpoch): string {
+  return workflowEpoch.slice('wep_'.length, 'wep_'.length + 12);
 }
 
 const MappingSchema = z.object({
@@ -119,7 +125,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
   const inputNames = inputPaths.map((inputPath) => path.basename(inputPath));
 
   {
-    const importId = ctx.workflowEpoch.slice('wep_'.length, 'wep_'.length + 12);
+    const importId = uiImportId(ctx.workflowEpoch);
     const importDir = path.join(paths.importsDir, importId);
     const stagingDir = path.join(importDir, 'staging');
     ensureDir(importDir);

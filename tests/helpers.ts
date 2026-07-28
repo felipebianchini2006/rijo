@@ -9,6 +9,8 @@ import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRequirements } from '../src/core/roadmap.js';
 import { exists } from '../src/core/fsx.js';
+import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
+import { uiImportId } from '../src/workflows/ui.js';
 import type { WorkflowDeps } from '../src/workflows/shared.js';
 import type { AgentTask, AgentResult } from '../src/agents/protocol.js';
 
@@ -476,4 +478,17 @@ export function deps(root: string, opts: StandardRunnerOpts = {}): WorkflowDeps 
   const shell = new FakeShellRunner();
   const runner = standardRunner(root, opts);
   return { runner, shell, git, sink: silentSink, now: () => new Date('2026-07-23T12:00:00.000Z') };
+}
+
+/**
+ * Give one UI invocation its own operation epoch and expose the matching
+ * import directory without coupling tests to the injectable wall clock.
+ */
+export function uiOperation<T extends WorkflowDeps>(root: string, baseDeps: T) {
+  const workflowEpoch = createWorkflowEpoch();
+  return {
+    deps: { ...baseDeps, workflowEpoch },
+    importDir: path.join(new RijoPaths(root).importsDir, uiImportId(workflowEpoch)),
+    workflowEpoch,
+  };
 }
