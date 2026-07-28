@@ -113,6 +113,6 @@ describe('milestone cycle', () => {
     const d2 = deps(root, { extraction: M2_EXTRACTION });
     const outcome = await newWorkflow(root, { planFile: '@PLAN-2.md', next: true }, d2);
     expect(outcome.status).toBe('blocked');
-    expect(outcome.details?.join(' ')).toContain('rijo run');
+    expect(outcome.details?.join(' ')).toContain('$rijo resume');
   });
 });

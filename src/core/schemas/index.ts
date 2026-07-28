@@ -46,10 +46,10 @@ export type CodexTier = z.infer<typeof CodexTierSchema>;
 const DEFAULT_CLAUDE_TIERS: Record<string, ClaudeTier> = {
   strongest: { model: 'opus', effort: 'high' },
   'strongest-independent': { model: 'opus', effort: 'high' },
-  'balanced-reasoning': { model: 'sonnet', effort: 'high' },
-  'economical-coding': { model: 'sonnet', effort: 'medium' },
-  'economical-research': { model: 'haiku', effort: 'medium' },
-  'economical-browser': { model: 'sonnet', effort: 'medium' },
+  'balanced-reasoning': { model: 'fable', effort: 'high' },
+  'economical-coding': { model: 'fable', effort: 'medium' },
+  'economical-research': { model: 'fable', effort: 'medium' },
+  'economical-browser': { model: 'fable', effort: 'medium' },
 };
 // Codex model IDs verified against https://developers.openai.com/codex/models
 // (redirects to https://learn.chatgpt.com/docs/models), checked 2026-07-24:

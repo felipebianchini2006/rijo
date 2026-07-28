@@ -65,7 +65,7 @@ describe('generateAdapters', () => {
 
     // The `model` field MUST be a concrete Claude model Claude Code accepts —
     // never the abstract RIJO tier string. rijo-worker maps to role `worker`,
-    // tier `economical-coding`, which resolves to the `sonnet` alias.
+    // tier `economical-coding`, which resolves to the `fable` alias.
     const workerAgent = fs.readFileSync(workerAgentPath, 'utf8');
     const modelLine = workerAgent.match(/^model:\s*(.+)$/m)?.[1]?.trim();
     expect(modelLine, workerAgent).toBeDefined();

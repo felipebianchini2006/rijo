@@ -129,9 +129,9 @@ describe('ClaudeCliRunner argv assembly', () => {
     const { command, args, cwd } = calls[0]!;
     expect(command).toBe('claude');
     expect(cwd).toBe('/tmp/rijo-ws-1');
-    // worker -> economical-coding -> sonnet / medium (default config)
+    // worker -> economical-coding -> fable / medium (default config)
     expect(args).toContain('--model');
-    expect(args[args.indexOf('--model') + 1]).toBe('sonnet');
+    expect(args[args.indexOf('--model') + 1]).toBe('fable');
     expect(args[args.indexOf('--effort') + 1]).toBe('medium');
     expect(args).toContain('-p');
     expect(args).toContain('--output-format');
@@ -349,7 +349,7 @@ describe('buildClaudeLaunch (pure builder, P0.2/P0.4)', () => {
     const launch = buildClaudeLaunch(task(), CONFIG, { projectRoot: '/proj' });
     expect(launch.command).toBe('claude');
     expect(launch.cwd).toBe('/tmp/rijo-ws-1'); // workspace root, never /proj
-    expect(argAfter(launch.args, '--model')).toBe('sonnet');
+    expect(argAfter(launch.args, '--model')).toBe('fable');
     expect(argAfter(launch.args, '--effort')).toBe('medium');
     expect(argAfter(launch.args, '--permission-mode')).toBe('acceptEdits');
     expect(launch.args).not.toContain('--add-dir');
@@ -386,7 +386,7 @@ describe('buildClaudeLaunch (pure builder, P0.2/P0.4)', () => {
 
   it('resolves researcher tier to the concrete economical-research model', () => {
     const launch = buildClaudeLaunch(task({ role: 'researcher', tier: 'economical-research', workspace: null }), CONFIG);
-    expect(argAfter(launch.args, '--model')).toBe('haiku');
+    expect(argAfter(launch.args, '--model')).toBe('fable');
   });
 
   it('honours an explicit permission-mode override', () => {
