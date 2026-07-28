@@ -1,4 +1,5 @@
 import type { AgentTask, AgentResult } from '../agents/protocol.js';
+import type { ReplayAttemptIdentity } from '../agents/runner.js';
 
 /**
  * Capability-explicit host control surface for supervised attempts. The
@@ -65,6 +66,7 @@ export interface SupervisedAgentTask {
 
 export interface HostAgentController {
   readonly host: string;
+  replayAttempt?(task: AgentTask): ReplayAttemptIdentity | null;
   start(task: SupervisedAgentTask, signal: AbortSignal): Promise<HostAttemptHandle>;
   heartbeat(handle: HostAttemptHandle): Promise<HostLiveness>;
   requestCancel(handle: HostAttemptHandle, reason: string): Promise<CancelReceipt>;

@@ -283,11 +283,22 @@ export class Supervisor {
     const idempotencyKey = sha256(logicalId).slice(0, 32);
 
     const prior = this.store.read(logicalId);
+    const replay = this.controller.replayAttempt?.(task) ?? null;
     const resumesNativeRequest =
       prior?.state === 'AWAITING_NATIVE_RESULT' &&
       !prior.revoked_leases.includes(prior.lease_id);
-    let generation = resumesNativeRequest ? prior.generation : 1;
-    let identity: AttemptIdentity = resumesNativeRequest
+    const replaysValidatedNativeResult =
+      prior?.state === 'SUCCEEDED' &&
+      replay !== null &&
+      replay.logical_task_id === prior.logical_task_id &&
+      replay.attempt_id === prior.attempt_id &&
+      replay.generation === prior.generation &&
+      replay.lease_id === prior.lease_id &&
+      replay.idempotency_key === prior.idempotency_key &&
+      !prior.revoked_leases.includes(prior.lease_id);
+    const reusesNativeIdentity = resumesNativeRequest || replaysValidatedNativeResult;
+    let generation = reusesNativeIdentity ? prior.generation : 1;
+    let identity: AttemptIdentity = reusesNativeIdentity
       ? {
           attempt_id: prior.attempt_id,
           generation: prior.generation,

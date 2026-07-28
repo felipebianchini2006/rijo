@@ -6,6 +6,14 @@ export interface RunnerCapabilities {
   browser: boolean;
 }
 
+export interface ReplayAttemptIdentity {
+  logical_task_id: string;
+  attempt_id: string;
+  generation: number;
+  lease_id: string;
+  idempotency_key: string;
+}
+
 /**
  * Injectable agent runtime. The core never imports a provider SDK — adapters
  * or embedders supply an implementation. Capabilities are honest: if the
@@ -14,6 +22,11 @@ export interface RunnerCapabilities {
  */
 export interface AgentRunner {
   readonly capabilities: RunnerCapabilities;
+  /**
+   * Return an exact prior identity only when this runner holds a result whose
+   * complete request hash still matches the current task.
+   */
+  replayAttempt?(task: AgentTask): ReplayAttemptIdentity | null;
   runTask(task: AgentTask): Promise<AgentResult>;
 }
 

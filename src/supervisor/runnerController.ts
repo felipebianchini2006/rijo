@@ -46,6 +46,10 @@ export class InProcessController implements HostAgentController {
     this.host = host;
   }
 
+  replayAttempt(task: AgentTask) {
+    return this.runner.replayAttempt?.(task) ?? null;
+  }
+
   async start(sup: SupervisedAgentTask, signal: AbortSignal): Promise<HostAttemptHandle> {
     const task = sup.task;
     const id = task.attempt?.attempt_id ?? task.id;

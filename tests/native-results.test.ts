@@ -137,6 +137,14 @@ describe('native result ingestion', () => {
     expect(resumed.lease_id).toBe(request.lease_id);
     expect(new (await import('../src/supervisor/store.js')).TaskStore(paths).read(task.id)?.state)
       .toBe('SUCCEEDED');
+
+    const replayExecutor = defaultExecutor(new NativeResultRunner(bundle), config, paths);
+    const replayed = await replayExecutor.run({ task, role: 'planner' });
+
+    expect(replayed.ok).toBe(true);
+    expect(replayed.attempt_id).toBe(request.attempt_id);
+    expect(replayed.generation).toBe(request.generation);
+    expect(replayed.lease_id).toBe(request.lease_id);
   });
 
   it('rejects a v1 bundle in the native workflow', () => {

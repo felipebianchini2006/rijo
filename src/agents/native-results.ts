@@ -14,7 +14,7 @@ import {
 } from '../core/fsx.js';
 import { pathInScope } from '../core/scope.js';
 import type { AgentResult, AgentTask } from './protocol.js';
-import type { AgentRunner, RunnerCapabilities } from './runner.js';
+import type { AgentRunner, ReplayAttemptIdentity, RunnerCapabilities } from './runner.js';
 
 const NativeIdentitySchema = z.object({
   request_id: z.string().regex(/^nreq_[a-f0-9]{64}$/),
@@ -178,6 +178,34 @@ export class NativeResultRunner implements AgentRunner {
     this.bundleDirectory = path.dirname(path.resolve(bundleFile));
     this.requestFile = path.resolve(this.bundleDirectory, bundle.request_file);
     assertContainedWithoutSymlinks(this.bundleDirectory, this.requestFile);
+  }
+
+  replayAttempt(task: AgentTask): ReplayAttemptIdentity | null {
+    for (let index = 0; index < this.entries.length; index++) {
+      if (this.used.has(index)) continue;
+      const entry = this.entries[index]!;
+      if (entry.logical_task_id !== task.id) continue;
+      const attempt = {
+        logical_task_id: entry.logical_task_id,
+        attempt_id: entry.attempt_id,
+        generation: entry.generation,
+        lease_id: entry.lease_id,
+        idempotency_key: entry.idempotency_key,
+        canonical_baseline_hash: task.canonical_baseline ?? null,
+        workspace_id: task.workspace?.id ?? null,
+      };
+      const expected = createNativeRequestV2({ ...task, attempt });
+      if (identityFields.every((field) => entry[field] === expected[field])) {
+        return {
+          logical_task_id: entry.logical_task_id,
+          attempt_id: entry.attempt_id,
+          generation: entry.generation,
+          lease_id: entry.lease_id,
+          idempotency_key: entry.idempotency_key,
+        };
+      }
+    }
+    return null;
   }
 
   async runTask(task: AgentTask): Promise<AgentResult> {
