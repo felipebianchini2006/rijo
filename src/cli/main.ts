@@ -567,7 +567,8 @@ async function withNativeResults(
     console.error(`rijo: archived a native v1 bundle at ${path.relative(cwd, archive)} and created a v2 bundle.`);
     runner = new NativeResultRunner(file);
   }
-  return withNative(cwd, { ...deps, runner }, body);
+  const supervisorConfig = deps.supervisorConfig ?? loadConfig(new RijoPaths(cwd)).supervisor;
+  return withNative(cwd, { ...deps, runner, supervisorConfig }, body);
 }
 
 function readHookInput(): Record<string, unknown> {

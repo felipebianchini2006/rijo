@@ -1035,6 +1035,104 @@ describe('native result ingestion', () => {
     expect(requests.map((request) => request.logical_task_id)).toEqual(['new-extract']);
   });
 
+  it('uses the configured replacement budget through the internal native helper', async () => {
+    const root = tmpProject('rijo-native-helper-budget-');
+    roots.push(root);
+    writePlanFile(root, 'PLAN.md');
+    const runtime = deps(root);
+    const paths = new RijoPaths(root);
+    fs.mkdirSync(paths.runtimeDir, { recursive: true });
+    const bundle = path.join(paths.runtimeDir, 'native-results.json');
+    const requestFile = path.join(paths.runtimeDir, 'native-requests.jsonl');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const helperArgs = [
+      'internal',
+      'project-init',
+      '@PLAN.md',
+      '--results',
+      '@.rijo/runtime/native-results.json',
+    ];
+
+    await expect(runCli(helperArgs, runtime, root)).rejects.toThrow('NATIVE_RESULT_REQUIRED');
+    const generation1Request = JSON.parse(fs.readFileSync(requestFile, 'utf8').trim());
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...generation1Request,
+        ok: false,
+        summary: 'Native delayed result preimage conflict at PLAN.md.',
+        payload: null,
+      }],
+    }));
+
+    await expect(runCli(helperArgs, runtime, root)).rejects.toThrow('NATIVE_RESULT_REQUIRED');
+    const requestsAfterFence = fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    const generation2Request = requestsAfterFence.find(
+      (request) => request.logical_task_id === 'new-extract' && request.generation === 2,
+    );
+    expect(generation2Request).toBeDefined();
+    expect(generation2Request.lease_id).not.toBe(generation1Request.lease_id);
+    let record = new TaskStore(paths).read('new-extract')!;
+    expect(record.state).toBe('AWAITING_NATIVE_RESULT');
+    expect(record.generation).toBe(2);
+    expect(record.revoked_leases).toContain(generation1Request.lease_id);
+    expect(record.replacement_count).toBe(1);
+
+    const generation2Task = AgentTaskSchema.parse({
+      id: generation2Request.logical_task_id,
+      role: generation2Request.role,
+      tier: generation2Request.tier,
+      objective: generation2Request.objective,
+      canonical_files: generation2Request.canonical_files,
+      code_files: generation2Request.code_files,
+      write_scope: generation2Request.write_scope,
+      acceptance_criteria: generation2Request.acceptance_criteria,
+      verification_commands: generation2Request.verification_commands,
+      return_format: generation2Request.return_format,
+      notes: generation2Request.notes,
+      expert_profiles: generation2Request.expert_profiles,
+      attempt: {
+        logical_task_id: generation2Request.logical_task_id,
+        attempt_id: generation2Request.attempt_id,
+        generation: generation2Request.generation,
+        lease_id: generation2Request.lease_id,
+        idempotency_key: generation2Request.idempotency_key,
+        canonical_baseline_hash: null,
+        workspace_id: null,
+      },
+    });
+    const generation2Result = await runtime.runner.runTask(generation2Task);
+    const stored = JSON.parse(fs.readFileSync(bundle, 'utf8')) as {
+      version: 2;
+      results: Array<Record<string, unknown>>;
+    };
+    stored.results.push({
+      ...generation2Request,
+      ok: generation2Result.ok,
+      summary: generation2Result.summary,
+      payload: generation2Result.payload,
+      files: {},
+      files_written: generation2Result.files_written,
+      scope_requests: generation2Result.scope_requests,
+      decision_proposals: generation2Result.decision_proposals ?? [],
+      artifacts: [],
+    });
+    fs.writeFileSync(bundle, JSON.stringify(stored));
+
+    await expect(runCli(helperArgs, runtime, root)).rejects.toThrow('NATIVE_RESULT_REQUIRED');
+    record = new TaskStore(paths).read('new-extract')!;
+    expect(record.state).toBe('SUCCEEDED');
+    expect(record.generation).toBe(2);
+    expect(record.replacement_count).toBe(1);
+    expect(
+      fs.readFileSync(requestFile, 'utf8')
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => JSON.parse(line))
+        .filter((request) => request.logical_task_id === 'new-extract'),
+    ).toHaveLength(2);
+  });
+
   it('applies a native writer result only inside the assigned workspace scope', async () => {
     const root = tmpProject('rijo-native-writer-');
     roots.push(root);
