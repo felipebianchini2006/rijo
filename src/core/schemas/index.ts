@@ -90,6 +90,7 @@ export const QaConfigSchema = z.object({
     .array(ViewportSchema)
     .default([
       { name: 'desktop', width: 1440, height: 900 },
+      { name: 'tablet', width: 768, height: 1024 },
       { name: 'mobile', width: 390, height: 844 },
     ]),
   /** journey ids explicitly waived, each with an auditable reason. */

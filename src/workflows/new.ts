@@ -377,7 +377,15 @@ export async function newWorkflow(
       // volatile internals never enter version control
       writeFileAtomic(path.join(paths.root, '.gitignore'), ['runtime/', 'archive/', ''].join('\n'));
       ensureDurableGitignore(projectRoot);
-      if (!exists(paths.config)) saveConfig(paths, defaultConfig());
+      if (!exists(paths.config)) {
+        const config = defaultConfig();
+        const explicitBaseUrl = findExplicitLoopbackBaseUrl(planContent);
+        if (explicitBaseUrl) {
+          config.qa.surface = 'web';
+          config.qa.base_url = explicitBaseUrl;
+        }
+        saveConfig(paths, config);
+      }
       writeManifest(paths, newManifest(now));
     }
     const newId = nextMilestoneId(readManifest(paths));
@@ -935,6 +943,17 @@ export async function newWorkflow(
     run: { plan: planContent, planHash, next: Boolean(opts.next), host: ctx.hostProvider },
     terminal: false,
   });
+}
+
+export function findExplicitLoopbackBaseUrl(planContent: string): string | null {
+  const candidates = planContent.matchAll(/\bhttps?:\/\/(?:127\.0\.0\.1|localhost):(\d{1,5})\b/gi);
+  for (const candidate of candidates) {
+    const port = Number(candidate[1]);
+    if (Number.isInteger(port) && port >= 1 && port <= 65_535) {
+      return candidate[0]!.replace(/\/+$/, '');
+    }
+  }
+  return null;
 }
 
 function detectBrownfield(ctx: { projectRoot: string }): BrownfieldInfo {

@@ -35,6 +35,11 @@ describe('ConfigSchema', () => {
       ask_user: 'blockers_only',
       confidence_threshold: 0.7,
     });
+    expect(config.qa.viewports.map((viewport) => viewport.name)).toEqual([
+      'desktop',
+      'tablet',
+      'mobile',
+    ]);
     expect(config.engine_supervisor).toEqual({
       poll_interval_ms: 1_000,
       no_progress_timeout_ms: 120_000,

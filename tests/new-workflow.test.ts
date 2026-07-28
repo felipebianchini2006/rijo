@@ -1,7 +1,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { newWorkflow, validatePlanExtractionFidelity } from '../src/workflows/new.js';
+import {
+  findExplicitLoopbackBaseUrl,
+  newWorkflow,
+  validatePlanExtractionFidelity,
+} from '../src/workflows/new.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { newManifest, readManifest, writeManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
@@ -77,6 +81,24 @@ describe('rijo new (greenfield)', () => {
 
     expect(outcome.ok).toBe(true);
     expect(loadConfig(paths).context_budget_bytes).toBe(12_345);
+  });
+
+  it('materializes an explicit loopback endpoint and all required web viewports', async () => {
+    fs.appendFileSync(
+      path.join(root, 'PLAN.md'),
+      '\nServe the application at http://127.0.0.1:4173.\n',
+    );
+
+    expect((await newWorkflow(root, { planFile: '@PLAN.md' }, deps(root))).ok).toBe(true);
+
+    const config = loadConfig(new RijoPaths(root));
+    expect(config.qa.surface).toBe('web');
+    expect(config.qa.base_url).toBe('http://127.0.0.1:4173');
+    expect(config.qa.viewports.map((viewport) => viewport.name)).toEqual([
+      'desktop',
+      'tablet',
+      'mobile',
+    ]);
   });
 
   it('feeds exact PlanExtraction schema errors into the bounded correction attempt', async () => {
@@ -246,6 +268,12 @@ describe('rijo new (greenfield)', () => {
     ) as { sources: Array<{ confidence: string }> };
     expect(sources.sources[0]!.confidence).toBe('high');
   });
+});
+
+it('accepts only valid explicit loopback ports for project QA', () => {
+  expect(findExplicitLoopbackBaseUrl('Open http://localhost:4173/path.')).toBe('http://localhost:4173');
+  expect(findExplicitLoopbackBaseUrl('Open http://127.0.0.1:70000.')).toBeNull();
+  expect(findExplicitLoopbackBaseUrl('Open https://example.com:4173.')).toBeNull();
 });
 
 describe('rijo new (brownfield)', () => {
