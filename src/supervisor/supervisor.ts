@@ -420,7 +420,7 @@ export class Supervisor {
           : 'The task content changed before native result validation.',
       });
     }
-    const deferredNativeWorkspace =
+    let deferredNativeWorkspace =
       prior && reusesNativeIdentity && task.workspace?.id !== prior.workspace_id
         ? this.managedWorkspace(prior)
         : null;
@@ -713,7 +713,26 @@ export class Supervisor {
 
         // REPLACING → backoff → fresh attempt.
         const backoff = this.backoffFor(replacementsDone);
-        st.record = this.store.transition(st.record, 'REPLACING', { replacement_count: replacementsDone + 1 });
+        const fencedLease = st.record.lease_id;
+        const fencedReplayWorkspace = deferredNativeWorkspace;
+        st.record = this.store.transition(
+          st.record,
+          'REPLACING',
+          {
+            replacement_count: replacementsDone + 1,
+            revoked_leases: [...new Set([...st.record.revoked_leases, fencedLease])],
+            workspace_id: null,
+            workspace_path: null,
+          },
+          {
+            revoked_lease_id: fencedLease,
+            workspace_invalidated: true,
+          },
+        );
+        deferredNativeWorkspace = null;
+        if (fencedReplayWorkspace) {
+          fs.rmSync(fencedReplayWorkspace.root, { recursive: true, force: true });
+        }
         await disposeCurrentAttemptResources();
         if (backoff > 0) await this.delay(backoff);
 

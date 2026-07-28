@@ -231,6 +231,38 @@ function workspaceBaselineHash(
   return { available: true, hash: sha256(baseline.stdout) };
 }
 
+function semanticRequestPath(value: string, workspaceId: string | null): string {
+  if (!workspaceId || !path.isAbsolute(value)) return value;
+  const parts = path.normalize(value).split(path.sep);
+  const workspaceIndex = parts.lastIndexOf(workspaceId);
+  if (workspaceIndex < 1 || parts[workspaceIndex - 1] !== 'workspaces') return value;
+  const relative = parts.slice(workspaceIndex + 1).join('/');
+  return relative === '' ? '$WORKSPACE' : `$WORKSPACE/${relative}`;
+}
+
+function semanticRequest(request: NativeRequestV2): string {
+  const {
+    request_id: _requestId,
+    request_hash: _requestHash,
+    attempt_id: _attemptId,
+    generation: _generation,
+    lease_id: _leaseId,
+    idempotency_key: _idempotencyKey,
+    ...body
+  } = request;
+  const notes = body.notes
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith('[supervisor] previous attempt '))
+    .join('\n');
+  return JSON.stringify({
+    ...body,
+    workspace_id: body.workspace_id === null ? null : '$WORKSPACE',
+    canonical_files: body.canonical_files.map((value) => semanticRequestPath(value, body.workspace_id)),
+    code_files: body.code_files.map((value) => semanticRequestPath(value, body.workspace_id)),
+    notes,
+  });
+}
+
 export function createNativeRequestV2(task: AgentTask): NativeRequestV2 {
   const body = requestHashInput(task);
   // A native helper turn can create a fresh workspace with a different
@@ -287,6 +319,46 @@ export class NativeResultRunner implements AgentRunner {
     assertContainedWithoutSymlinks(this.bundleDirectory, this.requestFile);
   }
 
+  private storedRequests(): NativeRequestV2[] {
+    if (!exists(this.requestFile)) return [];
+    const requests: NativeRequestV2[] = [];
+    for (const line of readText(this.requestFile).split(/\r?\n/).filter(Boolean)) {
+      try {
+        const parsed = NativeRequestV2Schema.safeParse(JSON.parse(line));
+        if (parsed.success) requests.push(parsed.data);
+      } catch {
+        // Ignore a torn trailing request. It cannot authorize a result.
+      }
+    }
+    return requests;
+  }
+
+  private storedRequestForTask(task: AgentTask, attempt: ReplayAttemptIdentity): NativeRequestV2 | null {
+    const expected = createNativeRequestV2({
+      ...task,
+      attempt: {
+        ...attempt,
+        canonical_baseline_hash: task.canonical_baseline ?? null,
+        workspace_id: task.workspace?.id ?? null,
+      },
+    });
+    const requests = this.storedRequests();
+    for (let index = requests.length - 1; index >= 0; index--) {
+      const request = requests[index]!;
+      if (
+        request.logical_task_id === attempt.logical_task_id &&
+        request.attempt_id === attempt.attempt_id &&
+        request.generation === attempt.generation &&
+        request.lease_id === attempt.lease_id &&
+        request.idempotency_key === attempt.idempotency_key &&
+        semanticRequest(request) === semanticRequest(expected)
+      ) {
+        return request;
+      }
+    }
+    return null;
+  }
+
   replayAttempt(task: AgentTask): ReplayAttemptIdentity | null {
     const candidates: NativeIdentity[] = [];
     const usedRequestIds = new Set(
@@ -297,15 +369,8 @@ export class NativeResultRunner implements AgentRunner {
       const entry = this.entries[index]!;
       candidates.push(entry);
     }
-    if (exists(this.requestFile)) {
-      for (const line of readText(this.requestFile).split(/\r?\n/).filter(Boolean)) {
-        try {
-          const parsed = NativeRequestV2Schema.safeParse(JSON.parse(line));
-          if (parsed.success && !usedRequestIds.has(parsed.data.request_id)) candidates.push(parsed.data);
-        } catch {
-          // Ignore a torn trailing request. No exact result can match it.
-        }
-      }
+    for (const request of this.storedRequests()) {
+      if (!usedRequestIds.has(request.request_id)) candidates.push(request);
     }
 
     for (const entry of candidates.reverse()) {
@@ -319,8 +384,8 @@ export class NativeResultRunner implements AgentRunner {
         canonical_baseline_hash: task.canonical_baseline ?? null,
         workspace_id: task.workspace?.id ?? null,
       };
-      const expected = createNativeRequestV2({ ...task, attempt });
-      if (identityFields.every((field) => entry[field] === expected[field])) {
+      const stored = this.storedRequestForTask(task, attempt);
+      if (stored && identityFields.every((field) => entry[field] === stored[field])) {
         return {
           logical_task_id: entry.logical_task_id,
           attempt_id: entry.attempt_id,
@@ -334,7 +399,17 @@ export class NativeResultRunner implements AgentRunner {
   }
 
   async runTask(task: AgentTask): Promise<AgentResult> {
-    const request = createNativeRequestV2(task);
+    const generatedRequest = createNativeRequestV2(task);
+    const storedRequest = task.attempt
+      ? this.storedRequestForTask(task, {
+          logical_task_id: task.attempt.logical_task_id,
+          attempt_id: task.attempt.attempt_id,
+          generation: task.attempt.generation,
+          lease_id: task.attempt.lease_id,
+          idempotency_key: task.attempt.idempotency_key,
+        })
+      : null;
+    const request = storedRequest ?? generatedRequest;
     const index = this.entries.findIndex((entry, candidate) => {
       if (this.used.has(candidate)) return false;
       return identityFields.every((field) => entry[field] === request[field]);

@@ -605,6 +605,151 @@ describe('native result ingestion', () => {
     }
   });
 
+  it('replaces a fenced delayed result once and retains the winning workspace', async () => {
+    const root = tmpProject('rijo-native-preimage-replacement-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    const original = 'export const feature = "A";\n';
+    const userEdit = 'export const feature = "B";\n';
+    const delayed = 'export const feature = "C";\n';
+    fs.writeFileSync(path.join(root, 'src', 'feature.ts'), original);
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const makeWorkspace = () =>
+      AttemptWorkspace.create(root, {
+        taskId: 'exec-preimage-replacement',
+        writeScope: ['src/feature.ts'],
+        baselineCanonicalHash: 'baseline-01',
+      });
+    const makeTask = (workspace: AttemptWorkspace) =>
+      AgentTaskSchema.parse({
+        id: 'exec-preimage-replacement',
+        role: 'worker',
+        objective: 'Change the feature.',
+        canonical_files: [],
+        code_files: [path.join(workspace.root, 'src', 'feature.ts')],
+        write_scope: ['src/feature.ts'],
+        acceptance_criteria: ['The latest generation changes the feature.'],
+        verification_commands: [],
+        return_format: 'JSON result.',
+        workspace: { id: workspace.id, root: workspace.root },
+        canonical_baseline: 'baseline-01',
+      });
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 2,
+      replacement_backoff_ms: [],
+    };
+    const generation1Workspace = makeWorkspace();
+    const generation1Task = makeTask(generation1Workspace);
+    const generation1Pending = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: generation1Task, role: 'worker' });
+    expect(generation1Pending.ok).toBe(false);
+    const requestFile = path.join(root, 'native-requests.jsonl');
+    const generation1Request = JSON.parse(fs.readFileSync(requestFile, 'utf8').trim());
+
+    fs.writeFileSync(path.join(generation1Workspace.root, 'src', 'feature.ts'), delayed);
+    fs.writeFileSync(path.join(root, 'src', 'feature.ts'), userEdit);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...generation1Request,
+        ok: true,
+        summary: 'Completed the stale generation.',
+        payload: { done: true },
+        files_written: ['src/feature.ts'],
+        preserved_files: [{
+          target_path: 'src/feature.ts',
+          sha256: sha256(delayed),
+          workspace_id: generation1Workspace.id,
+          baseline_sha256: sha256(original),
+        }],
+      }],
+    }));
+
+    const replayWorkspace = makeWorkspace();
+    const replayTask = makeTask(replayWorkspace);
+    let generation2Workspace: AttemptWorkspace | null = null;
+    const generation2Pending = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({
+      task: replayTask,
+      role: 'worker',
+      prepareReplacement: () => {
+        replayWorkspace.discard();
+        generation2Workspace = makeWorkspace();
+        const prepared = generation2Workspace;
+        return {
+          task: makeTask(prepared),
+          dispose: () => prepared.discard(),
+        };
+      },
+    });
+
+    expect(generation2Pending.ok).toBe(false);
+    expect(generation2Pending.summary).toContain('no exact native identity');
+    expect(generation2Workspace).not.toBeNull();
+    const generation2 = generation2Workspace!;
+    const requests = fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    expect(requests).toHaveLength(2);
+    expect(requests[1].generation).toBe(generation1Request.generation + 1);
+    expect(requests[1].lease_id).not.toBe(generation1Request.lease_id);
+    let record = new TaskStore(paths).read(generation1Task.id)!;
+    expect(record.state).toBe('AWAITING_NATIVE_RESULT');
+    expect(record.generation).toBe(2);
+    expect(record.revoked_leases).toContain(generation1Request.lease_id);
+    expect(record.workspace_id).toBe(generation2.id);
+    expect(fs.existsSync(generation1Workspace.root)).toBe(false);
+    expect(fs.existsSync(generation2.root)).toBe(true);
+
+    fs.writeFileSync(path.join(generation2.root, 'src', 'feature.ts'), delayed);
+    const stored = JSON.parse(fs.readFileSync(bundle, 'utf8')) as {
+      version: 2;
+      results: Array<Record<string, unknown>>;
+    };
+    stored.results.push({
+      ...requests[1],
+      ok: true,
+      summary: 'Completed the replacement generation.',
+      payload: { done: true },
+      files_written: ['src/feature.ts'],
+      preserved_files: [{
+        target_path: 'src/feature.ts',
+        sha256: sha256(delayed),
+        workspace_id: generation2.id,
+        baseline_sha256: sha256(userEdit),
+      }],
+    });
+    fs.writeFileSync(bundle, JSON.stringify(stored));
+
+    const winningWorkspace = makeWorkspace();
+    const winningTask = makeTask(winningWorkspace);
+    const accepted = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: winningTask, role: 'worker' });
+
+    expect(accepted.ok, accepted.summary).toBe(true);
+    record = new TaskStore(paths).read(generation1Task.id)!;
+    expect(record.state).toBe('SUCCEEDED');
+    expect(record.generation).toBe(2);
+    expect(record.replacement_count).toBe(1);
+    expect(record.revoked_leases).toContain(generation1Request.lease_id);
+    expect(fs.existsSync(generation2.root)).toBe(false);
+    expect(fs.existsSync(winningWorkspace.root)).toBe(true);
+    expect(winningWorkspace.validate().changed).toEqual(['src/feature.ts']);
+    expect(winningWorkspace.applyVerifiedPatch().applied).toEqual(['src/feature.ts']);
+    expect(fs.readFileSync(path.join(root, 'src', 'feature.ts'), 'utf8')).toBe(delayed);
+    expect(fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/)).toHaveLength(2);
+  });
+
   it('replaces a native writer result rejected by deterministic validation with a new fenced identity', async () => {
     const root = tmpProject('rijo-native-validation-replacement-');
     roots.push(root);
