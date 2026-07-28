@@ -67,7 +67,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
           {
             id: 'T01', name: 'auth session guard', requirement_ids: phaseReqIds(root, phaseId),
             technical_justification: null, files: ['src/auth/session.ts'], mapped_references: [newMappedReference('src/auth/session.ts')], write_scope: ['src/auth/session.ts'],
-            depends_on: [], parallel: false, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false,
+            depends_on: [], parallel: false, tdd: false, tests: ['node --version'], evidence_expected: 'e', done: false,
           },
           {
             id: 'T02', name: 'wire it', requirement_ids: [], technical_justification: 'integration',
@@ -111,7 +111,7 @@ describe('expert routing on real workflow tasks (P0.6)', () => {
       )
       .on(
         (t) => t.id.startsWith('fix-repair'),
-        (t) => ok(t, { payload: { fixed: true, root_cause: 'c', change_summary: 'guard', regression_test: 'tests/x.test.ts', regression_test_impossible_reason: null, verification_commands: ['echo ok'], residual_risk: 'none' } }),
+        (t) => ok(t, { payload: { fixed: true, root_cause: 'c', change_summary: 'guard', regression_test: 'tests/x.test.ts', regression_test_impossible_reason: null, verification_commands: ['node --version'], residual_risk: 'none' } }),
       );
     const outcome = await fixWorkflow(root, { description: 'bug on empty cart' }, d);
     expect(outcome.ok, outcome.message).toBe(true);

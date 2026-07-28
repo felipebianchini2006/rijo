@@ -59,6 +59,7 @@ describe('commit and evidence model (real git repository)', () => {
     expect(verificationAtC1).toContain('tested_commit: null');
     const c1Files = git(root, ['show', '--name-only', '--pretty=format:', c1]).split('\n').filter(Boolean);
     expect(c1Files).toContain('src/a.ts');
+    expect(c1Files).toContain('.rijo/milestones/M001-simple-store/phases/01-catalog/PLAN-CYCLE.json');
 
     // C2 points at C1 and touches ONLY allowed evidence metadata
     const c2Files = git(root, ['show', '--name-only', '--pretty=format:', c2]).split('\n').filter(Boolean);

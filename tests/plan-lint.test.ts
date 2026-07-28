@@ -112,6 +112,37 @@ describe('lintPlan', () => {
     expect(codes(plan)).toContain('DEP_CYCLE');
   });
 
+  it.each([
+    'mise exec -- npm test',
+    'npm ci',
+    'npm exec remote-tool',
+    'pnpm dlx remote-tool',
+    'playwright install chromium',
+    'custom-check',
+  ])('rejects the unsafe verification command "%s" during plan lint', (command) => {
+    const plan: PhasePlan = {
+      phase: '01',
+      tasks: [
+        task('T01', { tests: [command] }),
+        task('T02', { depends_on: ['T01'] }),
+        task('T03', { depends_on: ['T02'] }),
+      ],
+    };
+    expect(codes(plan)).toContain('INVALID_TEST_COMMAND');
+  });
+
+  it('accepts safe verification commands during plan lint', () => {
+    const plan: PhasePlan = {
+      phase: '01',
+      tasks: [
+        task('T01', { tests: ['npm run build'] }),
+        task('T02', { depends_on: ['T01'], tests: ['node --test test/example.test.js'] }),
+        task('T03', { depends_on: ['T02'], tests: ['npm test'] }),
+      ],
+    };
+    expect(codes(plan)).not.toContain('INVALID_TEST_COMMAND');
+  });
+
   it('passes a clean plan with no issues', () => {
     const plan: PhasePlan = {
       phase: '01',

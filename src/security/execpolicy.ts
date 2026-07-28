@@ -72,6 +72,48 @@ const KNOWN_SCRIPT: Array<{ exe: string; sub?: string; network: NetworkPolicy }>
 
 const INSTALL_SUBCOMMANDS = new Set(['install', 'ci', 'i', 'add', 'update', 'up']);
 
+/**
+ * Return the static policy refusal that applies before cwd, sandbox, network,
+ * and environment checks. Plan lint and runtime execution share this gate.
+ */
+export function staticCommandRefusal(
+  raw: string,
+  opts: { allowInstall?: boolean } = {},
+): string | null {
+  const decision = evaluateCommand(raw);
+  if (!decision.ok) return `command policy: ${decision.reason}`;
+  const { executable, args } = decision;
+  if (
+    executable === 'npx' ||
+    executable === 'pnpx' ||
+    (executable === 'npm' && (args[0] === 'exec' || args[0] === 'x')) ||
+    (executable === 'pnpm' && args[0] === 'dlx') ||
+    (executable === 'yarn' && args[0] === 'dlx') ||
+    (executable === 'bun' && args[0] === 'x')
+  ) {
+    return 'npx/dlx can download and execute arbitrary packages; invoke the locally installed binary (node_modules/.bin is on PATH) instead';
+  }
+  const sub = args.find((argument) => !argument.startsWith('-')) ?? '';
+  const isPackageInstall =
+    ['npm', 'pnpm', 'yarn', 'bun'].includes(executable) &&
+    INSTALL_SUBCOMMANDS.has(sub);
+  const browserTargets = args.slice(1);
+  const isBrowserInstall =
+    executable === 'playwright' &&
+    args[0] === 'install' &&
+    browserTargets.length > 0 &&
+    browserTargets.every((browser) =>
+      ['chromium', 'firefox', 'webkit'].includes(browser),
+    );
+  if (executable === 'playwright' && args[0] === 'install' && !isBrowserInstall) {
+    return 'Playwright browser provisioning only accepts explicit chromium, firefox, or webkit targets without flags';
+  }
+  if ((isPackageInstall || isBrowserInstall) && !opts.allowInstall) {
+    return `installation ("${executable} ${sub}") requires the explicit install policy (gate-managed); agents cannot install packages or browsers`;
+  }
+  return null;
+}
+
 /** Env vars whose NAMES look like credentials — never forwarded, even via PATH-style lists. */
 const SECRET_NAME = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|APIKEY|API_KEY|PRIVATE|COOKIE|SESSION)|^(AWS_|GOOGLE_|AZURE_|GH_|GITHUB_|GITLAB_|NPM_|SSH_|OPENAI_|ANTHROPIC_)/i;
 
@@ -179,27 +221,15 @@ export function seatbeltProfile(cwd: string, network: NetworkPolicy): string {
  * fallback path.
  */
 export function planCommand(raw: string, opts: PlanCommandOptions): CommandPlan | CommandRefusal {
+  const staticRefusal = staticCommandRefusal(raw, {
+    allowInstall: opts.allowInstall,
+  });
+  if (staticRefusal) {
+    return { ok: false, reason: staticRefusal, disposition: 'BLOCKED' };
+  }
   const decision = evaluateCommand(raw);
-  if (!decision.ok) {
-    return { ok: false, reason: `command policy: ${decision.reason}`, disposition: 'BLOCKED' };
-  }
+  if (!decision.ok) throw new Error('Static command policy accepted an invalid command.');
   const { executable, args, category } = decision;
-
-  // npx downloads and executes arbitrary registry packages — never allowed.
-  if (
-    executable === 'npx' ||
-    executable === 'pnpx' ||
-    (executable === 'npm' && (args[0] === 'exec' || args[0] === 'x')) ||
-    (executable === 'pnpm' && args[0] === 'dlx') ||
-    (executable === 'yarn' && args[0] === 'dlx') ||
-    (executable === 'bun' && args[0] === 'x')
-  ) {
-    return {
-      ok: false,
-      reason: 'npx/dlx can download and execute arbitrary packages; invoke the locally installed binary (node_modules/.bin is on PATH) instead',
-      disposition: 'BLOCKED',
-    };
-  }
 
   // Dependency installation and Playwright's browser provisioning need the
   // explicit gate policy. The latter is deliberately limited to the three
@@ -214,23 +244,7 @@ export function planCommand(raw: string, opts: PlanCommandOptions): CommandPlan 
     args[0] === 'install' &&
     browserTargets.length > 0 &&
     browserTargets.every((browser) => ['chromium', 'firefox', 'webkit'].includes(browser));
-  const attemptedBrowserInstall = executable === 'playwright' && args[0] === 'install';
-  if (attemptedBrowserInstall && !isBrowserInstall) {
-    return {
-      ok: false,
-      reason:
-        'Playwright browser provisioning only accepts explicit chromium, firefox, or webkit targets without flags',
-      disposition: 'BLOCKED',
-    };
-  }
   const isManagedInstall = isPackageInstall || isBrowserInstall;
-  if (isManagedInstall && !opts.allowInstall) {
-    return {
-      ok: false,
-      reason: `installation ("${executable} ${sub}") requires the explicit install policy (gate-managed); agents cannot install packages or browsers`,
-      disposition: 'BLOCKED',
-    };
-  }
 
   // cwd must stay inside the attempt workspace / gate checkout
   const resolvedCwd = path.resolve(opts.cwd);

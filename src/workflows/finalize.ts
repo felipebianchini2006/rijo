@@ -221,7 +221,7 @@ export async function stageFinalization(ctx: WorkflowContext, input: StageInput)
   }
 
   const rijoArtifacts = [
-    pp.research, pp.spec, pp.plan, pp.summary, pp.review, pp.verification,
+    pp.research, pp.spec, pp.plan, path.join(pp.dir, 'PLAN-CYCLE.json'), pp.summary, pp.review, pp.verification,
     milestone.paths.requirements, milestone.paths.roadmap,
     paths.requirements, paths.roadmap, paths.events,
     paths.state, paths.manifest, paths.milestonesIndex, paths.stack, paths.decisions,

@@ -98,6 +98,10 @@ import {
   type TxnPathState,
 } from '../core/txn.js';
 import { WorkflowEpochSchema } from '../core/workflow-epoch.js';
+import {
+  createNativeRequestV2,
+  NativeRequestV2Schema,
+} from '../agents/native-results.js';
 
 export interface RunOptions {
   /** undefined = resume from STATE.md; 'next' = next ready phase; 'all' = every phase; 'NN' = specific phase */
@@ -436,21 +440,40 @@ function pendingPlanCycleAttempt(
   const pending = records[0];
   if (!pending) return { status: 'none' };
   const requestLog = readTextIfExists(path.join(ctx.paths.runtimeDir, 'native-requests.jsonl'));
-  const request = requestLog
-    ?.split(/\r?\n/)
-    .filter(Boolean)
-    .reverse()
-    .flatMap((line) => {
-      try {
-        const value = JSON.parse(line) as Record<string, unknown>;
-        return value['workflow_epoch'] === ctx.workflowEpoch &&
-          value['logical_task_id'] === pending.record.logical_task_id
-          ? [value]
-          : [];
-      } catch {
-        return [];
-      }
-    })[0];
+  let request: z.infer<typeof NativeRequestV2Schema> | null = null;
+  let malformedCandidate = false;
+  for (const line of requestLog?.split(/\r?\n/).filter(Boolean).reverse() ?? []) {
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      (value as Record<string, unknown>)['workflow_epoch'] !== ctx.workflowEpoch ||
+      (value as Record<string, unknown>)['logical_task_id'] !==
+        pending.record.logical_task_id
+    ) {
+      continue;
+    }
+    const parsed = NativeRequestV2Schema.safeParse(value);
+    if (!parsed.success) {
+      malformedCandidate = true;
+      break;
+    }
+    request = parsed.data;
+    break;
+  }
+  if (malformedCandidate) {
+    return {
+      status: 'invalid',
+      logical_task_id: pending.record.logical_task_id,
+      reason: 'The native request is malformed.',
+    };
+  }
   if (!request) {
     return {
       status: 'invalid',
@@ -458,10 +481,82 @@ function pendingPlanCycleAttempt(
       reason: 'The exact native request is missing from native-requests.jsonl.',
     };
   }
+  const record = pending.record;
+  if (
+    record.task_hash === null ||
+    record.workflow_epoch !== request.workflow_epoch ||
+    record.logical_task_id !== request.logical_task_id ||
+    record.role !== request.role ||
+    record.attempt_id !== request.attempt_id ||
+    record.generation !== request.generation ||
+    record.lease_id !== request.lease_id ||
+    record.idempotency_key !== request.idempotency_key ||
+    record.workspace_id !== request.workspace_id ||
+    record.revoked_leases.includes(request.lease_id)
+  ) {
+    return {
+      status: 'invalid',
+      logical_task_id: record.logical_task_id,
+      reason: 'The native request identity does not match the durable task record.',
+    };
+  }
+  const recoveredTask = AgentTaskSchema.safeParse({
+    id: request.logical_task_id,
+    role: request.role,
+    tier: request.tier,
+    objective: request.objective,
+    canonical_files: request.canonical_files,
+    code_files: request.code_files,
+    write_scope: request.write_scope,
+    acceptance_criteria: request.acceptance_criteria,
+    verification_commands: request.verification_commands,
+    return_format: request.return_format,
+    notes: request.notes,
+    workspace:
+      record.workspace_id === null
+        ? null
+        : {
+            id: record.workspace_id,
+            root: record.workspace_path,
+          },
+    canonical_baseline: record.canonical_baseline_hash,
+    attempt: {
+      workflow_epoch: record.workflow_epoch,
+      logical_task_id: record.logical_task_id,
+      attempt_id: record.attempt_id,
+      generation: record.generation,
+      lease_id: record.lease_id,
+      idempotency_key: record.idempotency_key,
+      canonical_baseline_hash: record.canonical_baseline_hash,
+      workspace_id: record.workspace_id,
+    },
+    expert_profiles: request.expert_profiles,
+  });
+  if (
+    !recoveredTask.success ||
+    supervisedTaskHash(recoveredTask.data) !== record.task_hash
+  ) {
+    return {
+      status: 'invalid',
+      logical_task_id: record.logical_task_id,
+      reason: 'The native request task hash does not match the durable task record.',
+    };
+  }
+  const expectedRequest = createNativeRequestV2(recoveredTask.data);
+  if (
+    request.request_id !== expectedRequest.request_id ||
+    request.request_hash !== expectedRequest.request_hash
+  ) {
+    return {
+      status: 'invalid',
+      logical_task_id: record.logical_task_id,
+      reason: 'The native request hash does not match the durable task record.',
+    };
+  }
   const notes =
     pending.step === 'PLAN'
       ? recoverPlannerReviewNotes(
-          typeof request['notes'] === 'string' ? request['notes'] : '',
+          request.notes,
           pending.revision,
         )
       : [];

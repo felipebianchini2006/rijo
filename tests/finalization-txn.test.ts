@@ -65,6 +65,7 @@ function expectPhase01Complete(root: string): void {
   const c1 = p01.commit as string;
   const c1Files = git(root, ['show', '--name-only', '--pretty=format:', c1]).split('\n').filter(Boolean);
   expect(c1Files).toContain('src/a.ts');
+  expect(c1Files).toContain('.rijo/milestones/M001-simple-store/phases/01-catalog/PLAN-CYCLE.json');
   const verAtC1 = git(root, ['show', `${c1}:.rijo/milestones/M001-simple-store/phases/01-catalog/VERIFICATION.md`]);
   expect(verAtC1).toContain('tested_commit: null');
 

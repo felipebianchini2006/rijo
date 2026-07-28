@@ -33,7 +33,7 @@ function localPlanPayload(phaseId: string) {
         depends_on: [],
         parallel: false,
         tdd: true,
-        tests: ['echo test-a'],
+        tests: ['node --version'],
         evidence_expected: 'tests pass',
         done: false,
       },

@@ -14,6 +14,12 @@ import { defaultConfig } from '../src/core/config.js';
 import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 import { TaskStore } from '../src/supervisor/store.js';
 import { reconcileSupervisedTasks } from '../src/supervisor/recover.js';
+import { AgentTaskSchema } from '../src/agents/protocol.js';
+import {
+  createNativeRequestV2,
+  NativeRequestV2Schema,
+  NativeResultRunner,
+} from '../src/agents/native-results.js';
 import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds, newMappedReference } from './helpers.js';
 
 function milestoneDir(root: string): string {
@@ -140,7 +146,7 @@ describe('rijo run', () => {
     expect(d.runner.executed.some((task) => task.id.startsWith('spec-'))).toBe(false);
     // evidence: commands with exit codes recorded
     const verification = fs.readFileSync(path.join(phaseDir, 'VERIFICATION.md'), 'utf8');
-    expect(verification).toContain('echo test-a');
+    expect(verification).toContain('node --version');
     expect(verification).toContain('exit 0');
     // roadmap updated with the implementation commit (a second metadata commit
     // syncs the hash cross-reference, so HEAD is the metadata commit)
@@ -603,6 +609,103 @@ describe('rijo run', () => {
     expect(planners.length).toBe(3);
   });
 
+  it.each([
+    ['task hash', 'task_hash'],
+    ['role', 'role'],
+  ] as const)(
+    'rejects pending plan recovery with a mismatched durable %s',
+    async (_label, mismatch) => {
+      const d = deps(root);
+      await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+      const paths = new RijoPaths(root);
+      const phaseDir = path.join(milestoneDir(root), 'phases', '01-catalog');
+      fs.mkdirSync(phaseDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(phaseDir, 'RESEARCH.md'),
+        '# Phase research — 01\n\nNo volatile facts apply.\n',
+      );
+      touchManifest(paths, () => {}, () => new Date());
+      const workflowEpoch = createWorkflowEpoch();
+      const bundle = path.join(paths.runtimeDir, 'native-results.json');
+      fs.writeFileSync(
+        bundle,
+        JSON.stringify({
+          version: 2,
+          active_workflow_epoch: workflowEpoch,
+          results: [],
+        }),
+      );
+      await expect(
+        runWorkflow(root, { target: '01' }, {
+          ...d,
+          workflowEpoch,
+          runner: new NativeResultRunner(bundle, workflowEpoch),
+        }),
+      ).rejects.toThrow('NATIVE_RESULT_REQUIRED');
+
+      const requestLog = path.join(paths.runtimeDir, 'native-requests.jsonl');
+      const request = NativeRequestV2Schema.parse(
+        JSON.parse(fs.readFileSync(requestLog, 'utf8').trim()),
+      );
+      const record = new TaskStore(paths).read('plan-01-r0')!;
+      expect(record.state).toBe('AWAITING_NATIVE_RESULT');
+      const changedTask = AgentTaskSchema.parse({
+        id: request.logical_task_id,
+        role: mismatch === 'role' ? 'reviewer' : request.role,
+        tier: request.tier,
+        objective:
+          mismatch === 'task_hash'
+            ? `${request.objective}\nChanged after dispatch.`
+            : request.objective,
+        canonical_files: request.canonical_files,
+        code_files: request.code_files,
+        write_scope: request.write_scope,
+        acceptance_criteria: request.acceptance_criteria,
+        verification_commands: request.verification_commands,
+        return_format: request.return_format,
+        notes: request.notes,
+        workspace: null,
+        canonical_baseline: record.canonical_baseline_hash,
+        attempt: {
+          workflow_epoch: record.workflow_epoch,
+          logical_task_id: record.logical_task_id,
+          attempt_id: record.attempt_id,
+          generation: record.generation,
+          lease_id: record.lease_id,
+          idempotency_key: record.idempotency_key,
+          canonical_baseline_hash: record.canonical_baseline_hash,
+          workspace_id: null,
+        },
+        expert_profiles: request.expert_profiles,
+      });
+      fs.writeFileSync(
+        requestLog,
+        `${JSON.stringify(createNativeRequestV2(changedTask))}\n`,
+      );
+
+      const resumed = await runWorkflow(root, { target: '01' }, {
+        ...d,
+        workflowEpoch,
+        runner: new NativeResultRunner(bundle, workflowEpoch),
+      });
+
+      expect(resumed.status).toBe('blocked');
+      expect(resumed.message).toContain(
+        'active native planning request cannot be recovered',
+      );
+      expect(resumed.details?.join('\n')).toContain(
+        mismatch === 'task_hash'
+          ? 'task hash does not match'
+          : 'identity does not match',
+      );
+      expect(new TaskStore(paths).read('plan-01-r0')).toMatchObject({
+        state: 'AWAITING_NATIVE_RESULT',
+        lease_id: record.lease_id,
+        revoked_leases: [],
+      });
+    },
+  );
+
   it('revises a plan when an approved verdict still contains a high finding', async () => {
     const d = deps(root);
     d.runner.on(
@@ -929,7 +1032,7 @@ describe('rijo run', () => {
     const shell: ShellRunner = {
       run(command, options) {
         if (
-          command === 'echo test-a' &&
+          command === 'node --version' &&
           (!fs.existsSync(sourcePath) ||
             !fs.readFileSync(sourcePath, 'utf8').includes('verificationRepair'))
         ) {
@@ -1400,7 +1503,7 @@ describe('rijo run', () => {
   it('verification failure does not advance state (atomicity) and bounded repair applies', async () => {
     const d = deps(root);
     // shell always fails for the plan's test command
-    const failingShell = new FakeShellRunner([{ match: /echo test-a/, exitCode: 1, output: 'FAIL' }]);
+    const failingShell = new FakeShellRunner([{ match: /node --version/, exitCode: 1, output: 'FAIL' }]);
     const d2 = { ...d, shell: failingShell };
     let repairWrites = 0;
     d.runner.on(
@@ -1788,7 +1891,7 @@ describe('rijo run', () => {
       planPayload: (phaseId) => ({
         phase: phaseId,
         tasks: [
-          { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], mapped_references: [{ path: 'src/a.ts', intent: 'new', parent_module: 'greenfield-root', placement_evidence: [{ path: '.', reason: 'fixture root' }] }], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
+          { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], mapped_references: [{ path: 'src/a.ts', intent: 'new', parent_module: 'greenfield-root', placement_evidence: [{ path: '.', reason: 'fixture root' }] }], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['node --version'], evidence_expected: 'e', done: false },
           { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], mapped_references: [{ path: 'src/b.ts', intent: 'new', parent_module: 'greenfield-root', placement_evidence: [{ path: '.', reason: 'fixture root' }] }], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
         ],
       }),

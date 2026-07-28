@@ -22,7 +22,7 @@ function parallelPlan(root: string) {
   return (phaseId: string) => ({
     phase: phaseId,
     tasks: [
-      { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], mapped_references: [newMappedReference('src/a.ts')], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
+      { id: 'T01', name: 'a', requirement_ids: phaseReqIds(root, phaseId), technical_justification: null, files: ['src/a.ts'], mapped_references: [newMappedReference('src/a.ts')], write_scope: ['src/a.ts'], depends_on: [], parallel: true, tdd: false, tests: ['node --version'], evidence_expected: 'e', done: false },
       { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'x', files: ['src/b.ts'], mapped_references: [newMappedReference('src/b.ts')], write_scope: ['src/b.ts'], depends_on: [], parallel: true, tdd: false, tests: [], evidence_expected: 'e', done: false },
     ],
   });
@@ -252,7 +252,7 @@ describe('task lifecycle interruption at each transition', () => {
       run(command: string) {
         return {
           command,
-          exit_code: failVerify && /echo test-a/.test(command) ? 1 : 0,
+          exit_code: failVerify && /node --version/.test(command) ? 1 : 0,
           summary: '',
           duration_ms: 1,
           blocked: false,

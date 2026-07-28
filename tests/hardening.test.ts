@@ -132,7 +132,7 @@ describe('run hardening gates', () => {
       planPayload: (phaseId) => ({
         phase: phaseId,
         tasks: [
-          { id: 'T01', name: 'a', requirement_ids: [], technical_justification: 'infra', files: ['src/a.ts'], mapped_references: [newMappedReference('src/a.ts')], write_scope: ['src/a.ts'], depends_on: [], parallel: false, tdd: false, tests: ['echo ok'], evidence_expected: 'e', done: false },
+          { id: 'T01', name: 'a', requirement_ids: [], technical_justification: 'infra', files: ['src/a.ts'], mapped_references: [newMappedReference('src/a.ts')], write_scope: ['src/a.ts'], depends_on: [], parallel: false, tdd: false, tests: ['node --version'], evidence_expected: 'e', done: false },
           { id: 'T02', name: 'b', requirement_ids: [], technical_justification: 'infra', files: ['src/b.ts'], mapped_references: [newMappedReference('src/b.ts')], write_scope: ['src/b.ts'], depends_on: ['T01'], parallel: false, tdd: false, tests: [], evidence_expected: 'e', done: false },
         ],
       }),

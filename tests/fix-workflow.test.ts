@@ -39,7 +39,7 @@ describe('rijo fix', () => {
             change_summary: 'guarda de carrinho vazio no handler',
             regression_test: 'tests/checkout-empty.test.ts',
             regression_test_impossible_reason: null,
-            verification_commands: ['echo run-regression'],
+            verification_commands: ['node --version'],
             residual_risk: 'No residual risk was identified.',
           },
         }),

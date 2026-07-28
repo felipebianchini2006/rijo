@@ -1,6 +1,7 @@
 import { parseFrontmatter, serializeFrontmatter } from './frontmatter.js';
 import { PhasePlanSchema, assertTaskTransition, type PhasePlan, type PlanTask, type TaskStatus } from './schemas/index.js';
 import { readText, sha256, writeFileAtomic } from './fsx.js';
+import { staticCommandRefusal } from '../security/execpolicy.js';
 
 /**
  * PLAN.md: front matter carries the machine-readable task list, the body is a
@@ -182,24 +183,17 @@ export function lintPlan(
         });
       }
     }
-    // A task's tests are RUN verbatim as verification commands under the safe
-    // execution policy, which rejects two things a planner commonly emits and
-    // that would hard-block the phase mid verification: (a) a PATH-QUALIFIED
-    // executable (a bare test file such as "test/add.test.js" where a command
-    // belongs), and (b) shell METACHARACTERS (e.g. an inline `node -e "...( )..."`
-    // script, or a piped `cat ... | curl ...`). Catch both at plan time so the
-    // planner revises them into a plain command (e.g. `node --test`). A bare
-    // non-path, metacharacter-free command (even a non-allowlisted one) is left
-    // to the execution policy at run time.
+    // A task's tests run verbatim under the safe execution policy. Reject every
+    // command that the deterministic allowlist will reject. Also reject package
+    // installation. The core owns dependency installation through its managed
+    // install gate.
     for (const cmd of t.tests) {
-      const executable = cmd.trim().split(/\s+/)[0] ?? '';
-      const pathQualified = executable.includes('/') || executable.includes('\\');
-      const hasMetachar = /[|&;<>`$()\n\r*?~!\\]/.test(cmd);
-      if (pathQualified || hasMetachar) {
+      const refusal = staticCommandRefusal(cmd);
+      if (refusal) {
         issues.push({
           code: 'INVALID_TEST_COMMAND',
-          message: `Task ${t.id} test "${cmd}" is not a plain runnable command (${pathQualified ? 'file path' : 'shell metacharacters'})`,
-          fix: 'Use a plain command with a bare executable and no shell operators, e.g. `node --test` or `node --test test/add.test.js` — never a bare file path or an inline shell/`node -e` script',
+          message: `Task ${t.id} test "${cmd}" is not permitted by the safe verification policy (${refusal})`,
+          fix: 'Use a safe verification command such as `npm test`, `npm run build`, or `node --test test/example.test.js`. Do not install dependencies in a task test.',
         });
       }
     }
