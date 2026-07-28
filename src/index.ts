@@ -60,7 +60,12 @@ export { silentSink, consoleSink, readStatus, renderStatusLine } from './core/pr
 export { generateAdapters } from './adapters/index.js';
 export {
   installRijo,
+  installProjectDependency,
+  prepareProjectBinding,
+  validateInstalledBinding,
   detectInstalledHosts,
+  type ProjectBinding,
+  type ProjectDependencyInstallOptions,
   type InstallHost,
   type InstallScope,
   type InstallOptions,

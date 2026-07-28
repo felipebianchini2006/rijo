@@ -3,7 +3,7 @@
 Run this workflow after implementation is complete.
 Derive each journey from requirement identifiers.
 
-1. Run `rijo internal qa-open`.
+1. Run `node .rijo/bin/rijo.cjs internal qa-open`.
 2. Create `.rijo/qa/JOURNEYS.md`.
 3. Start the application with the approved deterministic command policy.
 4. Use the available browser for a web product.
@@ -19,7 +19,7 @@ Derive each journey from requirement identifiers.
 14. Write `.rijo/qa/FINDINGS.md`, `.rijo/qa/TEST-REPORT.md`, and `.rijo/qa/READINESS.md`.
 15. Read `native-results.md`.
 16. Record the native Quality Assurance results in a result bundle.
-17. Run `rijo internal qa-record --results @.rijo/runtime/native-results.json`.
+17. Run `node .rijo/bin/rijo.cjs internal qa-record --results @.rijo/runtime/native-results.json`.
 
 Return only `READY`, `NOT_READY`, or `BLOCKED`.
 Return `BLOCKED` when a required browser, simulator, or emulator is unavailable.

@@ -26,7 +26,11 @@ import { serve } from './serve.js';
 import { generateAdapters, type AdapterName } from '../adapters/index.js';
 import { openDurableWorkflowEngine } from '../durable/index.js';
 import type { WorkflowDeps, WorkflowOutcome } from '../workflows/shared.js';
-import { installRijo, type InstallHost } from '../install/index.js';
+import {
+  installProjectDependency,
+  installRijo,
+  type InstallHost,
+} from '../install/index.js';
 import { NativeResultRunner } from '../agents/native-results.js';
 import { activeMilestone } from '../core/milestones.js';
 import { readRequirements, readRoadmap } from '../core/roadmap.js';
@@ -321,6 +325,14 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         ...(values.claude ? ['claude' as const] : []),
       ] satisfies InstallHost[];
       const scope = values.user ? 'user' : 'project';
+      if (scope === 'project') {
+        try {
+          installProjectDependency(cwd);
+        } catch (error) {
+          console.error(`rijo: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
       const result = installRijo({
         root: scope === 'user' ? os.homedir() : cwd,
         scope,

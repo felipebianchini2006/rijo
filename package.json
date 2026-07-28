@@ -1,6 +1,6 @@
 {
   "name": "rijo",
-  "version": "0.1.0-alpha.1",
+  "version": "0.2.0-rc.1",
   "description": "Context and autonomous execution framework for freelance developers: closed scope in, verified code and readiness evidence out.",
   "license": "MIT",
   "type": "module",

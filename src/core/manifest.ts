@@ -4,7 +4,7 @@ import { ManifestSchema, SCHEMA_VERSION, type Manifest, type MilestoneStatus } f
 import { exists, readJsonIfExists, sha256, sha256File, writeJsonAtomic } from './fsx.js';
 import type { RijoPaths } from './paths.js';
 
-export const RIJO_VERSION = '0.1.0-alpha.1';
+export const RIJO_VERSION = '0.2.0-rc.1';
 
 /** Global files tracked for drift detection, relative to .rijo/. */
 const TRACKED = [

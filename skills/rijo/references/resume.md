@@ -1,7 +1,7 @@
 # Resume work
 
-1. Run `rijo internal recovery`.
-2. Run `rijo internal status --json`.
+1. Run `node .rijo/bin/rijo.cjs internal recovery`.
+2. Run `node .rijo/bin/rijo.cjs internal status --json`.
 3. Inspect durable task records, leases, and the latest verified checkpoint.
 4. Fence an expired or stale attempt.
 5. Recover deterministic state from canonical Markdown, JSON, events, and Git evidence.

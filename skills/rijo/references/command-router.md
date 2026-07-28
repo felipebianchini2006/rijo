@@ -20,5 +20,5 @@ Reject an unknown command.
 Show the supported command names.
 Do not select a provider from command arguments.
 Use the active native host.
-Use only the documented `rijo internal` commands for deterministic core work.
+Use only the documented `node .rijo/bin/rijo.cjs internal` commands for deterministic core work.
 Do not call a public workflow from another RIJO workflow.

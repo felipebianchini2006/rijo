@@ -1,7 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import { installRijo } from '../src/install/index.js';
+import { installRijo, prepareProjectBinding } from '../src/install/index.js';
 import { cleanup, tmpProject } from './helpers.js';
 
 describe('native installer API', () => {
@@ -24,6 +25,10 @@ describe('native installer API', () => {
     expect(fs.existsSync(path.join(root, 'AGENTS.md'))).toBe(true);
     expect(fs.existsSync(path.join(root, 'CLAUDE.md'))).toBe(true);
     expect(fs.existsSync(path.join(root, '.rijo', 'config.yml'))).toBe(false);
+    expect(fs.existsSync(path.join(root, '.rijo', 'bin', 'rijo.cjs'))).toBe(true);
+    expect(
+      JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).devDependencies.rijo,
+    ).toBe('0.2.0-rc.1');
   });
 
   it('uses provider user locations and is byte-idempotent', () => {
@@ -74,5 +79,68 @@ describe('native installer API', () => {
       /symbolic link/i,
     );
     expect(fs.readdirSync(outside)).toEqual([]);
+  });
+
+  it('uses isolated npm tooling when the application uses another package manager', () => {
+    const root = tmpProject('rijo-install-pnpm-');
+    roots.push(root);
+    fs.writeFileSync(
+      path.join(root, 'package.json'),
+      JSON.stringify({ name: 'pnpm-app', private: true }, null, 2),
+    );
+    fs.writeFileSync(path.join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+
+    const report = installRijo({ root, hosts: ['codex'], scope: 'project' });
+
+    expect(report.binding?.isolated).toBe(true);
+    expect(fs.existsSync(path.join(root, 'package-lock.json'))).toBe(false);
+    expect(
+      JSON.parse(
+        fs.readFileSync(path.join(root, '.rijo', 'tooling', 'package.json'), 'utf8'),
+      ).devDependencies.rijo,
+    ).toBe('0.2.0-rc.1');
+    expect(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).not.toContain('rijo');
+  });
+
+  it('runs only the locked local CLI and blocks a divergent lock version', () => {
+    const root = tmpProject('rijo-install-launcher-');
+    roots.push(root);
+    const binding = prepareProjectBinding(root);
+    const installed = path.join(root, 'node_modules', 'rijo');
+    fs.mkdirSync(path.join(installed, 'dist', 'cli'), { recursive: true });
+    fs.writeFileSync(
+      path.join(installed, 'package.json'),
+      JSON.stringify({ name: 'rijo', version: binding.version, type: 'module' }),
+    );
+    fs.writeFileSync(
+      path.join(installed, 'dist', 'cli', 'index.js'),
+      "console.log(`LOCAL_RIJO ${process.argv.slice(2).join(' ')}`);\n",
+    );
+    const lock = {
+      name: path.basename(root),
+      version: '0.0.0',
+      lockfileVersion: 3,
+      packages: {
+        '': { devDependencies: { rijo: binding.version } },
+        'node_modules/rijo': { version: binding.version, dev: true },
+      },
+    };
+    fs.writeFileSync(binding.lockfile, JSON.stringify(lock, null, 2));
+
+    const local = spawnSync(process.execPath, [binding.launcher, 'internal', 'status'], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    expect(local.status).toBe(0);
+    expect(local.stdout.trim()).toBe('LOCAL_RIJO internal status');
+
+    lock.packages['node_modules/rijo'].version = '9.9.9';
+    fs.writeFileSync(binding.lockfile, JSON.stringify(lock, null, 2));
+    const divergent = spawnSync(process.execPath, [binding.launcher, 'status'], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    expect(divergent.status).toBe(1);
+    expect(divergent.stderr).toContain('project binding mismatch');
   });
 });

@@ -8,15 +8,18 @@ description: Run the native RIJO software delivery workflow in Codex or Claude C
 Use the active host session as the lead orchestrator.
 Use native subagents for bounded delegated work.
 Keep canonical project memory in `.rijo/`.
+Use `.rijo/bin/rijo.cjs` for every deterministic helper.
 
 ## Route the command
 
 1. Read `references/command-router.md`.
-2. Parse the first argument as one of these commands: `map-codebase`, `new`, `ui`, `start`, `test`, `fix`, `finish`, `next`, `status`, or `resume`.
-3. Load only `references/<command>.md`.
-4. Load another reference only when the selected command requires it.
-5. Follow `references/decision-policy.md` when a factual blocker can stop work.
-6. Follow `references/language-style.md` for all generated content.
+2. Verify that `.rijo/bin/rijo.cjs` exists.
+3. If it is missing, tell the user to run `npx rijo install --project`.
+4. Parse the first argument as one of these commands: `map-codebase`, `new`, `ui`, `start`, `test`, `fix`, `finish`, `next`, `status`, or `resume`.
+5. Load only `references/<command>.md`.
+6. Load another reference only when the selected command requires it.
+7. Follow `references/decision-policy.md` when a factual blocker can stop work.
+8. Follow `references/language-style.md` for all generated content.
 
 Use English for every host message.
 Never use Portuguese in a RIJO message.

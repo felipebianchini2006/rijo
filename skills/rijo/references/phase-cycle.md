@@ -20,8 +20,8 @@ Store checked dates and source links.
 
 Create two to four bounded tasks.
 Define requirement identifiers, files, write scopes, dependencies, acceptance criteria, tests, evidence, Test-Driven Development requirements, and parallel safety.
-Read `active_phase_dir` from `rijo internal status --json`.
-Run `rijo internal plan-validate @<active_phase_dir>/PLAN.md`.
+Read `active_phase_dir` from `node .rijo/bin/rijo.cjs internal status --json`.
+Run `node .rijo/bin/rijo.cjs internal plan-validate @<active_phase_dir>/PLAN.md`.
 
 ## PLAN_REVIEW
 
@@ -44,8 +44,8 @@ Put each bounded native result in the phase result bundle.
 
 Run real build, lint, type check, unit, integration, and contract commands.
 Treat command output and artifacts as evidence.
-Run each approved command through `rijo internal safe-command -- COMMAND`.
-Use `rijo internal safe-command --loopback -- COMMAND` when a local application server must bind to loopback.
+Run each approved command through `node .rijo/bin/rijo.cjs internal safe-command -- COMMAND`.
+Use `node .rijo/bin/rijo.cjs internal safe-command --loopback -- COMMAND` when a local application server must bind to loopback.
 
 ## ENGINEERING_REVIEW
 
@@ -61,5 +61,5 @@ Update requirements, roadmap, and state.
 Create a verified checkpoint.
 Mark changed map paths as stale.
 
-Run `rijo internal phase-open [NN] --results @.rijo/runtime/native-results.json`.
+Run `node .rijo/bin/rijo.cjs internal phase-open [NN] --results @.rijo/runtime/native-results.json`.
 The helper owns task records, evidence recording, verified state transitions, and phase completion.

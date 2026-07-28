@@ -2,7 +2,7 @@
 
 This workflow is read-only.
 
-1. Run `rijo internal status --json`.
+1. Run `node .rijo/bin/rijo.cjs internal status --json`.
 2. Read only the active roadmap summary.
 3. Read the latest valid checkpoint.
 4. Report the milestone, phase, stage, task, blocker, and next command.
