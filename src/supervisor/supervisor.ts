@@ -416,7 +416,15 @@ export class Supervisor {
           : 'The task content changed before native result validation.',
       });
     }
-    if (prior && (reusesNativeIdentity || supersedesAwaitingNativeRequest)) {
+    const deferredNativeWorkspace =
+      prior &&
+      reusesNativeIdentity &&
+      prior.workspace_id !== null &&
+      prior.workspace_path !== null &&
+      task.workspace?.id !== prior.workspace_id
+        ? prior
+        : null;
+    if (prior && supersedesAwaitingNativeRequest) {
       this.discardSupersededWorkspace(prior, task);
     }
     const initial = TaskRecordSchema.parse({
@@ -586,8 +594,8 @@ export class Supervisor {
           started_at: this.toIso(),
           soft_deadline_at: this.toIso(softDeadline),
           hard_deadline_at: this.toIso(hardDeadline),
-          workspace_id: currentTask.workspace?.id ?? null,
-          workspace_path: currentTask.workspace?.root ?? null,
+          workspace_id: deferredNativeWorkspace?.workspace_id ?? currentTask.workspace?.id ?? null,
+          workspace_path: deferredNativeWorkspace?.workspace_path ?? currentTask.workspace?.root ?? null,
         });
 
         const attemptTask = this.buildAttemptTask(currentTask, identity, idempotencyKey);
@@ -635,6 +643,22 @@ export class Supervisor {
 
           if (outcome.kind === 'succeeded') {
             await this.safeDispose(handle);
+            if (deferredNativeWorkspace) {
+              st.record = this.store.patch(
+                st.record,
+                {
+                  workspace_id: currentTask.workspace?.id ?? null,
+                  workspace_path: currentTask.workspace?.root ?? null,
+                },
+                'native_workspace_materialized',
+                {
+                  prior_workspace_id: deferredNativeWorkspace.workspace_id,
+                  workspace_id: currentTask.workspace?.id ?? null,
+                  result_validated: true,
+                },
+              );
+              this.discardSupersededWorkspace(deferredNativeWorkspace, currentTask);
+            }
             this.active.delete(logicalId);
             return outcome.result;
           }

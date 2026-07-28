@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   NativeProtocolUpgradeError,
@@ -37,6 +38,11 @@ describe('native result ingestion', () => {
     workspace_id: null,
   };
 
+  const seedWorkspaceBaseline = (workspace: string): void => {
+    execFileSync('git', ['init', '--quiet'], { cwd: workspace });
+    execFileSync('git', ['add', '-A'], { cwd: workspace });
+  };
+
   it('exports a complete v2 request without starting a host process', async () => {
     const root = tmpProject('rijo-native-request-');
     roots.push(root);
@@ -72,6 +78,7 @@ describe('native result ingestion', () => {
     expect(request.request_hash).toMatch(/^[a-f0-9]{64}$/);
     expect(request.objective).toBe(task.objective);
     expect(request.result_contract.protocol).toBe('NativeResultV2');
+    expect(request.result_contract.preserved_files).toContain('baseline SHA-256');
     expect(fs.statSync(path.join(root, 'native-dispatch')).isDirectory()).toBe(true);
     expect(request.result_contract.identity_fields).toEqual([
       'request_id',
@@ -233,6 +240,92 @@ describe('native result ingestion', () => {
       .toBe('export const feature = true;\n');
     expect(fs.existsSync(workspaceA)).toBe(false);
     expect(fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/)).toHaveLength(1);
+  });
+
+  it('keeps the pending workspace until an exact writer result materializes successfully', async () => {
+    const root = tmpProject('rijo-native-writer-materialization-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const makeTask = (workspaceId: string) => {
+      const workspace = path.join(paths.runtimeDir, 'workspaces', workspaceId);
+      fs.mkdirSync(workspace, { recursive: true });
+      return AgentTaskSchema.parse({
+        id: 'exec-materialization',
+        role: 'worker',
+        objective: 'Create one portable feature.',
+        canonical_files: [],
+        code_files: [path.join(workspace, 'src', 'feature.ts')],
+        write_scope: ['src/feature.ts'],
+        acceptance_criteria: ['The feature exists.'],
+        verification_commands: [],
+        return_format: 'JSON result.',
+        workspace: { id: workspaceId, root: workspace },
+        canonical_baseline: 'baseline-01',
+      });
+    };
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 0,
+      replacement_backoff_ms: [],
+    };
+    const workspaceA = makeTask('ws-materialization-a');
+    const first = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: workspaceA, role: 'worker' });
+    expect(first.ok).toBe(false);
+    const request = JSON.parse(
+      fs.readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8').trim(),
+    );
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Implemented the task without portable output.',
+        payload: { done: true },
+      }],
+    }));
+
+    const workspaceB = makeTask('ws-materialization-b');
+    const invalid = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: workspaceB, role: 'worker' });
+
+    expect(invalid.ok).toBe(false);
+    expect(invalid.summary).toContain('did not materialize any file delta');
+    expect(new TaskStore(paths).read(workspaceA.id)?.state).toBe('AWAITING_NATIVE_RESULT');
+    expect(new TaskStore(paths).read(workspaceA.id)?.workspace_id).toBe('ws-materialization-a');
+    expect(fs.existsSync(workspaceA.workspace!.root)).toBe(true);
+
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Implemented the task with portable output.',
+        payload: { done: true },
+        files: { 'src/feature.ts': 'export const feature = true;\n' },
+        files_written: ['src/feature.ts'],
+      }],
+    }));
+    const workspaceC = makeTask('ws-materialization-c');
+    const accepted = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: workspaceC, role: 'worker' });
+
+    expect(accepted.ok).toBe(true);
+    expect(fs.existsSync(workspaceA.workspace!.root)).toBe(false);
+    expect(new TaskStore(paths).read(workspaceA.id)?.workspace_id).toBe('ws-materialization-c');
+    expect(fs.readFileSync(path.join(workspaceC.workspace!.root, 'src', 'feature.ts'), 'utf8'))
+      .toContain('feature = true');
   });
 
   it('replaces a native writer result rejected by deterministic validation with a new fenced identity', async () => {
@@ -613,6 +706,46 @@ describe('native result ingestion', () => {
     expect(fs.existsSync(path.join(workspace, 'src', 'feature.ts'))).toBe(false);
   });
 
+  it('rejects a successful writer result with an empty materialized payload', async () => {
+    const root = tmpProject('rijo-native-empty-writer-');
+    roots.push(root);
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(workspace);
+    const bundle = path.join(root, 'results.json');
+    const task = AgentTaskSchema.parse({
+      id: 'exec-empty-writer',
+      role: 'worker',
+      objective: 'Create one file.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: ['src/feature.ts'],
+      acceptance_criteria: ['The file exists.'],
+      verification_commands: [],
+      return_format: 'JSON result.',
+      workspace: { id: 'native-workspace', root: workspace },
+      attempt: {
+        ...attempt,
+        logical_task_id: 'exec-empty-writer',
+        workspace_id: 'native-workspace',
+      },
+    });
+    const request = createNativeRequestV2(task);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Implemented the task.',
+        payload: { done: true },
+      }],
+    }));
+
+    const result = await new NativeResultRunner(bundle).runTask(task);
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('did not materialize any file delta');
+  });
+
   it('rejects a declared inline write when it produces an empty delta', async () => {
     const root = tmpProject('rijo-native-empty-delta-');
     roots.push(root);
@@ -652,13 +785,14 @@ describe('native result ingestion', () => {
     expect(result.summary).toContain('without a materialized delta');
   });
 
-  it('accepts an exact preserved workspace file with a verified hash', async () => {
+  it('rejects a preserved workspace file that has no baseline delta', async () => {
     const root = tmpProject('rijo-native-preserved-file-');
     roots.push(root);
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
     const content = 'export const feature = true;\n';
     fs.writeFileSync(path.join(workspace, 'src', 'feature.ts'), content);
+    seedWorkspaceBaseline(workspace);
     const bundle = path.join(root, 'results.json');
     const task = AgentTaskSchema.parse({
       id: 'exec-preserved-file',
@@ -671,7 +805,11 @@ describe('native result ingestion', () => {
       verification_commands: [],
       return_format: 'JSON result.',
       workspace: { id: 'native-workspace', root: workspace },
-      attempt: { ...attempt, logical_task_id: 'exec-preserved-file' },
+      attempt: {
+        ...attempt,
+        logical_task_id: 'exec-preserved-file',
+        workspace_id: 'native-workspace',
+      },
     });
     const request = createNativeRequestV2(task);
     fs.writeFileSync(bundle, JSON.stringify({
@@ -682,13 +820,70 @@ describe('native result ingestion', () => {
         summary: 'Verified the preserved file.',
         payload: { done: true },
         files_written: ['src/feature.ts'],
-        preserved_files: [{ target_path: 'src/feature.ts', sha256: sha256(content) }],
+        preserved_files: [{
+          target_path: 'src/feature.ts',
+          sha256: sha256(content),
+          workspace_id: 'native-workspace',
+          baseline_sha256: sha256(content),
+        }],
       }],
     }));
 
     const result = await new NativeResultRunner(bundle).runTask(task);
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('has no delta from its attempt baseline');
+  });
+
+  it('accepts a preserved file changed in the exact attempt workspace', async () => {
+    const root = tmpProject('rijo-native-preserved-delta-');
+    roots.push(root);
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    const baseline = 'export const feature = false;\n';
+    const changed = 'export const feature = true;\n';
+    fs.writeFileSync(path.join(workspace, 'src', 'feature.ts'), baseline);
+    seedWorkspaceBaseline(workspace);
+    fs.writeFileSync(path.join(workspace, 'src', 'feature.ts'), changed);
+    const bundle = path.join(root, 'results.json');
+    const task = AgentTaskSchema.parse({
+      id: 'exec-preserved-delta',
+      role: 'worker',
+      objective: 'Return the changed workspace file.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: ['src/feature.ts'],
+      acceptance_criteria: ['The changed file is present.'],
+      verification_commands: [],
+      return_format: 'JSON result.',
+      workspace: { id: 'native-workspace', root: workspace },
+      attempt: {
+        ...attempt,
+        logical_task_id: 'exec-preserved-delta',
+        workspace_id: 'native-workspace',
+      },
+    });
+    const request = createNativeRequestV2(task);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Verified the changed workspace file.',
+        payload: { done: true },
+        files_written: ['src/feature.ts'],
+        preserved_files: [{
+          target_path: 'src/feature.ts',
+          sha256: sha256(changed),
+          workspace_id: 'native-workspace',
+          baseline_sha256: sha256(baseline),
+        }],
+      }],
+    }));
+
+    const result = await new NativeResultRunner(bundle).runTask(task);
+
+    expect(result.ok, result.summary).toBe(true);
     expect(result.files_written).toEqual(['src/feature.ts']);
   });
 

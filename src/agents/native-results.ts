@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import {
   appendLine,
@@ -55,6 +56,8 @@ export type NativeArtifactReference = z.infer<typeof NativeArtifactReferenceSche
 export const NativePreservedFileSchema = z.object({
   target_path: NativeRelativePathSchema,
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  workspace_id: z.string().min(1),
+  baseline_sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
 });
 export type NativePreservedFile = z.infer<typeof NativePreservedFileSchema>;
 
@@ -173,7 +176,8 @@ function requestHashInput(task: AgentTask): Omit<NativeRequestV2, 'request_id' |
       payload: 'A value that matches return_format.',
       files: 'Complete UTF-8 text keyed by project-relative target path.',
       artifacts: 'Binary files referenced by staged path, SHA-256, size, and media type.',
-      preserved_files: 'Files already present in the assigned workspace, with exact target path and SHA-256.',
+      preserved_files:
+        'Files already changed in the exact assigned workspace, with workspace ID, current SHA-256, and baseline SHA-256.',
       deleted_paths: 'Deleted files with project-relative path and the expected pre-delete SHA-256.',
       renames: 'Renamed files with source path, target path, and the expected source SHA-256.',
       decision_proposals: 'Material decisions for deterministic validation before patch application.',
@@ -191,12 +195,45 @@ function stableWorkspacePath(task: AgentTask, value: string): string {
   return `$WORKSPACE/${relative.split(path.sep).join('/')}`;
 }
 
+function workspaceBaselineHash(
+  workspaceRoot: string,
+  relative: string,
+): { available: true; hash: string | null } | { available: false; hash: null } {
+  const topLevel = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+    cwd: workspaceRoot,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  });
+  if (
+    topLevel.status !== 0 ||
+    topLevel.error ||
+    fs.realpathSync(topLevel.stdout.trim()) !== fs.realpathSync(workspaceRoot)
+  ) {
+    return { available: false, hash: null };
+  }
+  const tracked = spawnSync('git', ['ls-files', '--stage', '--', relative], {
+    cwd: workspaceRoot,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  });
+  if (tracked.status !== 0 || tracked.error) return { available: false, hash: null };
+  if (tracked.stdout.trim() === '') return { available: true, hash: null };
+  const baseline = spawnSync('git', ['show', `:./${relative}`], {
+    cwd: workspaceRoot,
+    encoding: null,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (baseline.status !== 0 || baseline.error || !Buffer.isBuffer(baseline.stdout)) {
+    return { available: false, hash: null };
+  }
+  return { available: true, hash: sha256(baseline.stdout) };
+}
+
 export function createNativeRequestV2(task: AgentTask): NativeRequestV2 {
   const body = requestHashInput(task);
-  // A native helper turn discards the prior isolated workspace. The next turn
-  // creates a fresh workspace with a different absolute root. Hash the semantic
-  // task paths, not that random root, so the exact supervised identity can
-  // resume while the emitted request still contains the real current paths.
+  // A native helper turn can create a fresh workspace with a different
+  // absolute root. Hash the semantic task paths, not that random root, so the
+  // exact supervised identity can resume while the request contains real paths.
   const hashBody = {
     ...body,
     canonical_files: body.canonical_files.map((value) => stableWorkspacePath(task, value)),
@@ -315,7 +352,7 @@ export class NativeResultRunner implements AgentRunner {
     const reject = (summary: string): AgentResult =>
       this.result(task, {
         ok: false,
-        summary,
+        summary: `The native result bundle has no result for task ${task.id}: ${summary}`,
         payload: null,
         scope_requests: [],
         decision_proposals: [],
@@ -411,12 +448,32 @@ export class NativeResultRunner implements AgentRunner {
         absolute(artifact.target_path);
         artifactBytes.set(artifact.target_path, bytes);
       }
+      const verifiedPreservedChanges = new Set<string>();
       for (const file of entry.preserved_files) {
+        if (
+          file.workspace_id !== task.workspace.id ||
+          task.attempt?.workspace_id !== task.workspace.id
+        ) {
+          return reject(
+            `Native result preserved file belongs to a different attempt workspace: ${file.target_path}.`,
+          );
+        }
         const actual = verifiedFileHash(file.target_path, 'preserved file');
         if (typeof actual !== 'string') return actual;
         if (actual !== file.sha256) {
           return reject(`Native result preserved file hash mismatch: ${file.target_path}.`);
         }
+        const baseline = workspaceBaselineHash(task.workspace.root, file.target_path);
+        if (!baseline.available) {
+          return reject(`Native result preserved file baseline is unavailable: ${file.target_path}.`);
+        }
+        if (baseline.hash !== file.baseline_sha256) {
+          return reject(`Native result preserved file baseline hash mismatch: ${file.target_path}.`);
+        }
+        if (baseline.hash === actual) {
+          return reject(`Native result preserved file has no delta from its attempt baseline: ${file.target_path}.`);
+        }
+        verifiedPreservedChanges.add(file.target_path);
       }
       for (const operation of entry.deleted_paths) {
         const actual = verifiedFileHash(operation.path, 'deletion');
@@ -454,16 +511,16 @@ export class NativeResultRunner implements AgentRunner {
         predictedChanged.add(operation.source_path);
         predictedChanged.add(operation.target_path);
       }
-      const preserved = new Set(preservedPaths);
+      for (const relative of verifiedPreservedChanges) predictedChanged.add(relative);
       const unchangedDeclared = entry.files_written.filter(
-        (relative) => !predictedChanged.has(relative) && !preserved.has(relative),
+        (relative) => !predictedChanged.has(relative),
       );
       if (unchangedDeclared.length > 0) {
         return reject(
           `Native result declared writes without a materialized delta: ${unchangedDeclared.join(', ')}.`,
         );
       }
-      if (entry.ok && reported.length > 0 && predictedChanged.size === 0 && preserved.size === 0) {
+      if (entry.ok && task.write_scope.length > 0 && predictedChanged.size === 0) {
         return reject(`Native writer result for task ${task.id} did not materialize any file delta.`);
       }
 
@@ -489,7 +546,11 @@ export class NativeResultRunner implements AgentRunner {
         const after = exists(target) && fs.lstatSync(target).isFile() ? sha256File(target) : null;
         if (before.get(relative) !== after) changed.add(relative);
       }
-      if ([...predictedChanged].some((relative) => !changed.has(relative))) {
+      if (
+        [...predictedChanged].some(
+          (relative) => !changed.has(relative) && !verifiedPreservedChanges.has(relative),
+        )
+      ) {
         return reject(`Native writer result for task ${task.id} did not produce its declared file delta.`);
       }
     } else if (reported.length > 0) {
