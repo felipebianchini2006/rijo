@@ -2447,7 +2447,7 @@ async function executePhase(
       if (t.status === 'IMPLEMENTED' || t.status === 'VERIFIED') transition(t.id, 'VERIFYING');
     }
     evidences = [
-      ...prepareProjectDependencies(ctx, phaseBaseline, projectCommands),
+      ...prepareProjectDependencies(ctx, phaseBaseline, projectCommands, plan),
       ...runVerification(ctx, plan, projectCommands),
     ];
 
@@ -2976,6 +2976,7 @@ function runTddRedProof(
           dependencies?: Record<string, unknown>;
           devDependencies?: Record<string, unknown>;
           optionalDependencies?: Record<string, unknown>;
+          scripts?: Record<string, string>;
         };
         const dependencyCount =
           Object.keys(pkg.dependencies ?? {}).length +
@@ -2991,6 +2992,19 @@ function runTddRedProof(
             return {
               ok: false,
               reason: `The RED workspace dependency setup failed: ${install.summary.slice(0, 400)}`,
+            };
+          }
+        }
+        if (requiresPlaywrightBrowser(pkg, task.tests)) {
+          const browserInstall = ctx.shell.run('playwright install chromium', {
+            cwd: redWorkspace.root,
+            allowInstall: true,
+            timeoutMs: 10 * 60 * 1000,
+          });
+          if (browserInstall.exit_code !== 0) {
+            return {
+              ok: false,
+              reason: `The RED workspace browser setup failed: ${browserInstall.summary.slice(0, 400)}`,
             };
           }
         }
@@ -3060,22 +3074,28 @@ function prepareProjectDependencies(
   ctx: WorkflowContext,
   phaseBaseline: FileSnapshot,
   projectCommands: string[],
+  plan: PhasePlan,
 ): CommandEvidence[] {
-  if (!projectCommands.some((command) => command.startsWith('npm run '))) return [];
+  const verificationCommands = [
+    ...projectCommands,
+    ...plan.tasks.flatMap((task) => task.tests),
+  ];
+  if (!verificationCommands.some((command) => command.startsWith('npm run '))) return [];
   const pkgPath = path.join(ctx.projectRoot, 'package.json');
   if (!exists(pkgPath)) return [];
 
   const delta = diffSnapshots(phaseBaseline, snapshotFiles(ctx.projectRoot));
   const nodeModulesPath = path.join(ctx.projectRoot, 'node_modules');
-  if (!delta.changed.includes('package.json') && exists(nodeModulesPath)) return [];
 
   let packageCount = 0;
+  let pkg: {
+    dependencies?: Record<string, unknown>;
+    devDependencies?: Record<string, unknown>;
+    optionalDependencies?: Record<string, unknown>;
+    scripts?: Record<string, string>;
+  };
   try {
-    const pkg = JSON.parse(readText(pkgPath)) as {
-      dependencies?: Record<string, unknown>;
-      devDependencies?: Record<string, unknown>;
-      optionalDependencies?: Record<string, unknown>;
-    };
+    pkg = JSON.parse(readText(pkgPath)) as typeof pkg;
     packageCount =
       Object.keys(pkg.dependencies ?? {}).length +
       Object.keys(pkg.devDependencies ?? {}).length +
@@ -3085,18 +3105,60 @@ function prepareProjectDependencies(
   }
   if (packageCount === 0) return [];
 
-  const command = 'npm install --no-audit --no-fund';
-  const evidence = ctx.shell.run(command, {
-    cwd: ctx.projectRoot,
-    allowInstall: true,
-    timeoutMs: 10 * 60 * 1000,
+  const evidences: CommandEvidence[] = [];
+  if (delta.changed.includes('package.json') || !exists(nodeModulesPath)) {
+    const command = 'npm install --no-audit --no-fund';
+    const evidence = ctx.shell.run(command, {
+      cwd: ctx.projectRoot,
+      allowInstall: true,
+      timeoutMs: 10 * 60 * 1000,
+    });
+    evidences.push(evidence);
+    ctx.bus.emit(
+      'run.verify_command',
+      { message: `${command} → exit ${evidence.exit_code}` },
+      { command, exit: evidence.exit_code, managed_install: true },
+    );
+    if (evidence.exit_code !== 0) return evidences;
+  }
+
+  if (requiresPlaywrightBrowser(pkg, verificationCommands)) {
+    const command = 'playwright install chromium';
+    const evidence = ctx.shell.run(command, {
+      cwd: ctx.projectRoot,
+      allowInstall: true,
+      timeoutMs: 10 * 60 * 1000,
+    });
+    evidences.push(evidence);
+    ctx.bus.emit(
+      'run.verify_command',
+      { message: `${command} → exit ${evidence.exit_code}` },
+      { command, exit: evidence.exit_code, managed_install: true },
+    );
+  }
+  return evidences;
+}
+
+function requiresPlaywrightBrowser(
+  pkg: {
+    dependencies?: Record<string, unknown>;
+    devDependencies?: Record<string, unknown>;
+    optionalDependencies?: Record<string, unknown>;
+    scripts?: Record<string, string>;
+  },
+  commands: string[],
+): boolean {
+  const dependencies = {
+    ...(pkg.dependencies ?? {}),
+    ...(pkg.devDependencies ?? {}),
+    ...(pkg.optionalDependencies ?? {}),
+  };
+  if (!('@playwright/test' in dependencies) && !('playwright' in dependencies)) return false;
+  return commands.some((command) => {
+    if (/\bplaywright\b/.test(command) || /\btest:e2e\b/.test(command)) return true;
+    const scriptName = command.match(/^npm run ([^\s]+)$/)?.[1];
+    return scriptName ? /\bplaywright\b/.test(pkg.scripts?.[scriptName] ?? '') : false;
   });
-  ctx.bus.emit(
-    'run.verify_command',
-    { message: `${command} → exit ${evidence.exit_code}` },
-    { command, exit: evidence.exit_code, managed_install: true },
-  );
-  return [evidence];
 }
 
 function runVerification(ctx: WorkflowContext, plan: PhasePlan, projectCommands: string[]): CommandEvidence[] {

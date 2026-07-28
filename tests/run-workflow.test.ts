@@ -265,7 +265,7 @@ describe('rijo run', () => {
               depends_on: [],
               parallel: false,
               tdd: false,
-              tests: ['npm run typecheck'],
+              tests: ['npm run typecheck', 'npm run test:e2e'],
               evidence_expected: 'The type check exits with status 0.',
             },
             {
@@ -294,8 +294,14 @@ describe('rijo run', () => {
           name: 'managed-install-fixture',
           version: '1.0.0',
           private: true,
-          scripts: { typecheck: 'tsc --noEmit' },
-          devDependencies: { typescript: '^5.9.0' },
+          scripts: {
+            typecheck: 'tsc --noEmit',
+            'test:e2e': 'playwright test',
+          },
+          devDependencies: {
+            '@playwright/test': '1.62.0',
+            typescript: '^5.9.0',
+          },
         }));
         return ok(task, {
           files_written: ['package.json'],
@@ -309,9 +315,13 @@ describe('rijo run', () => {
 
     expect(outcome.ok, outcome.message).toBe(true);
     const installIndex = d.shell.calls.indexOf('npm install --no-audit --no-fund');
+    const browserInstallIndex = d.shell.calls.indexOf('playwright install chromium');
     const typecheckIndex = d.shell.calls.indexOf('npm run typecheck');
+    const browserTestIndex = d.shell.calls.indexOf('npm run test:e2e');
     expect(installIndex).toBeGreaterThanOrEqual(0);
+    expect(browserInstallIndex).toBeGreaterThan(installIndex);
     expect(typecheckIndex).toBeGreaterThan(installIndex);
+    expect(browserTestIndex).toBeGreaterThan(browserInstallIndex);
     expect(d.shell.callOptions[installIndex]).toMatchObject({
       cwd: root,
       allowInstall: true,
@@ -1631,7 +1641,7 @@ describe('rijo run', () => {
         calls.push({ command, cwd, allowInstall: options.allowInstall });
         const implemented = fs.existsSync(path.join(cwd, 'src', 'feature.mjs'));
         const exit =
-          command === 'npm run test:unit'
+          command === 'npm run test:e2e'
             ? implemented
               ? 0
               : 1
@@ -1682,7 +1692,7 @@ describe('rijo run', () => {
             depends_on: ['T01'],
             parallel: false,
             tdd: true,
-            tests: ['npm run test:unit'],
+            tests: ['npm run test:e2e'],
             evidence_expected: 'The behavior test passes.',
             done: false,
           },
@@ -1697,8 +1707,11 @@ describe('rijo run', () => {
           JSON.stringify({
             name: 'later-tdd-dependency-fixture',
             private: true,
-            scripts: { 'test:unit': 'node --test test/feature.test.mjs' },
-            devDependencies: { typescript: '6.0.3' },
+            scripts: { 'test:e2e': 'playwright test' },
+            devDependencies: {
+              '@playwright/test': '1.62.0',
+              typescript: '6.0.3',
+            },
           }),
         );
         return ok(task, {
@@ -1743,10 +1756,16 @@ describe('rijo run', () => {
         call.cwd.includes('.rijo/runtime/workspaces/ws-tdd-red-01-T02-'),
     );
     expect(redInstall).toMatchObject({ allowInstall: true });
+    const redBrowserInstall = calls.find(
+      (call) =>
+        call.command === 'playwright install chromium' &&
+        call.cwd.includes('.rijo/runtime/workspaces/ws-tdd-red-01-T02-'),
+    );
+    expect(redBrowserInstall).toMatchObject({ allowInstall: true });
     expect(
       calls.some(
         (call) =>
-          call.command === 'npm run test:unit' &&
+          call.command === 'npm run test:e2e' &&
           call.cwd.includes('.rijo/runtime/workspaces/ws-tdd-red-01-T02-'),
       ),
     ).toBe(true);
