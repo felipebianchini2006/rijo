@@ -94,6 +94,7 @@ const identityFields = [
   'lease_id',
   'idempotency_key',
 ] as const;
+type NativeIdentity = Pick<NativeRequestV2, (typeof identityFields)[number]>;
 
 const nativeResultPendingText = 'native result bundle has no result for task';
 
@@ -181,9 +182,27 @@ export class NativeResultRunner implements AgentRunner {
   }
 
   replayAttempt(task: AgentTask): ReplayAttemptIdentity | null {
+    const candidates: NativeIdentity[] = [];
+    const usedRequestIds = new Set(
+      [...this.used].map((index) => this.entries[index]?.request_id).filter((id): id is string => Boolean(id)),
+    );
     for (let index = 0; index < this.entries.length; index++) {
       if (this.used.has(index)) continue;
       const entry = this.entries[index]!;
+      candidates.push(entry);
+    }
+    if (exists(this.requestFile)) {
+      for (const line of readText(this.requestFile).split(/\r?\n/).filter(Boolean)) {
+        try {
+          const parsed = NativeRequestV2Schema.safeParse(JSON.parse(line));
+          if (parsed.success && !usedRequestIds.has(parsed.data.request_id)) candidates.push(parsed.data);
+        } catch {
+          // Ignore a torn trailing request. No exact result can match it.
+        }
+      }
+    }
+
+    for (const entry of candidates.reverse()) {
       if (entry.logical_task_id !== task.id) continue;
       const attempt = {
         logical_task_id: entry.logical_task_id,

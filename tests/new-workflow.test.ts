@@ -117,6 +117,50 @@ describe('rijo new (greenfield)', () => {
     expect(correction?.notes).toContain('phases.0.requirement_indexes.0');
   });
 
+  it('uses a fresh bounded correction task for an invalid roadmap payload', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id === 'new-roadmap',
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'invalid roadmap',
+        files_written: [],
+        payload: {
+          phases: [{
+            name: 'Invalid phase',
+            requirement_indexes: ['invalid-index'],
+            depends_on_indexes: [],
+            ui_surface: 'web',
+          }],
+        },
+        scope_requests: [],
+      }),
+    );
+    d.runner.on(
+      (task) => task.id === 'new-roadmap-r1',
+      (task) => ({
+        task_id: task.id,
+        ok: true,
+        summary: 'corrected roadmap',
+        files_written: [],
+        payload: {
+          phases: EXTRACTION_PAYLOAD.phases,
+          rationale: 'Use the two observable vertical slices from the approved scope.',
+        },
+        scope_requests: [],
+      }),
+    );
+
+    const outcome = await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const correction = d.runner.executed.find((task) => task.id === 'new-roadmap-r1');
+    expect(correction?.notes).toContain('CORRECT THESE EXACT ERRORS');
+    expect(correction?.notes).toContain('phases.0.requirement_indexes.0');
+    expect(correction?.notes).toContain('rationale');
+  });
+
   it('refuses re-initialization without --next (non-destructive)', async () => {
     const d = deps(root);
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);

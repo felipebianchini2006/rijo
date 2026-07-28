@@ -284,17 +284,21 @@ export class Supervisor {
 
     const prior = this.store.read(logicalId);
     const replay = this.controller.replayAttempt?.(task) ?? null;
-    const resumesNativeRequest =
-      prior?.state === 'AWAITING_NATIVE_RESULT' &&
-      !prior.revoked_leases.includes(prior.lease_id);
-    const replaysValidatedNativeResult =
-      prior?.state === 'SUCCEEDED' &&
+    const replayMatchesPrior =
+      prior !== null &&
       replay !== null &&
       replay.logical_task_id === prior.logical_task_id &&
       replay.attempt_id === prior.attempt_id &&
       replay.generation === prior.generation &&
       replay.lease_id === prior.lease_id &&
-      replay.idempotency_key === prior.idempotency_key &&
+      replay.idempotency_key === prior.idempotency_key;
+    const resumesNativeRequest =
+      prior?.state === 'AWAITING_NATIVE_RESULT' &&
+      replayMatchesPrior &&
+      !prior.revoked_leases.includes(prior.lease_id);
+    const replaysValidatedNativeResult =
+      prior?.state === 'SUCCEEDED' &&
+      replayMatchesPrior &&
       !prior.revoked_leases.includes(prior.lease_id);
     const reusesNativeIdentity = resumesNativeRequest || replaysValidatedNativeResult;
     let generation = reusesNativeIdentity ? prior.generation : 1;
@@ -306,6 +310,18 @@ export class Supervisor {
         }
       : this.mkIdentity(logicalId, generation);
 
+    const supersededLeases =
+      prior?.state === 'AWAITING_NATIVE_RESULT' && !resumesNativeRequest
+        ? [...new Set([...prior.revoked_leases, prior.lease_id])]
+        : [];
+    if (supersededLeases.length > 0) {
+      this.store.emit(logicalId, 'native_identity_superseded', {
+        attempt_id: prior?.attempt_id,
+        generation: prior?.generation,
+        lease_id: prior?.lease_id,
+        reason: 'The task content changed before native result validation.',
+      });
+    }
     const initial = TaskRecordSchema.parse({
       logical_task_id: logicalId,
       attempt_id: identity.attempt_id,
@@ -320,6 +336,7 @@ export class Supervisor {
       canonical_baseline_hash: task.canonical_baseline ?? null,
       state: 'QUEUED',
       created_at: this.toIso(startedWall),
+      revoked_leases: supersededLeases,
     });
 
     const st: ActiveTask = {

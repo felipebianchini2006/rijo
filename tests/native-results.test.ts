@@ -147,6 +147,50 @@ describe('native result ingestion', () => {
     expect(replayed.lease_id).toBe(request.lease_id);
   });
 
+  it('fences a pending identity when task content changes before resume', async () => {
+    const root = tmpProject('rijo-native-changed-resume-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const task = AgentTaskSchema.parse({
+      id: 'plan-changed',
+      role: 'planner',
+      objective: 'Create the first bounded plan.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: [],
+      acceptance_criteria: ['The plan covers the phase.'],
+      verification_commands: [],
+      return_format: 'JSON plan payload.',
+    });
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 0,
+      replacement_backoff_ms: [],
+    };
+    await defaultExecutor(new NativeResultRunner(bundle), config, paths).run({ task, role: 'planner' });
+    const firstRequest = JSON.parse(
+      fs.readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8').trim(),
+    );
+
+    await defaultExecutor(new NativeResultRunner(bundle), config, paths).run({
+      task: { ...task, objective: 'Create the corrected bounded plan.' },
+      role: 'planner',
+    });
+
+    const requests = fs
+      .readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8')
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    expect(requests).toHaveLength(2);
+    expect(requests[1].request_id).not.toBe(firstRequest.request_id);
+    const record = new (await import('../src/supervisor/store.js')).TaskStore(paths).read(task.id);
+    expect(record?.revoked_leases).toContain(firstRequest.lease_id);
+    expect(record?.lease_id).toBe(requests[1].lease_id);
+  });
+
   it('rejects a v1 bundle in the native workflow', () => {
     const root = tmpProject('rijo-native-v1-');
     roots.push(root);

@@ -54,6 +54,7 @@ import {
   isWorkflowCancellation,
   type WorkflowDeps,
   type WorkflowOutcome,
+  type ValidatedAgentEnvelope,
 } from './shared.js';
 import { buildContextPacket, gapsAffectingScope } from '../codebase/context.js';
 import { readMapState } from '../codebase/state.js';
@@ -487,7 +488,7 @@ export async function newWorkflow(
     ];
     const toResearch = topics.filter((t) => !store.lookup(t.key));
     const cached = topics.filter((t) => store.lookup(t.key));
-    let researchSummaries: string[] = cached.map((t) => `- ${t.topic}: (cache) ${store.lookup(t.key)!.summary}`);
+    let researchSummaries: string[] = cached.map((t) => `- ${t.topic}: ${store.lookup(t.key)!.summary}`);
     if (toResearch.length > 0) {
       const tasks: AgentTaskDraft[] = toResearch.map((t, i) => ({
         id: `new-research-${i + 1}`,
@@ -631,7 +632,7 @@ export async function newWorkflow(
       ],
       verification_commands: [],
       return_format:
-        'JSON payload: {phases:[{name,requirement_indexes[],depends_on_indexes[],ui_surface}], rationale:string}.',
+        'JSON payload: {phases:[{name:string,requirement_indexes:number[],depends_on_indexes:number[],ui_surface:boolean}], rationale:string}.',
       notes: [
         `PROJECT: ${extraction.project_name}`,
         `SUMMARY: ${extraction.project_summary}`,
@@ -640,15 +641,38 @@ export async function newWorkflow(
         `RULES:\n${extraction.rules.join('\n')}`,
       ].join('\n\n'),
     };
-    const roadmapResult = await dispatch(ctx, roadmapTask, { stage: 'PLAN' });
-    const roadmapPayload = RoadmapPayloadSchema.safeParse(roadmapResult.payload);
-    if (!roadmapResult.ok || !roadmapPayload.success) {
+    let roadmapResult: ValidatedAgentEnvelope | null = null;
+    let roadmapPayload: z.SafeParseReturnType<unknown, z.infer<typeof RoadmapPayloadSchema>> | null = null;
+    let roadmapErrors: string[] = [];
+    for (let attempt = 0; attempt <= config.limits.plan_revisions; attempt++) {
+      const correctionNotes =
+        attempt === 0
+          ? roadmapTask.notes
+          : [
+              roadmapTask.notes,
+              'CORRECT THESE EXACT ERRORS:',
+              ...roadmapErrors.map((error) => `- ${error}`),
+            ].join('\n\n');
+      roadmapResult = await dispatch(
+        ctx,
+        {
+          ...roadmapTask,
+          id: attempt === 0 ? roadmapTask.id : `${roadmapTask.id}-r${attempt}`,
+          notes: correctionNotes,
+        },
+        { stage: 'PLAN' },
+      );
+      roadmapPayload = RoadmapPayloadSchema.safeParse(roadmapResult.payload);
+      if (roadmapResult.ok && roadmapPayload.success) break;
       discardDecisionProposals(ctx, roadmapResult);
+      roadmapErrors = roadmapPayload.success
+        ? [roadmapResult.summary]
+        : roadmapPayload.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`);
+    }
+    if (!roadmapResult || !roadmapPayload?.success || !roadmapResult.ok) {
       return failed(ctx, 'Independent roadmap generation failed.', [
-        roadmapResult.summary,
-        ...(roadmapPayload.success
-          ? []
-          : roadmapPayload.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`)),
+        roadmapResult?.summary ?? 'The roadmapper returned no result.',
+        ...roadmapErrors,
       ]);
     }
     const roadmapFidelity = validatePlanExtractionFidelity(planContent, {
