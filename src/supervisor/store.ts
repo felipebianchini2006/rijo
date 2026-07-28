@@ -80,20 +80,15 @@ export class TaskStore {
   }
 
   /**
-   * Requeue an existing terminal projection without erasing its identity
-   * history. This is deliberately narrower than `create`: exact SUCCEEDED
-   * native replay and a later workflow retry of a generation-1 failure are the
-   * only valid callers. A spent replacement budget can never be reopened.
+   * Requeue an exact SUCCEEDED native identity without erasing its history.
+   * EXHAUSTED is terminal for every replacement count and can never enter here.
    */
   requeueExisting(
     record: TaskRecord,
     patch: Partial<TaskRecord>,
     eventData: Record<string, unknown>,
   ): TaskRecord {
-    const allowed =
-      record.state === 'SUCCEEDED' ||
-      (record.state === 'EXHAUSTED' && record.replacement_count === 0);
-    if (!allowed) {
+    if (record.state !== 'SUCCEEDED') {
       throw new Error(
         `Supervised task ${record.logical_task_id} cannot be requeued from ${record.state}.`,
       );

@@ -572,6 +572,14 @@ export const PlanFreshnessSchema = z.object({
 });
 export type PlanFreshness = z.infer<typeof PlanFreshnessSchema>;
 
+/** Core-owned, portable proof that an independent review approved this task contract. */
+export const PortablePlanApprovalSchema = z.object({
+  schema_version: z.literal(1),
+  plan_contract_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  approved_at: z.string().datetime(),
+});
+export type PortablePlanApproval = z.infer<typeof PortablePlanApprovalSchema>;
+
 /** Planner-authored shape. Freshness is stamped by the deterministic core. */
 export const PhasePlanDraftSchema = z.object({
   phase: z.string(),
@@ -587,6 +595,7 @@ export type PhasePlanDraft = z.infer<typeof PhasePlanDraftSchema>;
 export const PhasePlanSchema = z.object({
   phase: z.string(),
   tasks: z.array(PlanTaskSchema).min(1).max(6),
+  approved_plan: PortablePlanApprovalSchema.optional(),
 }).merge(PlanFreshnessSchema);
 export type PhasePlan = z.infer<typeof PhasePlanSchema>;
 

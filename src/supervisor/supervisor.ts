@@ -342,7 +342,7 @@ export class Supervisor {
     const idempotencyKey = sha256(logicalId).slice(0, 32);
 
     const prior = this.store.read(logicalId);
-    if (prior?.state === 'EXHAUSTED' && prior.replacement_count > 0) {
+    if (prior?.state === 'EXHAUSTED') {
       return this.blockedResult(
         prior,
         prior.last_error ? [prior.last_error] : [],
@@ -382,13 +382,9 @@ export class Supervisor {
       prior?.state === 'REPLACING' &&
       prior.workspace_id === null &&
       prior.revoked_leases.includes(prior.lease_id);
-    const retriesUnreplacedFailure =
-      prior?.state === 'EXHAUSTED' && prior.replacement_count === 0;
     let generation = validationPrior
       ? validationPrior.generation + 1
       : resumesRecoveredReplacement
-        ? prior.generation + 1
-      : retriesUnreplacedFailure
         ? prior.generation + 1
       : supersedesAwaitingNativeRequest
         ? prior.generation + 1
@@ -407,8 +403,6 @@ export class Supervisor {
       ? [...new Set([...validationPrior.revoked_leases, validationPrior.lease_id])]
       : resumesRecoveredReplacement
         ? prior.revoked_leases
-      : retriesUnreplacedFailure
-        ? [...new Set([...prior.revoked_leases, prior.lease_id])]
       : supersedesAwaitingNativeRequest
         ? [...new Set([...prior.revoked_leases, prior.lease_id])]
         : [];
@@ -525,20 +519,6 @@ export class Supervisor {
               prior_generation: prior.generation,
               prior_lease_id: prior.lease_id,
               reason: 'task content changed before native result validation',
-            },
-          )
-      : retriesUnreplacedFailure
-        ? this.store.requeueExisting(
-            prior,
-            {
-              ...replacementPatch,
-              replacement_count: prior.replacement_count,
-              last_error: prior.last_error,
-            },
-            {
-              prior_attempt_id: prior.attempt_id,
-              prior_generation: prior.generation,
-              prior_lease_id: prior.lease_id,
             },
           )
       : resumesNativeRequest

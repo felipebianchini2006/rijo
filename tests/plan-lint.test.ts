@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
@@ -9,6 +10,8 @@ import {
   writePlan,
   readPlan,
   preserveEquivalentPlanProgress,
+  hasValidPortablePlanApproval,
+  planContractHash,
 } from '../src/core/plan.js';
 import { PlanTaskSchema, type PlanTask, type PhasePlan } from '../src/core/schemas/index.js';
 import { tmpProject, cleanup } from './helpers.js';
@@ -253,6 +256,29 @@ describe('setTaskStatus (task lifecycle)', () => {
       ),
     });
     expect(changed.tasks.every((candidate) => candidate.status === 'PENDING')).toBe(true);
+  });
+
+  it('carries approval provenance in PLAN.md across a clean-clone copy', () => {
+    const source = path.join(root, 'PLAN.md');
+    const base = persisted([task('T01'), task('T02'), task('T03')]);
+    const approved: PhasePlan = {
+      ...base,
+      approved_plan: {
+        schema_version: 1,
+        plan_contract_hash: planContractHash(base),
+        approved_at: '2026-07-24T00:00:00.000Z',
+      },
+    };
+    writePlan(source, approved, 'portable approval');
+    const cloneRoot = path.join(root, 'clean-clone');
+    const cloned = path.join(cloneRoot, 'PLAN.md');
+    fs.mkdirSync(cloneRoot);
+    fs.copyFileSync(source, cloned);
+
+    const reconstructed = readPlan(cloned);
+    expect(hasValidPortablePlanApproval(reconstructed)).toBe(true);
+    reconstructed.tasks[0]!.name = 'edited after approval';
+    expect(hasValidPortablePlanApproval(reconstructed)).toBe(false);
   });
 
   it('rejects skipping the lifecycle (PENDING → DONE is a core error)', () => {

@@ -16,6 +16,7 @@ import {
   parallelGroups,
   preserveEquivalentPlanProgress,
   planContractHash,
+  hasValidPortablePlanApproval,
 } from '../core/plan.js';
 import { validateStateIntegrity } from '../core/traceability.js';
 import { checkContextBudget } from '../core/contextBudget.js';
@@ -838,29 +839,50 @@ async function executePhase(
   let planApproved = false;
   const approvalTarget = planApprovalPath(ctx, milestone.id, phase.id);
   if (plan) {
-    const approval = PlanApprovalSchema.safeParse(readJsonIfExists<unknown>(approvalTarget));
+    const runtimeApproval = PlanApprovalSchema.safeParse(readJsonIfExists<unknown>(approvalTarget));
     const executionStarted = plan.tasks.some((task) => task.status !== 'PENDING');
-    if (approval.success) {
-      if (approval.data.plan_contract_hash !== planContractHash(plan)) {
+    const contractHash = planContractHash(plan);
+    if (plan.approved_plan) {
+      if (!hasValidPortablePlanApproval(plan)) {
         return blocked(ctx, `Phase ${phase.id}: the approved plan contract changed without invalidation.`, [
           'The durable task lifecycle was preserved. Explicitly invalidate the plan before changing task definitions.',
         ]);
       }
       planApproved = true;
+    } else if (
+      runtimeApproval.success &&
+      runtimeApproval.data.plan_contract_hash === contractHash
+    ) {
+      // One-time migration from the old runtime-only marker into PLAN.md.
+      plan = PhasePlanSchema.parse({
+        ...plan,
+        approved_plan: {
+          schema_version: 1,
+          plan_contract_hash: contractHash,
+          approved_at: runtimeApproval.data.approved_at,
+        },
+      });
+      writePlan(pp.plan, plan, `Generated for ${phase.name}.`);
+      touchManifest(paths, () => {}, now);
+      planApproved = true;
     } else if (executionStarted) {
-      // Compatibility/bootstrap path: execution is reachable only after review
-      // approval, so a legacy in-progress plan is already frozen.
+      return blocked(ctx, `Phase ${phase.id}: in-progress plan approval provenance is missing.`, [
+        'RIJO will not infer approval from mutable task statuses or the current plan hash.',
+        'Restore the approved PLAN.md artifact or explicitly invalidate and review the plan.',
+      ]);
+    }
+    if (planApproved) {
+      const approvedAt = plan.approved_plan!.approved_at;
       writeJsonAtomic(
         approvalTarget,
         PlanApprovalSchema.parse({
           schema_version: 1,
           milestone: milestone.id,
           phase: phase.id,
-          plan_contract_hash: planContractHash(plan),
-          approved_at: now().toISOString(),
+          plan_contract_hash: contractHash,
+          approved_at: approvedAt,
         }),
       );
-      planApproved = true;
     }
   }
   let revisions = 0;
@@ -1101,6 +1123,20 @@ async function executePhase(
       : [`Reviewer verdict (unstructured): ${reviewRes.summary}`];
     plan = null;
   }
+  if (!plan.approved_plan) {
+    plan = PhasePlanSchema.parse({
+      ...plan,
+      approved_plan: {
+        schema_version: 1,
+        plan_contract_hash: planContractHash(plan),
+        approved_at: now().toISOString(),
+      },
+    });
+    writePlan(pp.plan, plan, `Generated for ${phase.name}.`);
+    touchManifest(paths, () => {}, now);
+  }
+  const portableApproval = plan.approved_plan;
+  if (!portableApproval) throw new Error(`Phase ${phase.id}: approved plan provenance was not persisted.`);
   writeJsonAtomic(
     approvalTarget,
     PlanApprovalSchema.parse({
@@ -1108,7 +1144,7 @@ async function executePhase(
       milestone: milestone.id,
       phase: phase.id,
       plan_contract_hash: planContractHash(plan),
-      approved_at: now().toISOString(),
+      approved_at: portableApproval.approved_at,
     }),
   );
   if (planEnvelope) commitDecisionProposals(ctx, planEnvelope);

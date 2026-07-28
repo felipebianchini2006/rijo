@@ -65,6 +65,10 @@ export function planContractHash(plan: PhasePlan): string {
   );
 }
 
+export function hasValidPortablePlanApproval(plan: PhasePlan): boolean {
+  return plan.approved_plan?.plan_contract_hash === planContractHash(plan);
+}
+
 /**
  * Persist a validated lifecycle transition for one task. The `done` flag is
  * DERIVED (status === DONE) — it can never be flipped without walking the

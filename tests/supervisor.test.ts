@@ -724,4 +724,33 @@ describe('supervisor — crash recovery reconciliation', () => {
       createdBefore,
     );
   });
+
+  it('keeps EXHAUSTED terminal when zero replacements were configured across repeated calls', async () => {
+    const paths = tmpPaths();
+    writeRecord(paths, {
+      state: 'EXHAUSTED',
+      generation: 1,
+      replacement_count: 0,
+      last_error: 'generation 1 exhausted with replacement budget zero',
+      finished_at: new Date().toISOString(),
+    });
+    const store = new TaskStore(paths);
+    const before = store.read('exec-01-T01')!;
+    const createdBefore = store.readEvents('exec-01-T01').filter((event) => event.type === 'task_created').length;
+
+    for (let invocation = 0; invocation < 2; invocation++) {
+      const controller = new FakeController();
+      const { supervisor } = newSupervisor(controller, cfg({ max_replacements_per_task: 0 }), paths);
+      const result = await supervisor.superviseTask(makeTask());
+      expect(result.ok).toBe(false);
+      expect(result.summary).toContain('replacement budget already exhausted');
+      expect(controller.started).toHaveLength(0);
+    }
+
+    expect(store.read('exec-01-T01')).toEqual(before);
+    expect(store.readEvents('exec-01-T01').filter((event) => event.type === 'task_created')).toHaveLength(
+      createdBefore,
+    );
+    expect(store.readEvents('exec-01-T01').filter((event) => event.type === 'task_requeued')).toHaveLength(0);
+  });
 });

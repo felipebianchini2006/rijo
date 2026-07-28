@@ -4,10 +4,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
 import { runWorkflow } from '../src/workflows/run.js';
 import { RijoPaths } from '../src/core/paths.js';
-import { readManifest } from '../src/core/manifest.js';
+import { readManifest, touchManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
-import { planContractHash, readPlan } from '../src/core/plan.js';
+import { planContractHash, readPlan, writePlan } from '../src/core/plan.js';
 import { FakeShellRunner } from '../src/core/commands.js';
 import { defaultConfig } from '../src/core/config.js';
 import { TaskStore } from '../src/supervisor/store.js';
@@ -381,6 +381,16 @@ describe('rijo run', () => {
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const blockedRun = await runWorkflow(root, {}, d);
     expect(blockedRun.status).toBe('blocked');
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalog', 'PLAN.md');
+    const approved = readPlan(planPath);
+    expect(approved.approved_plan?.plan_contract_hash).toBe(planContractHash(approved));
+    const planReviewCount = d.runner.executed.filter((task) =>
+      task.id.startsWith('plan-review-01-'),
+    ).length;
+    fs.rmSync(path.join(root, '.rijo', 'runtime', 'plan-approvals'), {
+      recursive: true,
+      force: true,
+    });
 
     d.runner.on(
       (t) => t.id.startsWith('code-review-'),
@@ -388,8 +398,49 @@ describe('rijo run', () => {
     );
     const resumed = await runWorkflow(root, {}, d);
     expect(resumed.ok, resumed.message).toBe(true);
+    expect(
+      d.runner.executed.filter((task) => task.id.startsWith('plan-review-01-')).length,
+    ).toBe(planReviewCount);
     const implementation = d.git.commits.find((commit) => commit.message.includes('verified'))!;
     expect(implementation.paths).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts']));
+  });
+
+  it('blocks an edited in-progress plan when portable approval no longer matches', async () => {
+    const d = deps(root);
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) =>
+        ok(task, {
+          payload: {
+            approved: false,
+            findings: [
+              {
+                type: 'spec_gap',
+                severity: 'high',
+                description: 'pause after implementation',
+                file: null,
+              },
+            ],
+          },
+        }),
+    );
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    expect((await runWorkflow(root, {}, d)).status).toBe('blocked');
+
+    const planPath = path.join(milestoneDir(root), 'phases', '01-catalog', 'PLAN.md');
+    const edited = readPlan(planPath);
+    edited.tasks[0]!.name = 'silently edited task contract';
+    writePlan(planPath, edited, 'edited after approval');
+    touchManifest(new RijoPaths(root), () => {}, () => new Date());
+    fs.rmSync(path.join(root, '.rijo', 'runtime', 'plan-approvals'), {
+      recursive: true,
+      force: true,
+    });
+
+    const resumed = await runWorkflow(root, {}, d);
+    expect(resumed.status).toBe('blocked');
+    expect(resumed.message).toContain('approved plan contract changed without invalidation');
+    expect(readPlan(planPath).tasks[0]!.name).toBe('silently edited task contract');
   });
 
   it('blocks recovery when a task path changed after the isolated worker patch was applied', async () => {
@@ -703,7 +754,7 @@ describe('rijo run', () => {
     },
   );
 
-  it('resumes from the last verified checkpoint without repeating work', async () => {
+  it('does not recreate an exhausted task on a later workflow invocation', async () => {
     const d = deps(root);
     // T02 worker fails on the first run
     let failT02 = true;
@@ -726,10 +777,12 @@ describe('rijo run', () => {
     const execCountAfterFirst = d.runner.executed.filter((t) => t.id === 'exec-01-T01').length;
     const reviewCountAfterFirst = d.runner.executed.filter((t) => t.id.startsWith('plan-review-01-')).length;
     const approvedContract = planContractHash(readPlan(planPath));
+    const exhaustedBefore = new TaskStore(new RijoPaths(root)).read('exec-01-T02')!;
+    expect(exhaustedBefore.state).toBe('EXHAUSTED');
     failT02 = false;
     const second = await runWorkflow(root, {}, d);
-    expect(second.ok, second.message).toBe(true);
-    // T01 was NOT re-executed on resume (it was re-VERIFIED, never re-implemented)
+    expect(second.status).toBe('blocked');
+    // T01 was not re-executed while the exhausted T02 remained fenced.
     expect(d.runner.executed.filter((t) => t.id === 'exec-01-T01').length).toBe(execCountAfterFirst);
     // plan was not regenerated and no redundant spec task was dispatched
     expect(d.runner.executed.filter((t) => t.id === 'plan-01-r0').length).toBe(1);
@@ -737,9 +790,13 @@ describe('rijo run', () => {
       .toBe(reviewCountAfterFirst);
     expect(planContractHash(readPlan(planPath))).toBe(approvedContract);
     expect(d.runner.executed.some((t) => t.id.startsWith('spec-'))).toBe(false);
-    // both tasks reached DONE through the full lifecycle
-    const finalPlan = readPlan(planPath);
-    expect(finalPlan.tasks.every((t) => t.status === 'DONE' && t.done)).toBe(true);
+    const exhaustedAfter = new TaskStore(new RijoPaths(root)).read('exec-01-T02')!;
+    expect(exhaustedAfter).toEqual(exhaustedBefore);
+    expect(
+      new TaskStore(new RijoPaths(root))
+        .readEvents('exec-01-T02')
+        .filter((event) => event.type === 'task_created'),
+    ).toHaveLength(1);
   });
 
   it('parallel tasks with disjoint write scopes run in one batch; overlapping are serialized', async () => {
