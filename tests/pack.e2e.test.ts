@@ -84,7 +84,8 @@ describe('distribution E2E (npm pack + install)', () => {
       const status = JSON.parse(statusOut);
       expect(status.initialized).toBe(false);
       expect(status.rijo_version).toBe('0.2.0-rc.1');
-      expect(status.schema_version).toBe(3);
+      expect(status.schema_version).toBe(4);
+      expect(status.native_workflow).toBeNull();
 
       // ---- project binding: the public manifest and lock root use the exact
       // semantic version even though npm received a local package source.

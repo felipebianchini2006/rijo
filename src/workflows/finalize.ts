@@ -340,70 +340,72 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
     return finishOutcome(ctx, phase, marker.tested_commit);
   }
 
-  // ---- DONE-flips (idempotent). Observable requirement/roadmap/checkpoint DONE
-  // is only made PERMANENT by the marker's removal at the very end.
-  for (const t of readPlan(pp.plan).tasks) {
-    if (t.status === 'VERIFIED') {
-      bus.emit('task.transition', { message: `Task ${t.id} → DONE` }, { task: t.id, to: 'DONE' });
-      setTaskStatus(pp.plan, t.id, 'DONE');
+  // Once C2 is durable its tree is the authoritative pre-seal checkpoint.
+  // Rewriting DONE metadata after that commit would create a new uncommitted
+  // state that the deliberately narrow seal path cannot absorb.
+  if (!vcsEnabled || marker.evidence_commit === null) {
+    // ---- DONE-flips (idempotent). Observable requirement/roadmap/checkpoint DONE
+    // is only made PERMANENT by the marker's removal at the very end.
+    for (const t of readPlan(pp.plan).tasks) {
+      if (t.status === 'VERIFIED') {
+        bus.emit('task.transition', { message: `Task ${t.id} → DONE` }, { task: t.id, to: 'DONE' });
+        setTaskStatus(pp.plan, t.id, 'DONE');
+      }
     }
-  }
-  applyRequirementCompletion(milestone, pp, phase, readPlan(pp.plan));
-  markPhase('DONE', marker.tested_commit);
-  syncActiveProjectProjections(paths);
-  hooks.afterStep?.('roadmap');
-  checkpoint(`Phase ${phase.id} (${phase.name}) verified.`, {
-    task: null,
-    last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
-    last_commit: marker.tested_commit,
-    next_step: '$rijo start',
-    blocked: false,
-    blocked_reason: null,
-  });
-  hooks.afterStep?.('state');
+    applyRequirementCompletion(milestone, pp, phase, readPlan(pp.plan));
+    markPhase('DONE', marker.tested_commit);
+    syncActiveProjectProjections(paths);
+    hooks.afterStep?.('roadmap');
+    checkpoint(`Phase ${phase.id} (${phase.name}) verified.`, {
+      task: null,
+      last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
+      last_commit: marker.tested_commit,
+      next_step: '$rijo start',
+      blocked: false,
+      blocked_reason: null,
+    });
+    hooks.afterStep?.('state');
 
-  if (!vcsEnabled) {
-    // No VCS: DONE state on disk IS the completed form. Removal completes it.
-    markCodebasePathsStale(paths, marker.authorized_source, `verified phase ${phase.id}`, now);
-    removeFinalizeMarker(paths);
-    return finishOutcome(ctx, phase, null);
-  }
-
-  emitStage('COMMIT', 'Commit the authorized files for the verified phase.');
-
-  // ---- C1: code + phase state, no self-reference.
-  let c1 = marker.tested_commit;
-  if (c1 === null) {
-    hooks.afterStep?.('before_c1');
-    c1 = commitOrAdopt(ctx, marker.commit_message, marker.commit_paths);
-    if (!c1) {
-      return blocked(ctx, `Phase ${phase.id}: code commit (C1) failed while git commits are enabled.`, [
-        'The verified artifacts are on disk but the phase commit did not complete.',
-      ]);
+    if (!vcsEnabled) {
+      // No VCS: DONE state on disk IS the completed form. Removal completes it.
+      markCodebasePathsStale(paths, marker.authorized_source, `verified phase ${phase.id}`, now);
+      removeFinalizeMarker(paths);
+      return finishOutcome(ctx, phase, null);
     }
-    marker.tested_commit = c1;
-    marker.step = 'C1';
-    writeFinalizeMarker(paths, marker);
-    hooks.afterStep?.('after_c1');
-  }
 
-  // ---- Evidence metadata: point VERIFICATION/roadmap/state at C1.
-  writeVerificationCommit(pp, c1, null);
-  markPhase('DONE', c1);
-  syncActiveProjectProjections(paths);
-  checkpoint(`Phase ${phase.id} (${phase.name}) verified and committed.`, {
-    task: null,
-    last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
-    last_commit: c1,
-    next_step: '$rijo start',
-  });
+    emitStage('COMMIT', 'Commit the authorized files for the verified phase.');
 
-  // ---- C2: evidence pointing at C1 — only allowed metadata paths may change.
-  const c2Message = `rijo(${marker.milestone}-F${marker.phase}): evidence for ${c1.slice(0, 12)}`;
-  let c2 = marker.evidence_commit;
-  if (c2 === null) {
+    // ---- C1: code + phase state, no self-reference.
+    let c1 = marker.tested_commit;
+    if (c1 === null) {
+      hooks.afterStep?.('before_c1');
+      c1 = commitOrAdopt(ctx, marker.commit_message, marker.commit_paths);
+      if (!c1) {
+        return blocked(ctx, `Phase ${phase.id}: code commit (C1) failed while git commits are enabled.`, [
+          'The verified artifacts are on disk but the phase commit did not complete.',
+        ]);
+      }
+      marker.tested_commit = c1;
+      marker.step = 'C1';
+      writeFinalizeMarker(paths, marker);
+      hooks.afterStep?.('after_c1');
+    }
+
+    // ---- Evidence metadata: point VERIFICATION/roadmap/state at C1.
+    writeVerificationCommit(pp, c1, null);
+    markPhase('DONE', c1);
+    syncActiveProjectProjections(paths);
+    checkpoint(`Phase ${phase.id} (${phase.name}) verified and committed.`, {
+      task: null,
+      last_verified: `phase ${phase.id} @ ${now().toISOString()}`,
+      last_commit: c1,
+      next_step: '$rijo start',
+    });
+
+    // ---- C2: evidence pointing at C1 — only allowed metadata paths may change.
+    const c2Message = `rijo(${marker.milestone}-F${marker.phase}): evidence for ${c1.slice(0, 12)}`;
     hooks.afterStep?.('before_c2');
-    c2 = commitOrAdopt(ctx, c2Message, marker.allowed_evidence_paths);
+    const c2 = commitOrAdopt(ctx, c2Message, marker.allowed_evidence_paths);
     if (!c2) {
       return blocked(ctx, `Phase ${phase.id}: evidence commit (C2) failed.`, [
         `Code commit ${c1} exists but its evidence metadata is uncommitted.`,
@@ -413,6 +415,12 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
     marker.step = 'C2';
     writeFinalizeMarker(paths, marker);
     hooks.afterStep?.('after_c2');
+  }
+
+  const c1 = marker.tested_commit;
+  const c2 = marker.evidence_commit;
+  if (c1 === null || c2 === null) {
+    return blocked(ctx, `Phase ${phase.id}: finalization marker has incomplete commit progress.`, []);
   }
 
   // ---- Deterministic check: C1..C2 contains ONLY allowed evidence metadata.

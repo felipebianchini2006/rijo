@@ -10,6 +10,7 @@ import { readState } from '../src/core/state.js';
 import { planContractHash, readPlan, writePlan } from '../src/core/plan.js';
 import { FakeShellRunner } from '../src/core/commands.js';
 import { defaultConfig } from '../src/core/config.js';
+import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 import { TaskStore } from '../src/supervisor/store.js';
 import { tmpProject, cleanup, writePlanFile, deps, ok, phaseReqIds, newMappedReference } from './helpers.js';
 
@@ -828,16 +829,18 @@ describe('rijo run', () => {
     },
   );
 
-  it('does not recreate an exhausted task on a later workflow invocation', async () => {
+  it('keeps an exhausted task fenced in one epoch and retries it in a new explicit operation', async () => {
     const d = deps(root);
+    const firstEpoch = createWorkflowEpoch();
+    const firstOperation = { ...d, workflowEpoch: firstEpoch };
     // T02 worker fails on the first run
     let failT02 = true;
     d.runner.on(
       (t) => t.id === 'exec-01-T02' && failT02,
       (t) => ({ task_id: t.id, ok: false, summary: 'interrupted', files_written: [], payload: null, scope_requests: [] }),
     );
-    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
-    const first = await runWorkflow(root, {}, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, firstOperation);
+    const first = await runWorkflow(root, {}, firstOperation);
     expect(first.status).toBe('blocked');
     // T01's patch was applied but the phase never verified: the plan shows the
     // partial implementation WITHOUT promoting it to done.
@@ -853,9 +856,10 @@ describe('rijo run', () => {
     const approvedContract = planContractHash(readPlan(planPath));
     const exhaustedBefore = new TaskStore(new RijoPaths(root)).read('exec-01-T02')!;
     expect(exhaustedBefore.state).toBe('EXHAUSTED');
+    expect(exhaustedBefore.workflow_epoch).toBe(firstEpoch);
     failT02 = false;
-    const second = await runWorkflow(root, {}, d);
-    expect(second.status).toBe('blocked');
+    const sameOperation = await runWorkflow(root, {}, firstOperation);
+    expect(sameOperation.status).toBe('blocked');
     // T01 was not re-executed while the exhausted T02 remained fenced.
     expect(d.runner.executed.filter((t) => t.id === 'exec-01-T01').length).toBe(execCountAfterFirst);
     // plan was not regenerated and no redundant spec task was dispatched
@@ -864,13 +868,53 @@ describe('rijo run', () => {
       .toBe(reviewCountAfterFirst);
     expect(planContractHash(readPlan(planPath))).toBe(approvedContract);
     expect(d.runner.executed.some((t) => t.id.startsWith('spec-'))).toBe(false);
-    const exhaustedAfter = new TaskStore(new RijoPaths(root)).read('exec-01-T02')!;
-    expect(exhaustedAfter).toEqual(exhaustedBefore);
+    const exhaustedInSameEpoch = new TaskStore(new RijoPaths(root)).read('exec-01-T02')!;
+    expect(exhaustedInSameEpoch).toEqual(exhaustedBefore);
     expect(
       new TaskStore(new RijoPaths(root))
         .readEvents('exec-01-T02')
         .filter((event) => event.type === 'task_created'),
     ).toHaveLength(1);
+
+    // A new public operation has a new epoch and may retry the unfinished task
+    // from generation one without replaying already implemented T01.
+    const secondEpoch = createWorkflowEpoch();
+    const newOperation = await runWorkflow(
+      root,
+      {},
+      { ...d, workflowEpoch: secondEpoch },
+    );
+    expect(newOperation.ok, newOperation.message).toBe(true);
+    expect(secondEpoch).not.toBe(firstEpoch);
+    expect(d.runner.executed.filter((t) => t.id === 'exec-01-T01').length).toBe(execCountAfterFirst);
+    expect(d.runner.executed.filter((t) => t.id === 'exec-01-T02')).toHaveLength(2);
+
+    const store = new TaskStore(new RijoPaths(root));
+    expect(store.readArchived('exec-01-T02', firstEpoch)).toEqual(exhaustedBefore);
+    expect(store.read('exec-01-T02')).toMatchObject({
+      workflow_epoch: secondEpoch,
+      state: 'SUCCEEDED',
+      generation: 1,
+      replacement_count: 0,
+    });
+    expect(
+      store
+        .readEvents('exec-01-T02')
+        .filter((event) => event.type === 'task_created'),
+    ).toHaveLength(1);
+    expect(
+      store
+        .readEvents('exec-01-T02')
+        .filter((event) => event.type === 'workflow_epoch_rolled_over'),
+    ).toEqual([
+      expect.objectContaining({
+        workflow_epoch: secondEpoch,
+        data: expect.objectContaining({
+          prior_workflow_epoch: firstEpoch,
+          prior_state: 'EXHAUSTED',
+        }),
+      }),
+    ]);
   });
 
   it('parallel tasks with disjoint write scopes run in one batch; overlapping are serialized', async () => {
