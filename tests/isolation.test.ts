@@ -261,6 +261,17 @@ describe('task lifecycle interruption at each transition', () => {
       },
     };
     const d2 = { ...d, shell };
+    d.runner.on(
+      (task) => task.id.startsWith('verify-fix-'),
+      (task) => {
+        const target = path.join(task.workspace!.root, 'src', 'a.ts');
+        fs.appendFileSync(target, `// ${task.id}\n`);
+        return ok(task, {
+          files_written: ['src/a.ts'],
+          payload: { done: true, notes: 'Applied a bounded verification repair.' },
+        });
+      },
+    );
     await newWorkflow(root, { planFile: '@PLAN.md' }, d2);
     const first = await runWorkflow(root, {}, d2);
     expect(first.status).toBe('blocked');

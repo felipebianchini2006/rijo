@@ -61,7 +61,7 @@ describe('rijo fix', () => {
     expect(record).toContain('status: DONE');
     expect(record).toContain('Root cause');
     expect(record).toContain('tests/checkout-empty.test.ts');
-    expect(record).toContain('`echo run-regression` exit 0');
+    expect(record).toContain('`node --version` exit 0');
     // atomic commit created
     expect(d.git.commits.some((c) => c.message.startsWith('rijo(fix):'))).toBe(true);
     // did NOT create a phase (no hidden rijo run)
