@@ -12,14 +12,17 @@ decisions and implement bounded tasks.
 
 ## Status
 
-The current release is `0.1.0-alpha.1`.
+The current release candidate is `0.2.0-rc.1`.
 
-Use this alpha release with human review of generated commits. See
-[docs/readiness.md](docs/readiness.md) for the current readiness record.
+Do not use this release candidate for unattended client delivery.
+The deterministic macOS gates pass.
+The final native host certification is incomplete.
+See [docs/readiness.md](docs/readiness.md) for the current readiness record.
 
 ## Requirements
 
-- Node.js 22 or later. Node.js 24 Long-Term Support is recommended.
+- macOS.
+- Node.js 22 or Node.js 24.
 - Git.
 - Codex or Claude Code with native subagent support.
 
@@ -29,7 +32,7 @@ Install RIJO as a local development dependency. This keeps the package version
 in your lockfile.
 
 ```bash
-npm install --save-dev rijo@alpha
+npm install --save-dev rijo@0.2.0-rc.1
 ```
 
 Install the native skill:
