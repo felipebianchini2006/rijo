@@ -87,6 +87,19 @@ export function nativeSandboxAvailable(): boolean {
   return process.platform === 'darwin' && fs.existsSync('/usr/bin/sandbox-exec');
 }
 
+function scratchScope(cwd: string): string {
+  const resolvedCwd = path.resolve(cwd);
+  const runtimeMarker = `${path.sep}.rijo${path.sep}runtime${path.sep}`;
+  const markerIndex = resolvedCwd.indexOf(runtimeMarker);
+  if (markerIndex === -1) return resolvedCwd;
+
+  const runtimePath = resolvedCwd.slice(markerIndex + runtimeMarker.length);
+  const gateDirectory = runtimePath.split(path.sep)[0];
+  if (!gateDirectory?.startsWith('gate-')) return resolvedCwd;
+
+  return fs.realpathSync(resolvedCwd.slice(0, markerIndex));
+}
+
 function classify(executable: string, args: string[]): { trust: CommandTrust; network: NetworkPolicy } {
   const sub = args.find((a) => !a.startsWith('-')) ?? args[0] ?? '';
   const known = KNOWN_SCRIPT.find((k) => k.exe === executable && (k.sub === undefined || k.sub === sub || args[0] === k.sub));
@@ -104,7 +117,7 @@ function classify(executable: string, args: string[]): { trust: CommandTrust; ne
 export function buildEnv(cwd: string, config: ExecutionConfig): Record<string, string> {
   // scratch HOME/TMPDIR live OUTSIDE the workspace tree (system tmp) so the
   // sandbox leaves no residue in the checkout — a clean tree stays clean.
-  const digest = createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 12);
+  const digest = createHash('sha256').update(scratchScope(cwd)).digest('hex').slice(0, 12);
   const scratchHome = path.join(os.tmpdir(), 'rijo-sbx', digest);
   fs.mkdirSync(path.join(scratchHome, 'tmp'), { recursive: true });
   const nodeDir = path.dirname(process.execPath);

@@ -136,6 +136,44 @@ describe('environment reconstruction', () => {
     }
   });
 
+  it('shares the browser cache between gate worktrees for one project', () => {
+    const gateOne = path.join(root, '.rijo', 'runtime', 'gate-one');
+    const gateTwo = path.join(root, '.rijo', 'runtime', 'gate-two');
+    fs.mkdirSync(gateOne, { recursive: true });
+    fs.mkdirSync(gateTwo, { recursive: true });
+
+    expect(buildEnv(gateOne, config)['PLAYWRIGHT_BROWSERS_PATH']).toBe(
+      buildEnv(gateTwo, config)['PLAYWRIGHT_BROWSERS_PATH'],
+    );
+  });
+
+  it('does not share the browser cache between projects', () => {
+    const otherRoot = tmpProject('rijo-env-other-');
+    try {
+      const gateOne = path.join(root, '.rijo', 'runtime', 'gate-one');
+      const gateTwo = path.join(otherRoot, '.rijo', 'runtime', 'gate-two');
+      fs.mkdirSync(gateOne, { recursive: true });
+      fs.mkdirSync(gateTwo, { recursive: true });
+
+      expect(buildEnv(gateOne, config)['PLAYWRIGHT_BROWSERS_PATH']).not.toBe(
+        buildEnv(gateTwo, config)['PLAYWRIGHT_BROWSERS_PATH'],
+      );
+    } finally {
+      cleanup(otherRoot);
+    }
+  });
+
+  it('keeps ordinary working directories isolated', () => {
+    const first = path.join(root, 'first');
+    const second = path.join(root, 'second');
+    fs.mkdirSync(first);
+    fs.mkdirSync(second);
+
+    expect(buildEnv(first, config)['PLAYWRIGHT_BROWSERS_PATH']).not.toBe(
+      buildEnv(second, config)['PLAYWRIGHT_BROWSERS_PATH'],
+    );
+  });
+
   it('flags credential-looking names', () => {
     for (const name of ['GITHUB_TOKEN', 'NPM_TOKEN', 'SSH_AUTH_SOCK', 'MY_API_KEY', 'DB_PASSWORD', 'AWS_PROFILE']) {
       expect(isSecretEnvName(name), name).toBe(true);
