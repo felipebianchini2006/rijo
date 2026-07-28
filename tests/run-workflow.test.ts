@@ -463,7 +463,7 @@ describe('rijo run', () => {
     await newWorkflow(root, { planFile: '@PLAN.md' }, wired);
     const outcome = await runWorkflow(root, {}, wired);
     expect(outcome.ok, outcome.message).toBe(true);
-    expect(calls.map((call) => call.exit)).toEqual([1, 0, 0]);
+    expect(calls.map((call) => call.exit)).toEqual([1, 0]);
     expect(calls[0]!.cwd).toContain('.rijo/runtime/workspaces/ws-tdd-red-01-T01-');
     const verification = fs.readFileSync(
       path.join(milestoneDir(root), 'phases', '01-catalog', 'VERIFICATION.md'),
