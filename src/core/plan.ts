@@ -67,6 +67,13 @@ export function lintPlan(
 ): PlanLintIssue[] {
   const issues: PlanLintIssue[] = [];
   const ids = new Set(plan.tasks.map((t) => t.id));
+  if (plan.tasks.length < 3 || plan.tasks.length > 6) {
+    issues.push({
+      code: 'TASK_COUNT',
+      message: `The phase plan has ${plan.tasks.length} tasks. A phase plan requires three to six bounded tasks`,
+      fix: 'Create three to six natural tasks. Do not add artificial tasks',
+    });
+  }
   if (ids.size !== plan.tasks.length) {
     issues.push({ code: 'DUP_TASK_ID', message: 'Duplicate task IDs', fix: 'Give each task a unique T## id' });
   }

@@ -64,9 +64,27 @@ describe('native RIJO product surface', () => {
       path.join(skillRoot, 'references', 'native-results.md'),
       'utf8',
     );
-    for (const field of ['task_id', 'ok', 'summary', 'payload', 'files', 'scope_requests']) {
+    for (const field of [
+      'request_id',
+      'request_hash',
+      'logical_task_id',
+      'attempt_id',
+      'generation',
+      'lease_id',
+      'idempotency_key',
+      'ok',
+      'summary',
+      'payload',
+      'files',
+      'scope_requests',
+      'decision_proposals',
+      'artifacts',
+    ]) {
       expect(nativeResults).toContain(`"${field}"`);
     }
+    expect(nativeResults).toContain('"version": 2');
+    expect(nativeResults).not.toContain('"version": 1');
+    expect(nativeResults).not.toContain('match_prefix');
     expect(nativeResults).toContain('Put the structured return value in `payload`.');
     expect(nativeResults).toContain('Do not encode the payload in `summary`.');
     expect(nativeResults).toContain('Do not invoke Python, Go, or Rust.');
@@ -120,6 +138,7 @@ describe('native RIJO product surface', () => {
       expect(source).toMatch(/^model:/m);
       expect(source).toMatch(/^effort:/m);
       expect(source).toMatch(/^maxTurns:/m);
+      expect(source).toMatch(/^background: true$/m);
       expect(source).toMatch(/^skills:/m);
       expect(source).toMatch(/^hooks:/m);
       if (agent === 'rijo-worker') {
@@ -145,7 +164,7 @@ describe('native RIJO product surface', () => {
         expect(source).not.toMatch(/^tools:/m);
       }
       expect(source).not.toContain('command: "rijo internal lifecycle');
-      expect(source).toContain('native-hooks.jsonl');
+      expect(source).toContain('node .rijo/bin/rijo.cjs internal lifecycle-hook');
     }
   });
 

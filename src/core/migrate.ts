@@ -26,13 +26,15 @@ export class MigrationError extends Error {
  * interrupted migration is re-runnable (the version stamp only advances after
  * every artifact has been rewritten).
  *
- * v1/v2/v3 → v4:
+ * v1/v2/v3/v4 → v5:
  *  - PLAN.md tasks gain `status` (derived from the legacy `done` flag);
  *  - legacy task files are explicitly migrated to intent-bearing references;
  *  - legacy plans receive an invalid freshness stamp, forcing safe re-planning;
  *  - config.yml receives the v4 stamp; the autonomous decision policy and
  *    codebase-map defaults materialize deterministically through ConfigSchema;
- *  - manifest.schema_version becomes 4.
+ *  - every legacy plan receives a new invalid freshness stamp so the workflow
+ *    creates a bounded three-to-six-task plan before execution;
+ *  - manifest.schema_version becomes 5.
  */
 export function migrateProject(paths: RijoPaths, now: () => Date = () => new Date()): MigrationReport {
   const manifest = readJsonIfExists<{ schema_version?: number }>(paths.manifest);
@@ -102,18 +104,16 @@ export function migrateProject(paths: RijoPaths, now: () => Date = () => new Dat
         });
       }
     }
-    const invalidationSeed = sha256(`legacy-plan-migration\0${path.relative(paths.root, planPath)}`);
+    const invalidationSeed = sha256(`schema-v${SCHEMA_VERSION}-plan-migration\0${path.relative(paths.root, planPath)}`);
     data['mapped_commit'] = typeof data['mapped_commit'] === 'string' ? data['mapped_commit'] : 'legacy-unmapped';
-    data['mapped_tree_hash'] = typeof data['mapped_tree_hash'] === 'string' ? data['mapped_tree_hash'] : invalidationSeed;
+    data['mapped_tree_hash'] = invalidationSeed;
     data['planned_at'] = typeof data['planned_at'] === 'string' ? data['planned_at'] : now().toISOString();
-    data['context_packet_hash'] =
-      typeof data['context_packet_hash'] === 'string' ? data['context_packet_hash'] : invalidationSeed;
+    data['context_packet_hash'] = invalidationSeed;
     data['mapped_reference_hashes'] =
       data['mapped_reference_hashes'] && typeof data['mapped_reference_hashes'] === 'object'
         ? data['mapped_reference_hashes']
         : {};
-    data['decision_context_hash'] =
-      typeof data['decision_context_hash'] === 'string' ? data['decision_context_hash'] : invalidationSeed;
+    data['decision_context_hash'] = invalidationSeed;
     writeFileAtomic(planPath, serializeFrontmatter(data, body));
     changed.push(planPath);
   }

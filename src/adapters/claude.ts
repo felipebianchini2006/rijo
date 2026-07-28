@@ -206,6 +206,7 @@ export function generateClaudeAdapter(projectRoot: string, options: ClaudeAdapte
       `tier: ${tierName}`,
       `model: ${resolved.model}`,
       `maxTurns: ${maxTurns}`,
+      'background: true',
       `tools: [${profile.default_tools.join(', ')}]`,
       `disallowedTools: [${disallowedTools.join(', ')}]`,
       `permissionMode: ${permissionMode}`,
@@ -282,6 +283,7 @@ function renderNativeClaudeAgent(agent: NativeClaudeAgent, tier: string, model: 
     `model: ${model}`,
     `effort: ${agent.effort}`,
     `maxTurns: ${agent.maxTurns}`,
+    'background: true',
     'skills: [rijo]',
     `permissionMode: ${agent.readOnly ? 'plan' : 'acceptEdits'}`,
   ];
@@ -301,13 +303,7 @@ function renderNativeClaudeAgent(agent: NativeClaudeAgent, tier: string, model: 
 }
 
 function renderLifecycleHook(event: string): string[] {
-  const script = [
-    "const fs=require('node:fs');",
-    "const directory='.rijo/runtime';",
-    'fs.mkdirSync(directory,{recursive:true});',
-    `fs.appendFileSync(directory+'/native-hooks.jsonl',JSON.stringify({event:${JSON.stringify(event)},at:new Date().toISOString()})+'\\n');`,
-  ].join('');
-  const command = `node -e ${JSON.stringify(script)}`;
+  const command = `node .rijo/bin/rijo.cjs internal lifecycle-hook ${event}`;
   return [
     `  ${event}:`,
     '    - hooks:',

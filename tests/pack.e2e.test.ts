@@ -62,14 +62,33 @@ describe('distribution E2E (npm pack + install)', () => {
 
       // ---- rijo --version
       const version = execSync(`node "${cliEntry}" --version`, { cwd: fixture, encoding: 'utf8' });
-      expect(version.trim()).toBe('0.1.0-alpha.1');
+      expect(version.trim()).toBe('0.2.0-rc.1');
 
       // ---- rijo --status --json on the uninitialized fixture
       const statusOut = execSync(`node "${cliEntry}" --status --json`, { cwd: fixture, encoding: 'utf8' });
       const status = JSON.parse(statusOut);
       expect(status.initialized).toBe(false);
-      expect(status.rijo_version).toBe('0.1.0-alpha.1');
+      expect(status.rijo_version).toBe('0.2.0-rc.1');
       expect(status.schema_version).toBe(3);
+
+      // ---- project binding: install the tarball as an exact development
+      // dependency, create the lock, and execute only through the local
+      // version-validating launcher.
+      fs.writeFileSync(
+        path.join(fixture, 'bind-check.mjs'),
+        [
+          "import { installProjectDependency } from 'rijo';",
+          'installProjectDependency(process.cwd(), { packageSpec: process.argv[2] });',
+        ].join('\n'),
+      );
+      execSync(`node bind-check.mjs "${tarball}"`, { cwd: fixture, encoding: 'utf8' });
+      const boundManifest = JSON.parse(fs.readFileSync(path.join(fixture, 'package.json'), 'utf8'));
+      expect(boundManifest.devDependencies.rijo).toBe('0.2.0-rc.1');
+      const localVersion = execSync('node .rijo/bin/rijo.cjs --version', {
+        cwd: fixture,
+        encoding: 'utf8',
+      });
+      expect(localVersion.trim()).toBe('0.2.0-rc.1');
 
       // ---- P0.2: the published programmatic API is importable from the tarball.
       // The audit reproduced ERR_MODULE_NOT_FOUND here before package "exports"

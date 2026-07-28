@@ -9,6 +9,7 @@ import {
 import { AgentTaskSchema } from '../src/agents/protocol.js';
 import { detectDrift } from '../src/core/manifest.js';
 import { RijoPaths } from '../src/core/paths.js';
+import { runCli } from '../src/cli/main.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { startWorkflow } from '../src/workflows/run.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
@@ -82,6 +83,33 @@ describe('native result ingestion', () => {
     const bundle = path.join(root, 'results.json');
     fs.writeFileSync(bundle, JSON.stringify({ version: 1, results: [] }));
     expect(() => new NativeResultRunner(bundle)).toThrow(NativeProtocolUpgradeError);
+  });
+
+  it('archives a v1 helper bundle and regenerates an exact v2 request', async () => {
+    const root = tmpProject('rijo-native-v1-upgrade-');
+    roots.push(root);
+    writePlanFile(root, 'PLAN.md', '# Plan\n\nCreate one local TypeScript file.\n');
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 1, results: [] }));
+
+    await expect(
+      runCli(
+        ['internal', 'project-init', '@PLAN.md', '--results', '@results.json'],
+        deps(root),
+        root,
+      ),
+    ).rejects.toThrow('NATIVE_RESULT_REQUIRED');
+
+    expect(JSON.parse(fs.readFileSync(bundle, 'utf8')).version).toBe(2);
+    const archiveDir = path.join(root, '.rijo', 'runtime', 'native-v1-archive');
+    const archives = fs.readdirSync(archiveDir);
+    expect(archives).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(archiveDir, archives[0]!), 'utf8')).version).toBe(1);
+    const request = JSON.parse(
+      fs.readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8').trim(),
+    );
+    expect(request.logical_task_id).toBe('new-extract');
+    expect(request.request_id).toMatch(/^nreq_[a-f0-9]{64}$/);
   });
 
   it('does not create plan correction requests before the native host returns a result', async () => {

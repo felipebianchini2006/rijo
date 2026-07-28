@@ -1,4 +1,4 @@
-export const STATE_SCHEMA_VERSION = 2;
+export const STATE_SCHEMA_VERSION = 3;
 
 export type DurableRunStatus =
   | 'CREATED'

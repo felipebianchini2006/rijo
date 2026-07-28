@@ -33,11 +33,20 @@ Allow at most two correction cycles.
 ## EXECUTE
 
 Create a durable task record before delegation.
+Run `node .rijo/bin/rijo.cjs internal task-dispatch @<native-request-file>`.
 Use one fresh native subagent for each task.
 Use worktree isolation for writers when available.
+Record the host handle with `task-start`.
+Record useful progress with `task-observe`.
+Record the terminal event with `task-complete` or `task-fail`.
 Record completion or failure.
 Fence stale results.
 Replace failed tasks only within the configured budget.
+Use the host inspect, wait, and interrupt capabilities when they exist.
+Request cancellation after a hard timeout when the host supports it.
+Record `task-cancelled` only after the host confirms cancellation.
+Record `task-cancel-unavailable` when the host cannot cancel the task.
+Revoke the old lease before a replacement attempt.
 Read `native-results.md`.
 Put each bounded native result in the phase result bundle.
 
@@ -53,6 +62,8 @@ Use `node .rijo/bin/rijo.cjs internal safe-command --loopback -- COMMAND` when a
 Read `engineering-review.md`.
 Use an independent native reviewer.
 Allow at most two repair cycles.
+Use a separate security reviewer only for a high-risk change.
+Treat authentication, permissions, money, secrets, uploads, data destruction, and trust boundaries as high risk.
 Run the framework-owned UI smoke after engineering review.
 
 ## PHASE_DONE

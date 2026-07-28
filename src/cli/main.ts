@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { parseArgs } from 'node:util';
 import { RijoPaths } from '../core/paths.js';
-import { appendLine, ensureDir, readJson } from '../core/fsx.js';
+import { appendLine, ensureDir, readJson, writeFileAtomic, writeJsonAtomic } from '../core/fsx.js';
 import { TaskRecordSchema, type TaskRecord } from '../core/schemas/index.js';
 import { readStatus, renderStatusLine, stderrSink } from '../core/progress.js';
 import { readState } from '../core/state.js';
@@ -33,6 +33,7 @@ import {
 } from '../install/index.js';
 import {
   NativeRequestV2Schema,
+  NativeProtocolUpgradeError,
   NativeResultRunner,
 } from '../agents/native-results.js';
 import {
@@ -264,6 +265,35 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         appendLine(
           path.join(paths.runtimeDir, 'native-hooks.jsonl'),
           JSON.stringify({ event, at: new Date().toISOString() }),
+        );
+        return 0;
+      }
+      if (helper === 'lifecycle-hook') {
+        const event = helperArgs[0];
+        const allowed = new Set([
+          'SubagentStart',
+          'Stop',
+          'SubagentStop',
+          'StopFailure',
+          'WorktreeRemove',
+        ]);
+        if (!event || helperArgs.length > 1 || !allowed.has(event)) {
+          return usage('rijo internal lifecycle-hook SubagentStart|Stop|SubagentStop|StopFailure|WorktreeRemove');
+        }
+        const input = readHookInput();
+        const paths = new RijoPaths(cwd);
+        ensureDir(paths.runtimeDir);
+        appendLine(
+          path.join(paths.runtimeDir, 'native-hooks.jsonl'),
+          JSON.stringify({
+            event,
+            at: new Date().toISOString(),
+            hook_event_name: stringField(input, 'hook_event_name'),
+            session_id: stringField(input, 'session_id'),
+            agent_id: stringField(input, 'agent_id'),
+            agent_type: stringField(input, 'agent_type'),
+            worktree_path: stringField(input, 'worktree_path'),
+          }),
         );
         return 0;
       }
@@ -517,7 +547,43 @@ async function withNativeResults(
 ): Promise<number> {
   const file = path.resolve(cwd, resultFile.replace(/^@/, ''));
   if (!fs.existsSync(file)) return usage(`native result bundle not found: ${resultFile}`);
-  return withNative(cwd, { ...deps, runner: new NativeResultRunner(file) }, body);
+  let runner: NativeResultRunner;
+  try {
+    runner = new NativeResultRunner(file);
+  } catch (error) {
+    if (!(error instanceof NativeProtocolUpgradeError)) throw error;
+    const paths = new RijoPaths(cwd);
+    const archiveDir = path.join(paths.runtimeDir, 'native-v1-archive');
+    ensureDir(archiveDir);
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '');
+    const archive = path.join(archiveDir, `${path.basename(file, path.extname(file))}-${stamp}.json`);
+    writeFileAtomic(archive, fs.readFileSync(file, 'utf8'));
+    writeJsonAtomic(file, {
+      version: 2,
+      request_file: 'native-requests.jsonl',
+      capabilities: { subagents: true, parallelism: false, browser: false },
+      results: [],
+    });
+    console.error(`rijo: archived a native v1 bundle at ${path.relative(cwd, archive)} and created a v2 bundle.`);
+    runner = new NativeResultRunner(file);
+  }
+  return withNative(cwd, { ...deps, runner }, body);
+}
+
+function readHookInput(): Record<string, unknown> {
+  if (process.stdin.isTTY) return {};
+  try {
+    const text = fs.readFileSync(0, 'utf8').slice(0, 1_048_576);
+    const parsed = text ? JSON.parse(text) : {};
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function stringField(input: Record<string, unknown>, key: string): string | null {
+  const value = input[key];
+  return typeof value === 'string' ? value.slice(0, 4_096) : null;
 }
 
 function extractNativeResultsFlag(args: string[]): { resultFile: string | null; args: string[] } {

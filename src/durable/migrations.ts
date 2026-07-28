@@ -299,6 +299,14 @@ CREATE INDEX IF NOT EXISTS checkpoints_kind_sequence_idx
   ON checkpoints(kind, event_sequence);
 `.trim(),
   },
+  {
+    version: 3,
+    name: 'native-attempt-identity-index',
+    sql: `
+CREATE INDEX IF NOT EXISTS attempts_native_identity_idx
+  ON agent_attempts(logical_task_id, generation, lease_id);
+`.trim(),
+  },
 ];
 
 if (STATE_MIGRATIONS.at(-1)?.version !== STATE_SCHEMA_VERSION) {

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * A boolean field an LLM fills that may arrive as a string ("true"/"false"/
@@ -573,8 +573,15 @@ export const PhasePlanDraftSchema = z.object({
 });
 export type PhasePlanDraft = z.infer<typeof PhasePlanDraftSchema>;
 
-/** Persisted PLAN.md shape. Every plan is tied to one exact map/context. */
-export const PhasePlanSchema = PhasePlanDraftSchema.merge(PlanFreshnessSchema);
+/**
+ * Persisted plans accept a smaller legacy task set during migration.
+ * New planner output still requires three to six tasks.
+ * Schema v5 invalidates legacy freshness and creates a new bounded plan.
+ */
+export const PhasePlanSchema = z.object({
+  phase: z.string(),
+  tasks: z.array(PlanTaskSchema).min(1).max(6),
+}).merge(PlanFreshnessSchema);
 export type PhasePlan = z.infer<typeof PhasePlanSchema>;
 
 export const PhaseStatusSchema = z.enum(['PENDING', 'IN_PROGRESS', 'DONE', 'BLOCKED']);

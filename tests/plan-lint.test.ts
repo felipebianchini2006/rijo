@@ -114,6 +114,7 @@ describe('lintPlan', () => {
       tasks: [
         task('T01', { requirement_ids: ['M001-REQ-001'], technical_justification: null }),
         task('T02', { requirement_ids: ['M001-REQ-002'], depends_on: ['T01'], technical_justification: null }),
+        task('T03', { requirement_ids: [], depends_on: ['T02'], technical_justification: 'integration boundary' }),
       ],
     };
     expect(lintPlan(plan, { knownRequirements: known })).toEqual([]);
