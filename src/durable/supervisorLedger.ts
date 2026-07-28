@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { canonicalJson, sha256 } from './canonical.js';
-import { recoverSqliteState } from './recovery.js';
-import { SqliteStateStore } from './sqliteStore.js';
+import { recoverDurableState } from './factory.js';
+import type { StateStore } from './types.js';
 import {
   killProcessTree,
   processGroupAlive,
@@ -28,13 +28,23 @@ export interface EngineSupervisorReceipt {
   data?: Record<string, unknown>;
 }
 
+interface EngineLedgerStateStore extends StateStore {
+  acquireNamedLock(name: string, ownerId: string, pid: number): Promise<boolean>;
+  releaseNamedLock(name: string, ownerId: string): Promise<void>;
+  readProgressMarker(): Promise<EngineProgress>;
+  readLastProcessReceipts(processType: string): Promise<Array<Record<string, unknown>>>;
+  appendProcessReceipt(receipt: Record<string, unknown>): Promise<void>;
+  appendRecoveryReceipt(receipt: Record<string, unknown>): Promise<void>;
+  fenceAllActiveAttempts(reason: string): Promise<void>;
+}
+
 /**
  * Structural implementation of supervisor/engineTypes.EngineSupervisorLedger.
  * It deliberately does not import the supervisor package.
  */
 export class DurableEngineSupervisorLedger {
   constructor(
-    private readonly store: SqliteStateStore,
+    private readonly store: EngineLedgerStateStore,
     private readonly mode: 'new' | 'run',
     private readonly openedSequence: number,
     private readonly openedRunId: string | null,
@@ -206,13 +216,14 @@ export class DurableEngineSupervisorLedger {
 
 export async function openEngineSupervisorLedger(
   projectRoot: string,
-  options: { mode?: 'new' | 'run' } = {},
+  options: { mode?: 'new' | 'run'; stateStore?: 'auto' | 'sqlite' | 'file' } = {},
 ): Promise<DurableEngineSupervisorLedger> {
-  const recovery = await recoverSqliteState({
+  const recovery = await recoverDurableState({
     projectRoot,
     acquireWriterLock: false,
+    stateStore: options.stateStore,
   });
-  const store = recovery.store;
+  const store = recovery.store as EngineLedgerStateStore;
   const opened = await store.getLatestRun();
   const openedProgress = await store.readProgressMarker();
   return new DurableEngineSupervisorLedger(

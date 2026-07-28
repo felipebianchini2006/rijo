@@ -23,6 +23,10 @@ export {
 export { STATE_MIGRATIONS, type StateMigration } from './migrations.js';
 export { MemoryStateStore } from './memoryStore.js';
 export {
+  FileStateStore,
+  type FileStateStoreOptions,
+} from './fileStore.js';
+export {
   SqliteDriverLoadError,
   SqliteStateStore,
   type SqliteDiagnostics,
@@ -65,12 +69,15 @@ export {
 export {
   openDurableStateEngine,
   openDurableWorkflowEngine,
+  recoverDurableState,
+  type DurableStateEngineOptions,
   type OpenDurableStateEngineResult,
 } from './factory.js';
 export {
   DurableWorkflowEngine,
   type DurableProgressRecord,
   type DurableRunBinding,
+  type WorkflowRecoveryResult,
 } from './workflowAdapter.js';
 export {
   collectWorkflowProjection,

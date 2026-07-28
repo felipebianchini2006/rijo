@@ -6,8 +6,7 @@ import {
   DurableStateEngine,
   progressIdempotencyKey,
 } from './engine.js';
-import type { DurableRecoveryResult } from './recovery.js';
-import type { RunRecord } from './types.js';
+import type { RunRecord, StateStore } from './types.js';
 import { collectWorkflowProjection } from './workflowProjection.js';
 
 export interface DurableRunBinding {
@@ -26,6 +25,13 @@ export interface DurableProgressRecord {
   snapshot: StatusSnapshot;
 }
 
+export interface WorkflowRecoveryResult {
+  store: StateStore;
+  rebuilt: boolean;
+  projected: number;
+  diagnostic_database: string | null;
+}
+
 /**
  * Structural adapter for workflows/shared.ts. It intentionally does not import
  * that module, keeping the durable layer below workflows in the dependency graph.
@@ -37,7 +43,7 @@ export class DurableWorkflowEngine {
   constructor(
     private readonly projectRoot: string,
     private readonly engine: DurableStateEngine,
-    private readonly recoveryResult: DurableRecoveryResult,
+    private readonly recoveryResult: WorkflowRecoveryResult,
     private readonly now: () => Date = () => new Date(),
   ) {}
 

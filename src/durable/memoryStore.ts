@@ -36,6 +36,21 @@ interface MemoryData {
   snapshotBaselineHash: string;
 }
 
+export interface SerializedMemoryState {
+  version: 1;
+  initialized: boolean;
+  runs: Array<[string, RunRecord]>;
+  events: StoredDomainEvent[];
+  eventIdempotency: Array<[string, number]>;
+  outbox: Array<[string, OutboxItem]>;
+  checkpoints: Array<[string, Checkpoint]>;
+  checkpointIdempotency: string[];
+  leases: Array<[string, Lease]>;
+  attemptHeartbeats: Array<[string, string]>;
+  snapshotBaselineSequence: number;
+  snapshotBaselineHash: string;
+}
+
 function cloneData(data: MemoryData): MemoryData {
   return structuredClone(data);
 }
@@ -126,6 +141,12 @@ export class MemoryStateStore implements StateStore {
       .filter((run) => run.status === 'CREATED' || run.status === 'RUNNING')
       .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
     return structuredClone(active ?? null);
+  }
+
+  async getLatestRun(): Promise<RunRecord | null> {
+    const latest = [...this.data.runs.values()]
+      .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+    return structuredClone(latest ?? null);
   }
 
   async saveCheckpoint(checkpoint: Checkpoint): Promise<void> {
@@ -268,6 +289,42 @@ export class MemoryStateStore implements StateStore {
 
   async close(): Promise<void> {
     this.data.initialized = false;
+  }
+
+  /** Internal persistence image used by FileStateStore. */
+  exportData(): SerializedMemoryState {
+    return structuredClone({
+      version: 1,
+      initialized: this.data.initialized,
+      runs: [...this.data.runs.entries()],
+      events: this.data.events,
+      eventIdempotency: [...this.data.eventIdempotency.entries()],
+      outbox: [...this.data.outbox.entries()],
+      checkpoints: [...this.data.checkpoints.entries()],
+      checkpointIdempotency: [...this.data.checkpointIdempotency],
+      leases: [...this.data.leases.entries()],
+      attemptHeartbeats: [...this.data.attemptHeartbeats.entries()],
+      snapshotBaselineSequence: this.data.snapshotBaselineSequence,
+      snapshotBaselineHash: this.data.snapshotBaselineHash,
+    });
+  }
+
+  /** Internal recovery hook used only after FileStateStore verifies its checksum. */
+  importData(raw: SerializedMemoryState): void {
+    if (raw.version !== 1) throw new Error(`Unsupported file state format: ${raw.version}`);
+    this.data = {
+      initialized: true,
+      runs: new Map(structuredClone(raw.runs)),
+      events: structuredClone(raw.events),
+      eventIdempotency: new Map(raw.eventIdempotency),
+      outbox: new Map(structuredClone(raw.outbox)),
+      checkpoints: new Map(structuredClone(raw.checkpoints)),
+      checkpointIdempotency: new Set(raw.checkpointIdempotency),
+      leases: new Map(structuredClone(raw.leases)),
+      attemptHeartbeats: new Map(raw.attemptHeartbeats),
+      snapshotBaselineSequence: raw.snapshotBaselineSequence,
+      snapshotBaselineHash: raw.snapshotBaselineHash,
+    };
   }
 
   private assertOpen(): void {

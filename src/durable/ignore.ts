@@ -8,6 +8,9 @@ const DURABLE_IGNORES = [
   'state/rijo.db-wal',
   'state/rijo.db-shm',
   'state/rijo.db.corrupt-*',
+  'state/file-store.json',
+  'state/file-store.json.corrupt-*',
+  'state/file-operations.json',
   'state/backups/',
 ] as const;
 

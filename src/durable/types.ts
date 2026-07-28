@@ -151,6 +151,7 @@ export interface StateStore {
   appendEvent(event: DomainEvent): Promise<void>;
   getRun(runId: string): Promise<RunRecord | null>;
   getActiveRun(): Promise<RunRecord | null>;
+  getLatestRun(): Promise<RunRecord | null>;
   saveCheckpoint(checkpoint: Checkpoint): Promise<void>;
   claimTask(taskId: string, lease: Lease): Promise<boolean>;
   heartbeatAttempt(attemptId: string): Promise<void>;
