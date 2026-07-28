@@ -163,7 +163,7 @@ export function normalizeResearchCheckedAt(value: string): string {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00.000Z` : value;
 }
 
-const PhaseResearchPayloadSchema = z.object({
+export const PhaseResearchPayloadSchema = z.object({
   summary: z.string().min(1),
   volatile_facts: looseBool(true),
   sources: z
@@ -172,7 +172,10 @@ const PhaseResearchPayloadSchema = z.object({
         claim: z.string().min(1),
         source: z.string().min(1),
         url: z.string().url(),
-        checked_at: z.string().transform(normalizeResearchCheckedAt).pipe(z.string().datetime()),
+        checked_at: z
+          .string()
+          .transform(normalizeResearchCheckedAt)
+          .pipe(z.string().datetime({ offset: true })),
         version: z.string().min(1),
         tier: z.literal('official'),
       }),
