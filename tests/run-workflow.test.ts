@@ -1294,6 +1294,76 @@ describe('rijo run', () => {
     expect(fs.readdirSync(transactionRoot)).toEqual([]);
   });
 
+  it('does not replan after the authorized package task changes its lockfile', async () => {
+    const exactVersion = '0.2.0-rc.1';
+    const d = deps(root, {
+      planPayload: (phaseId) => toolingBindingPlan(root, phaseId),
+    });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    writeToolingBindingFixture(root, exactVersion);
+    d.runner.on(
+      (task) => task.id === 'exec-01-T01',
+      (task) => {
+        fs.writeFileSync(
+          path.join(task.workspace!.root, 'package.json'),
+          JSON.stringify({
+            private: true,
+            scripts: { typecheck: 'node --test' },
+            devDependencies: { rijo: exactVersion },
+          }, null, 2) + '\n',
+        );
+        fs.writeFileSync(
+          path.join(task.workspace!.root, 'package-lock.json'),
+          JSON.stringify({
+            name: 'fixture',
+            lockfileVersion: 3,
+            packages: {
+              '': { devDependencies: { rijo: exactVersion } },
+              'node_modules/rijo': { version: exactVersion },
+            },
+          }, null, 2) + '\n',
+        );
+        return ok(task, {
+          files_written: ['package.json', 'package-lock.json'],
+          payload: { done: true, notes: 'Updated the authorized tooling files.' },
+        });
+      },
+    );
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) =>
+        ok(task, {
+          payload: {
+            approved: false,
+            findings: [{
+              type: 'spec_gap',
+              severity: 'high',
+              description: 'hold finalization after the authorized lockfile change',
+              file: null,
+            }],
+          },
+        }),
+    );
+    const blocked = await runWorkflow(root, {}, d);
+    expect(blocked.status).toBe('blocked');
+    const planCalls = d.runner.executed.filter(
+      (task) => task.id.startsWith('plan-') && !task.id.startsWith('plan-review-'),
+    ).length;
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) => ok(task, { payload: { approved: true, findings: [] } }),
+    );
+
+    const resumed = await runWorkflow(root, {}, d);
+
+    expect(resumed.ok, resumed.message).toBe(true);
+    expect(
+      d.runner.executed.filter(
+        (task) => task.id.startsWith('plan-') && !task.id.startsWith('plan-review-'),
+      ),
+    ).toHaveLength(planCalls);
+  });
+
   it('keeps a task running when external bytes conflict with its retained patch', async () => {
     const d = deps(root);
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);

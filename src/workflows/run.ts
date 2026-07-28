@@ -1599,6 +1599,11 @@ async function executePhase(
     const packageManifestTask = plan.tasks.find((task) =>
       task.write_scope.includes('package.json'),
     );
+    const packageManifestTaskApplied =
+      packageManifestTask !== undefined &&
+      ['IMPLEMENTED', 'VERIFYING', 'VERIFIED', 'DONE'].includes(
+        packageManifestTask.status,
+      );
     if (
       packageManifestTask &&
       exists(path.join(ctx.projectRoot, 'package-lock.json')) &&
@@ -1613,7 +1618,8 @@ async function executePhase(
     }
     if (
       packageManifestTask &&
-      exists(path.join(ctx.projectRoot, 'package-lock.json'))
+      exists(path.join(ctx.projectRoot, 'package-lock.json')) &&
+      !packageManifestTaskApplied
     ) {
       const lockReference = packageManifestTask.mapped_references.find(
         (reference) => reference.path === 'package-lock.json',
