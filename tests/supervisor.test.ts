@@ -23,8 +23,10 @@ import {
   type PreparedAttempt,
 } from '../src/supervisor/index.js';
 import { FakeAgentRunner } from '../src/agents/runner.js';
+import type { ReplayAttemptIdentity } from '../src/agents/runner.js';
 import { TaskRecordSchema } from '../src/core/schemas/index.js';
 import { TaskStore } from '../src/supervisor/store.js';
+import { sha256 } from '../src/core/fsx.js';
 
 // ---- unhandled-rejection guard ------------------------------------------------
 const unhandled: unknown[] = [];
@@ -76,6 +78,7 @@ class FakeController implements HostAgentController {
   livenessThrows = false;
   cancelBehavior: 'ack' | 'noack' | 'never' = 'ack';
   queryStatus: HostAttemptStatus = { kind: 'running' };
+  replayIdentity: ReplayAttemptIdentity | null = null;
   disposedAttempts: string[] = [];
   autoFail = false;
   forceTerminate?: (handle: HostAttemptHandle, reason: string) => Promise<TerminationReceipt>;
@@ -85,6 +88,10 @@ class FakeController implements HostAgentController {
   constructor(opts: { forceTerminate?: boolean; forceBehavior?: 'terminate' | 'fail' | 'never' } = {}) {
     this.forceBehavior = opts.forceBehavior ?? 'terminate';
     if (opts.forceTerminate) this.forceTerminate = () => this.doForce();
+  }
+
+  replayAttempt(): ReplayAttemptIdentity | null {
+    return this.replayIdentity;
   }
 
   private doForce(): Promise<TerminationReceipt> {
@@ -614,5 +621,107 @@ describe('supervisor — crash recovery reconciliation', () => {
     expect(second.total).toBe(0); // nothing left to reconcile
     expect(store.read('exec-01-T01')!.state).toBe(afterFirst);
     expect(store.readEvents('exec-01-T01').length).toBe(eventsAfterFirst); // no new events
+  });
+
+  it('starts a recovered FAILED task at the next generation without resetting fencing or budget', async () => {
+    const paths = tmpPaths();
+    writeRecord(paths, {
+      state: 'FAILED',
+      attempt_id: 'exec-01-T01#g2-bbbb',
+      generation: 2,
+      lease_id: 'lease-2',
+      replacement_count: 1,
+      revoked_leases: ['lease-1'],
+      last_error: 'replacement workspace disappeared',
+    });
+    await reconcileSupervisedTasks(paths, { maxReplacements: 2 });
+
+    const c = new FakeController();
+    const { clock, supervisor } = newSupervisor(c, cfg({ max_replacements_per_task: 0 }), paths);
+    const p = supervisor.superviseTask(
+      makeTask('exec-01-T01', {
+        workspace: { id: 'ws-exec-01-T01-g3', root: '/tmp/exec-01-T01-g3' },
+      }),
+    );
+    await clock.advance(0);
+
+    expect(c.started).toHaveLength(1);
+    const generation3 = c.started[0]!.attempt!;
+    expect(generation3.generation).toBe(3);
+    expect(generation3.lease_id).not.toBe('lease-2');
+    c.deliver(generation3.attempt_id, c.matching(generation3.attempt_id));
+    await clock.advance(0);
+    expect((await p).ok).toBe(true);
+
+    const recovered = new TaskStore(paths).read('exec-01-T01')!;
+    expect(recovered.generation).toBe(3);
+    expect(recovered.replacement_count).toBe(2);
+    expect(recovered.revoked_leases).toEqual(expect.arrayContaining(['lease-1', 'lease-2']));
+    expect(recovered.revoked_leases).not.toContain(generation3.lease_id);
+  });
+
+  it('replays an exact SUCCEEDED identity without recreating or resetting its durable record', async () => {
+    const paths = tmpPaths();
+    const idempotencyKey = sha256('exec-01-T01').slice(0, 32);
+    writeRecord(paths, {
+      state: 'SUCCEEDED',
+      attempt_id: 'exec-01-T01#g2-bbbb',
+      generation: 2,
+      lease_id: 'lease-2',
+      replacement_count: 1,
+      revoked_leases: ['lease-1'],
+      finished_at: new Date().toISOString(),
+      idempotency_key: idempotencyKey,
+    });
+    const c = new FakeController();
+    c.replayIdentity = {
+      logical_task_id: 'exec-01-T01',
+      attempt_id: 'exec-01-T01#g2-bbbb',
+      generation: 2,
+      lease_id: 'lease-2',
+      idempotency_key: idempotencyKey,
+    };
+    const { clock, supervisor } = newSupervisor(c, cfg(), paths);
+    const p = supervisor.superviseTask(makeTask());
+    await clock.advance(0);
+    c.deliver(c.lastAttemptId(), c.matching(c.lastAttemptId()));
+    await clock.advance(0);
+    expect((await p).ok).toBe(true);
+
+    const store = new TaskStore(paths);
+    const replayed = store.read('exec-01-T01')!;
+    expect(replayed.generation).toBe(2);
+    expect(replayed.replacement_count).toBe(1);
+    expect(replayed.revoked_leases).toEqual(['lease-1']);
+    expect(store.readEvents('exec-01-T01').filter((event) => event.type === 'task_created')).toHaveLength(1);
+  });
+
+  it('never recreates an EXHAUSTED task and therefore cannot loop past its replacement bound', async () => {
+    const paths = tmpPaths();
+    writeRecord(paths, {
+      state: 'FAILED',
+      attempt_id: 'exec-01-T01#g3-cccc',
+      generation: 3,
+      lease_id: 'lease-3',
+      replacement_count: 2,
+      revoked_leases: ['lease-1', 'lease-2'],
+      last_error: 'generation 3 failed',
+    });
+    await reconcileSupervisedTasks(paths, { maxReplacements: 2 });
+    const store = new TaskStore(paths);
+    const before = store.read('exec-01-T01')!;
+    const createdBefore = store.readEvents('exec-01-T01').filter((event) => event.type === 'task_created').length;
+
+    const c = new FakeController();
+    const { supervisor } = newSupervisor(c, cfg({ max_replacements_per_task: 2 }), paths);
+    const result = await supervisor.superviseTask(makeTask());
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('replacement budget already exhausted');
+    expect(c.started).toHaveLength(0);
+    expect(store.read('exec-01-T01')).toEqual(before);
+    expect(store.readEvents('exec-01-T01').filter((event) => event.type === 'task_created')).toHaveLength(
+      createdBefore,
+    );
   });
 });

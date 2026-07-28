@@ -8,6 +8,7 @@ import {
   setTaskStatus,
   writePlan,
   readPlan,
+  preserveEquivalentPlanProgress,
 } from '../src/core/plan.js';
 import { PlanTaskSchema, type PlanTask, type PhasePlan } from '../src/core/schemas/index.js';
 import { tmpProject, cleanup } from './helpers.js';
@@ -224,6 +225,34 @@ describe('setTaskStatus (task lifecycle)', () => {
     expect(after.tasks.find((t) => t.id === 'T01')!.status).toBe('DONE');
     expect(after.tasks.find((t) => t.id === 'T01')!.done).toBe(true);
     expect(after.tasks.find((t) => t.id === 'T02')!.done).toBe(false);
+  });
+
+  it('preserves durable task progress when replanning produces the same task contract', () => {
+    const previous = persisted([
+      task('T01', { status: 'DONE', done: true }),
+      task('T02', { status: 'IMPLEMENTED' }),
+      task('T03', { status: 'RUNNING' }),
+    ]);
+    const regenerated = {
+      ...persisted([task('T01'), task('T02'), task('T03')]),
+      planned_at: '2026-07-24T00:00:00.000Z',
+    };
+
+    const preserved = preserveEquivalentPlanProgress(previous, regenerated);
+
+    expect(preserved.tasks.map(({ status, done }) => ({ status, done }))).toEqual([
+      { status: 'DONE', done: true },
+      { status: 'IMPLEMENTED', done: false },
+      { status: 'RUNNING', done: false },
+    ]);
+    expect(preserved.planned_at).toBe('2026-07-24T00:00:00.000Z');
+    const changed = preserveEquivalentPlanProgress(previous, {
+      ...regenerated,
+      tasks: regenerated.tasks.map((candidate) =>
+        candidate.id === 'T02' ? { ...candidate, name: 'Changed task contract' } : candidate,
+      ),
+    });
+    expect(changed.tasks.every((candidate) => candidate.status === 'PENDING')).toBe(true);
   });
 
   it('rejects skipping the lifecycle (PENDING → DONE is a core error)', () => {

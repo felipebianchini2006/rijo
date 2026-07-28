@@ -37,6 +37,7 @@ import {
   type DecisionCommitHooks,
   type PendingDecision,
 } from '../core/decisions.js';
+import { TaskStore } from '../supervisor/store.js';
 
 export type { DispatchRouting } from './routing.js';
 
@@ -314,7 +315,12 @@ export async function withLock<T>(
       );
     }
 
-    for (const ws of discardOrphanWorkspaces(ctx.paths.runtimeDir)) {
+    const activeWorkspaceIds = new Set(
+      new TaskStore(ctx.paths)
+        .listNonTerminal()
+        .flatMap((record) => (record.workspace_id === null ? [] : [record.workspace_id])),
+    );
+    for (const ws of discardOrphanWorkspaces(ctx.paths.runtimeDir, activeWorkspaceIds)) {
       ctx.bus.emit('workspace.orphan_discarded', { message: `Discarded the orphaned workspace: ${ws}.` }, { workspace: ws });
     }
 

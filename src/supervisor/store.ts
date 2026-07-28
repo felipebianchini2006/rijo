@@ -71,9 +71,40 @@ export class TaskStore {
   /** Persist a brand-new record (its initial state, usually QUEUED). */
   create(record: TaskRecord): TaskRecord {
     const valid = TaskRecordSchema.parse(record);
+    if (this.read(valid.logical_task_id) !== null) {
+      throw new Error(`Supervised task ${valid.logical_task_id} already has a durable record.`);
+    }
     this.emit(valid.logical_task_id, 'task_created', { state: valid.state, role: valid.role });
     this.write(valid);
     return valid;
+  }
+
+  /**
+   * Requeue an existing terminal projection without erasing its identity
+   * history. This is deliberately narrower than `create`: exact SUCCEEDED
+   * native replay and a later workflow retry of a generation-1 failure are the
+   * only valid callers. A spent replacement budget can never be reopened.
+   */
+  requeueExisting(
+    record: TaskRecord,
+    patch: Partial<TaskRecord>,
+    eventData: Record<string, unknown>,
+  ): TaskRecord {
+    const allowed =
+      record.state === 'SUCCEEDED' ||
+      (record.state === 'EXHAUSTED' && record.replacement_count === 0);
+    if (!allowed) {
+      throw new Error(
+        `Supervised task ${record.logical_task_id} cannot be requeued from ${record.state}.`,
+      );
+    }
+    this.emit(record.logical_task_id, 'task_requeued', {
+      from: record.state,
+      ...eventData,
+    });
+    const next = TaskRecordSchema.parse({ ...record, ...patch, state: 'QUEUED' });
+    this.write(next);
+    return next;
   }
 
   /**

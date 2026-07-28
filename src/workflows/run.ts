@@ -8,7 +8,15 @@ import { readState } from '../core/state.js';
 import { touchManifest, canonicalBaselineHash } from '../core/manifest.js';
 import { activeMilestone, type MilestoneRef } from '../core/milestones.js';
 import { readRequirements, readRoadmap, writeRoadmap, nextPhase, type RoadmapDoc } from '../core/roadmap.js';
-import { readPlan, writePlan, lintPlan, setTaskStatus, parallelGroups } from '../core/plan.js';
+import {
+  readPlan,
+  writePlan,
+  lintPlan,
+  setTaskStatus,
+  parallelGroups,
+  preserveEquivalentPlanProgress,
+  planContractHash,
+} from '../core/plan.js';
 import { validateStateIntegrity } from '../core/traceability.js';
 import { checkContextBudget } from '../core/contextBudget.js';
 import { snapshotFiles, diffSnapshots, pathInScope, type FileSnapshot } from '../core/scope.js';
@@ -184,8 +192,20 @@ const PlanInvalidationSchema = z.object({
   replanned_at: z.string().datetime().nullable(),
 });
 
+const PlanApprovalSchema = z.object({
+  schema_version: z.literal(1),
+  milestone: z.string(),
+  phase: z.string(),
+  plan_contract_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  approved_at: z.string().datetime(),
+});
+
 function planInvalidationPath(ctx: WorkflowContext, milestone: string, phase: string): string {
   return path.join(ctx.paths.runtimeDir, 'plan-invalidations', `${milestone}-${phase}.json`);
+}
+
+function planApprovalPath(ctx: WorkflowContext, milestone: string, phase: string): string {
+  return path.join(ctx.paths.runtimeDir, 'plan-approvals', `${milestone}-${phase}.json`);
 }
 
 function writePlanInvalidation(
@@ -210,6 +230,7 @@ function writePlanInvalidation(
       replanned_at: null,
     }),
   );
+  fs.rmSync(planApprovalPath(ctx, milestone, phase), { force: true });
   ctx.planHooks.afterInvalidated?.();
 }
 
@@ -515,6 +536,14 @@ async function executePhase(
 
   let forceReplan = false;
   let appliedPlanAtEntry = false;
+  let durablePlanAtEntry: PhasePlan | null = null;
+  if (exists(pp.plan)) {
+    try {
+      durablePlanAtEntry = readPlan(pp.plan);
+    } catch {
+      // Legacy/corrupt plans are handled by the explicit migration path below.
+    }
+  }
   if (readMapState(paths)) {
     stage('LOAD', 'Check map and plan freshness before the phase starts.');
     const rawPlanData = exists(pp.plan)
@@ -806,6 +835,34 @@ async function executePhase(
   ].join('\n');
   const hasPlanningMap = readMapState(paths) !== null;
   let plan: PhasePlan | null = exists(pp.plan) && !forceReplan ? readPlan(pp.plan) : null;
+  let planApproved = false;
+  const approvalTarget = planApprovalPath(ctx, milestone.id, phase.id);
+  if (plan) {
+    const approval = PlanApprovalSchema.safeParse(readJsonIfExists<unknown>(approvalTarget));
+    const executionStarted = plan.tasks.some((task) => task.status !== 'PENDING');
+    if (approval.success) {
+      if (approval.data.plan_contract_hash !== planContractHash(plan)) {
+        return blocked(ctx, `Phase ${phase.id}: the approved plan contract changed without invalidation.`, [
+          'The durable task lifecycle was preserved. Explicitly invalidate the plan before changing task definitions.',
+        ]);
+      }
+      planApproved = true;
+    } else if (executionStarted) {
+      // Compatibility/bootstrap path: execution is reachable only after review
+      // approval, so a legacy in-progress plan is already frozen.
+      writeJsonAtomic(
+        approvalTarget,
+        PlanApprovalSchema.parse({
+          schema_version: 1,
+          milestone: milestone.id,
+          phase: phase.id,
+          plan_contract_hash: planContractHash(plan),
+          approved_at: now().toISOString(),
+        }),
+      );
+      planApproved = true;
+    }
+  }
   let revisions = 0;
   let reviewNotes: string[] = [];
   let planEnvelope: ValidatedAgentEnvelope | null = null;
@@ -908,9 +965,11 @@ async function executePhase(
         ),
         decision_context_hash: planningMapContext.decision_context_hash,
       };
+      plan = preserveEquivalentPlanProgress(durablePlanAtEntry, plan);
       // The PLAN is a canonical artifact written by the CORE from the planner's
       // validated payload — the agent never touches the plan file itself.
       writePlan(pp.plan, plan, `Generated for ${phase.name}.`);
+      planApproved = false;
       ctx.planHooks.afterPlanWritten?.();
       markPlanReplanned(ctx, milestone.id, phase.id, pp.plan);
       touchManifest(paths, () => {}, now);
@@ -965,6 +1024,8 @@ async function executePhase(
       plan = null;
       continue;
     }
+
+    if (planApproved) break;
 
     stage('PLAN_REVIEW', 'Run an independent plan review.');
     const reviewTask: AgentTaskDraft = {
@@ -1040,6 +1101,16 @@ async function executePhase(
       : [`Reviewer verdict (unstructured): ${reviewRes.summary}`];
     plan = null;
   }
+  writeJsonAtomic(
+    approvalTarget,
+    PlanApprovalSchema.parse({
+      schema_version: 1,
+      milestone: milestone.id,
+      phase: phase.id,
+      plan_contract_hash: planContractHash(plan),
+      approved_at: now().toISOString(),
+    }),
+  );
   if (planEnvelope) commitDecisionProposals(ctx, planEnvelope);
   if (planReviewEnvelope) commitDecisionProposals(ctx, planReviewEnvelope);
   bus.emit('run.plan_approved', { message: 'Plan approved.' });
@@ -1327,7 +1398,6 @@ async function executePhase(
           );
         } catch (error) {
           if (isNativeResultRequired(error)) {
-            discardAll();
             throw error;
           }
           discardAll();

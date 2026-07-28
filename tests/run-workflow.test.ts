@@ -7,7 +7,7 @@ import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
-import { readPlan } from '../src/core/plan.js';
+import { planContractHash, readPlan } from '../src/core/plan.js';
 import { FakeShellRunner } from '../src/core/commands.js';
 import { defaultConfig } from '../src/core/config.js';
 import { TaskStore } from '../src/supervisor/store.js';
@@ -724,6 +724,8 @@ describe('rijo run', () => {
     expect(fs.existsSync(path.join(root, 'src', 'b.ts'))).toBe(false);
 
     const execCountAfterFirst = d.runner.executed.filter((t) => t.id === 'exec-01-T01').length;
+    const reviewCountAfterFirst = d.runner.executed.filter((t) => t.id.startsWith('plan-review-01-')).length;
+    const approvedContract = planContractHash(readPlan(planPath));
     failT02 = false;
     const second = await runWorkflow(root, {}, d);
     expect(second.ok, second.message).toBe(true);
@@ -731,6 +733,9 @@ describe('rijo run', () => {
     expect(d.runner.executed.filter((t) => t.id === 'exec-01-T01').length).toBe(execCountAfterFirst);
     // plan was not regenerated and no redundant spec task was dispatched
     expect(d.runner.executed.filter((t) => t.id === 'plan-01-r0').length).toBe(1);
+    expect(d.runner.executed.filter((t) => t.id.startsWith('plan-review-01-')).length)
+      .toBe(reviewCountAfterFirst);
+    expect(planContractHash(readPlan(planPath))).toBe(approvedContract);
     expect(d.runner.executed.some((t) => t.id.startsWith('spec-'))).toBe(false);
     // both tasks reached DONE through the full lifecycle
     const finalPlan = readPlan(planPath);

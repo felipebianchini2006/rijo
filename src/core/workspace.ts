@@ -432,17 +432,22 @@ function initializeGitBarrier(workspaceRoot: string): void {
 }
 
 /**
- * Remove every leftover attempt workspace under `<runtimeDir>/workspaces`.
+ * Remove every leftover attempt workspace under `<runtimeDir>/workspaces`
+ * except workspaces still owned by a durable non-terminal task record.
  * A crashed run can leave whole workspace copies behind; a fresh run must
  * never observe or reuse them (a stale copy could re-introduce a discarded
  * attempt's edits). Returns the ids of the workspaces that were removed so the
  * caller can emit progress; safe to call when the directory does not exist.
  */
-export function discardOrphanWorkspaces(runtimeDir: string): string[] {
+export function discardOrphanWorkspaces(
+  runtimeDir: string,
+  activeWorkspaceIds: ReadonlySet<string> = new Set(),
+): string[] {
   const wsDir = path.join(runtimeDir, 'workspaces');
   if (!exists(wsDir)) return [];
   const discarded: string[] = [];
   for (const entry of fs.readdirSync(wsDir)) {
+    if (activeWorkspaceIds.has(entry)) continue;
     fs.rmSync(path.join(wsDir, entry), { recursive: true, force: true });
     discarded.push(entry);
   }

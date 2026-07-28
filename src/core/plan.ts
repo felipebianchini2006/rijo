@@ -1,6 +1,6 @@
 import { parseFrontmatter, serializeFrontmatter } from './frontmatter.js';
 import { PhasePlanSchema, assertTaskTransition, type PhasePlan, type PlanTask, type TaskStatus } from './schemas/index.js';
-import { readText, writeFileAtomic } from './fsx.js';
+import { readText, sha256, writeFileAtomic } from './fsx.js';
 
 /**
  * PLAN.md: front matter carries the machine-readable task list, the body is a
@@ -26,6 +26,43 @@ export function writePlan(planPath: string, plan: PhasePlan, narrative: string):
     '',
   ].join('\n');
   writeFileAtomic(planPath, serializeFrontmatter(PhasePlanSchema.parse(plan), body));
+}
+
+/**
+ * A forced planning refresh may reproduce the exact same task contract while
+ * defaulting every task back to PENDING. Progress belongs to the durable core,
+ * not the planner, so carry it forward only when every planner-owned task field
+ * is identical. Any real plan change gets a clean lifecycle.
+ */
+export function preserveEquivalentPlanProgress(
+  previous: PhasePlan | null,
+  next: PhasePlan,
+): PhasePlan {
+  if (!previous) return next;
+  const definition = (candidate: PhasePlan): string =>
+    JSON.stringify({
+      phase: candidate.phase,
+      tasks: candidate.tasks.map(({ status: _status, done: _done, ...task }) => task),
+    });
+  if (definition(previous) !== definition(next)) return next;
+  const previousById = new Map(previous.tasks.map((task) => [task.id, task]));
+  return {
+    ...next,
+    tasks: next.tasks.map((task) => {
+      const durable = previousById.get(task.id)!;
+      return { ...task, status: durable.status, done: durable.done };
+    }),
+  };
+}
+
+/** Stable identity of planner-owned plan content; lifecycle/freshness are core-owned. */
+export function planContractHash(plan: PhasePlan): string {
+  return sha256(
+    JSON.stringify({
+      phase: plan.phase,
+      tasks: plan.tasks.map(({ status: _status, done: _done, ...task }) => task),
+    }),
+  );
 }
 
 /**

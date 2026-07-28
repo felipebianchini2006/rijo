@@ -213,4 +213,38 @@ describe('recovery — orphan workspace discard runs through withLock', () => {
     expect(rec.workspace_id).toBeNull();
     expect(emitted.some((e) => e.type === 'supervised.recovered')).toBe(true);
   });
+
+  it('keeps a replacement workspace owned by an active native-result attempt', async () => {
+    const paths = new RijoPaths(root);
+    const wsDir = path.join(paths.runtimeDir, 'workspaces');
+    const activeId = 'ws-exec-01-T01-g2-active';
+    const orphanId = 'ws-exec-01-T99-orphan';
+    fs.mkdirSync(path.join(wsDir, activeId), { recursive: true });
+    fs.mkdirSync(path.join(wsDir, orphanId), { recursive: true });
+    fs.writeFileSync(path.join(wsDir, activeId, 'replacement.ts'), '// corrected generation\n');
+    seed(paths, 'AWAITING_NATIVE_RESULT', {
+      attempt_id: 'exec-01-T01#g2-bbbb',
+      generation: 2,
+      lease_id: 'lease-2',
+      replacement_count: 1,
+      revoked_leases: ['lease-1'],
+      workspace_id: activeId,
+      workspace_path: path.join(wsDir, activeId),
+    });
+
+    let workspacesAtBodyTime: string[] = [];
+    await withLock(makeCtx(), async () => {
+      workspacesAtBodyTime = fs.readdirSync(wsDir).sort();
+      return null;
+    });
+
+    expect(workspacesAtBodyTime).toEqual([activeId]);
+    expect(fs.readFileSync(path.join(wsDir, activeId, 'replacement.ts'), 'utf8')).toContain(
+      'corrected generation',
+    );
+    const record = new TaskStore(paths).read('exec-01-T01')!;
+    expect(record.state).toBe('AWAITING_NATIVE_RESULT');
+    expect(record.workspace_id).toBe(activeId);
+    expect(record.generation).toBe(2);
+  });
 });
