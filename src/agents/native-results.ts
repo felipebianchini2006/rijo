@@ -135,8 +135,27 @@ function requestHashInput(task: AgentTask): Omit<NativeRequestV2, 'request_id' |
   };
 }
 
+function stableWorkspacePath(task: AgentTask, value: string): string {
+  if (!task.workspace || !path.isAbsolute(value)) return value;
+  const root = path.resolve(task.workspace.root);
+  const candidate = path.resolve(value);
+  const relative = path.relative(root, candidate);
+  if (relative === '') return '$WORKSPACE';
+  if (path.isAbsolute(relative) || relative.split(path.sep).includes('..')) return value;
+  return `$WORKSPACE/${relative.split(path.sep).join('/')}`;
+}
+
 export function createNativeRequestV2(task: AgentTask): NativeRequestV2 {
   const body = requestHashInput(task);
+  // A native helper turn discards the prior isolated workspace. The next turn
+  // creates a fresh workspace with a different absolute root. Hash the semantic
+  // task paths, not that random root, so the exact supervised identity can
+  // resume while the emitted request still contains the real current paths.
+  const hashBody = {
+    ...body,
+    canonical_files: body.canonical_files.map((value) => stableWorkspacePath(task, value)),
+    code_files: body.code_files.map((value) => stableWorkspacePath(task, value)),
+  };
   const identity = JSON.stringify({
     logical_task_id: body.logical_task_id,
     attempt_id: body.attempt_id,
@@ -146,7 +165,7 @@ export function createNativeRequestV2(task: AgentTask): NativeRequestV2 {
   });
   return NativeRequestV2Schema.parse({
     request_id: `nreq_${sha256(identity)}`,
-    request_hash: sha256(JSON.stringify(body)),
+    request_hash: sha256(JSON.stringify(hashBody)),
     ...body,
   });
 }

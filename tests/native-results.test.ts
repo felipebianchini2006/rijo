@@ -150,6 +150,84 @@ describe('native result ingestion', () => {
     expect(replayed.lease_id).toBe(request.lease_id);
   });
 
+  it('reuses a writer identity after its old workspace is discarded and writes into the fresh workspace', async () => {
+    const root = tmpProject('rijo-native-writer-resume-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const workspaceA = path.join(paths.runtimeDir, 'workspaces', 'ws-writer-a');
+    const workspaceB = path.join(paths.runtimeDir, 'workspaces', 'ws-writer-b');
+    fs.mkdirSync(workspaceA, { recursive: true });
+    const writerTask = (workspace: string, id: string) =>
+      AgentTaskSchema.parse({
+        id: 'exec-01-T01',
+        role: 'worker',
+        objective: 'Implement the bounded feature.',
+        canonical_files: [path.join(workspace, '.rijo', 'RULES.md')],
+        code_files: [path.join(workspace, 'src', 'feature.ts')],
+        write_scope: ['src/feature.ts'],
+        acceptance_criteria: ['The feature exists.'],
+        verification_commands: ['npm test'],
+        return_format: 'JSON payload: {done: boolean}.',
+        workspace: { id, root: workspace },
+        canonical_baseline: 'baseline-01',
+      });
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 0,
+      replacement_backoff_ms: [],
+    };
+
+    const first = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: writerTask(workspaceA, 'ws-writer-a'), role: 'worker' });
+    expect(first.ok).toBe(false);
+    const requestFile = path.join(root, 'native-requests.jsonl');
+    const request = JSON.parse(fs.readFileSync(requestFile, 'utf8').trim());
+    expect(request.canonical_files).toEqual([path.join(workspaceA, '.rijo', 'RULES.md')]);
+    expect(request.code_files).toEqual([path.join(workspaceA, 'src', 'feature.ts')]);
+
+    // The helper boundary removes the old attempt workspace. The next workflow
+    // turn creates a clean workspace with a different random absolute root.
+    fs.rmSync(workspaceA, { recursive: true, force: true });
+    fs.mkdirSync(workspaceB, { recursive: true });
+    fs.writeFileSync(
+      bundle,
+      JSON.stringify({
+        version: 2,
+        results: [{
+          ...request,
+          ok: true,
+          summary: 'Implemented the feature.',
+          payload: { done: true },
+          files: { 'src/feature.ts': 'export const feature = true;\n' },
+          files_written: ['src/feature.ts'],
+          scope_requests: [],
+          decision_proposals: [],
+          artifacts: [],
+        }],
+      }),
+    );
+
+    const resumed = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: writerTask(workspaceB, 'ws-writer-b'), role: 'worker' });
+
+    expect(resumed.ok).toBe(true);
+    expect(resumed.attempt_id).toBe(request.attempt_id);
+    expect(resumed.generation).toBe(request.generation);
+    expect(resumed.lease_id).toBe(request.lease_id);
+    expect(fs.readFileSync(path.join(workspaceB, 'src', 'feature.ts'), 'utf8'))
+      .toBe('export const feature = true;\n');
+    expect(fs.existsSync(workspaceA)).toBe(false);
+    expect(fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/)).toHaveLength(1);
+  });
+
   it('fences a pending identity when task content changes before resume', async () => {
     const root = tmpProject('rijo-native-changed-resume-');
     roots.push(root);
