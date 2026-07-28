@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { detectClaude, generateClaudeAdapter } from '../adapters/claude.js';
 import { detectCodex, generateCodexAdapter } from '../adapters/codex.js';
 import type { AdapterReport } from '../adapters/shared.js';
@@ -37,7 +38,7 @@ export interface ProjectBinding {
 }
 
 export interface ProjectDependencyInstallOptions {
-  /** Test and local-package override. Production uses rijo@<exact version>. */
+  /** Explicit package source. The default is the package that runs this code. */
   packageSpec?: string;
 }
 
@@ -184,10 +185,30 @@ export function installProjectDependency(
   options: ProjectDependencyInstallOptions = {},
 ): ProjectBinding {
   const binding = prepareProjectBinding(projectRoot);
-  const packageSpec = options.packageSpec ?? `rijo@${binding.version}`;
+
+  // A repeated local installation already has the required package materialized.
+  // Do not ask npm to install a package from its own node_modules destination.
+  if (options.packageSpec === undefined) {
+    try {
+      validateInstalledBinding(binding);
+      return binding;
+    } catch {
+      // Continue and repair the project binding from the running package.
+    }
+  }
+
+  const packageSpec = options.packageSpec ?? resolveRunningPackageRoot(binding.version);
   const result = spawnSync(
     'npm',
-    ['install', '--save-dev', '--save-exact', '--no-audit', '--no-fund', packageSpec],
+    [
+      'install',
+      '--save-dev',
+      '--save-exact',
+      '--install-links',
+      '--no-audit',
+      '--no-fund',
+      packageSpec,
+    ],
     {
       cwd: binding.toolingRoot,
       encoding: 'utf8',
@@ -206,6 +227,35 @@ export function installProjectDependency(
   pinManifestAndLock(binding);
   validateInstalledBinding(binding);
   return binding;
+}
+
+/**
+ * Find the package that contains the running installer.
+ *
+ * This source is available for global installs, npx cache installs, packed
+ * tarballs, and project-local installs. It lets an unpublished exact version
+ * bootstrap a project without a registry lookup.
+ */
+function resolveRunningPackageRoot(expectedVersion: string): string {
+  let candidate = path.dirname(fileURLToPath(import.meta.url));
+  while (true) {
+    const manifest = readJsonIfExists<{ name?: string; version?: string }>(
+      path.join(candidate, 'package.json'),
+    );
+    if (manifest?.name === 'rijo') {
+      if (manifest.version !== expectedVersion) {
+        throw new Error(
+          `The running RIJO package has version ${manifest.version ?? 'unknown'}, but the installer expects ${expectedVersion}.`,
+        );
+      }
+      return candidate;
+    }
+    const parent = path.dirname(candidate);
+    if (parent === candidate) {
+      throw new Error('The running RIJO package root could not be found.');
+    }
+    candidate = parent;
+  }
 }
 
 export function validateInstalledBinding(binding: ProjectBinding): void {

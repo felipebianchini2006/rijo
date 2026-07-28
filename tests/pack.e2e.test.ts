@@ -1,4 +1,4 @@
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,13 +42,28 @@ describe('distribution E2E (npm pack + install)', () => {
       expect(shippedPaths).toContain('dist/cli/index.js');
       expect(shippedPaths).toContain('skills/rijo-new.md');
 
-      // ---- install the tarball into a fresh fixture project
-      execSync('npm init -y', { cwd: fixture, encoding: 'utf8' });
-      execSync(`npm install "${tarball}" --no-audit --no-fund`, { cwd: fixture, encoding: 'utf8' });
+      // ---- run the packed CLI through npm in an empty folder. The installer
+      // must bootstrap this exact package without a registry lookup.
+      execFileSync(
+        'npm',
+        [
+          'exec',
+          '--yes',
+          '--package',
+          tarball,
+          '--',
+          'rijo',
+          'install',
+          '--project',
+          '--codex',
+        ],
+        { cwd: fixture, encoding: 'utf8' },
+      );
 
       const installed = path.join(fixture, 'node_modules', 'rijo');
       expect(fs.existsSync(path.join(installed, 'dist', 'cli', 'index.js'))).toBe(true);
       expect(fs.existsSync(path.join(installed, 'skills', 'rijo-new.md'))).toBe(true);
+      expect(fs.lstatSync(installed).isSymbolicLink()).toBe(false);
 
       // package.json "files" also lists templates/, schemas/, adapters/ — only
       // assert what actually exists in the repo (npm skips missing entries).
@@ -71,24 +86,41 @@ describe('distribution E2E (npm pack + install)', () => {
       expect(status.rijo_version).toBe('0.2.0-rc.1');
       expect(status.schema_version).toBe(3);
 
-      // ---- project binding: install the tarball as an exact development
-      // dependency, create the lock, and execute only through the local
-      // version-validating launcher.
-      fs.writeFileSync(
-        path.join(fixture, 'bind-check.mjs'),
-        [
-          "import { installProjectDependency } from 'rijo';",
-          'installProjectDependency(process.cwd(), { packageSpec: process.argv[2] });',
-        ].join('\n'),
-      );
-      execSync(`node bind-check.mjs "${tarball}"`, { cwd: fixture, encoding: 'utf8' });
+      // ---- project binding: the public manifest and lock root use the exact
+      // semantic version even though npm received a local package source.
       const boundManifest = JSON.parse(fs.readFileSync(path.join(fixture, 'package.json'), 'utf8'));
       expect(boundManifest.devDependencies.rijo).toBe('0.2.0-rc.1');
+      const boundLock = JSON.parse(fs.readFileSync(path.join(fixture, 'package-lock.json'), 'utf8'));
+      expect(boundLock.packages[''].devDependencies.rijo).toBe('0.2.0-rc.1');
+      expect(boundLock.packages['node_modules/rijo'].version).toBe('0.2.0-rc.1');
       const localVersion = execSync('node .rijo/bin/rijo.cjs --version', {
         cwd: fixture,
         encoding: 'utf8',
       });
       expect(localVersion.trim()).toBe('0.2.0-rc.1');
+
+      // ---- repeat the public project install through the bound local CLI.
+      // The second run must preserve every binding and provider byte.
+      const idempotentFiles = [
+        'package.json',
+        'package-lock.json',
+        '.rijo/bin/rijo.cjs',
+        '.rijo/tooling-binding.json',
+        '.agents/skills/rijo/SKILL.md',
+        'AGENTS.md',
+      ];
+      const firstInstall = idempotentFiles.map((file) =>
+        fs.readFileSync(path.join(fixture, file)),
+      );
+      execFileSync(
+        process.execPath,
+        ['.rijo/bin/rijo.cjs', 'install', '--project', '--codex'],
+        { cwd: fixture, encoding: 'utf8' },
+      );
+      const secondInstall = idempotentFiles.map((file) =>
+        fs.readFileSync(path.join(fixture, file)),
+      );
+      expect(secondInstall).toEqual(firstInstall);
 
       // ---- P0.2: the published programmatic API is importable from the tarball.
       // The audit reproduced ERR_MODULE_NOT_FOUND here before package "exports"
