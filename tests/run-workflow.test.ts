@@ -4,11 +4,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
 import { runWorkflow } from '../src/workflows/run.js';
 import { RijoPaths } from '../src/core/paths.js';
-import { readManifest, touchManifest } from '../src/core/manifest.js';
+import { detectDrift, readManifest, touchManifest } from '../src/core/manifest.js';
 import { readRequirements, readRoadmap } from '../src/core/roadmap.js';
 import { readState } from '../src/core/state.js';
 import { planContractHash, readPlan, writePlan } from '../src/core/plan.js';
-import { FakeShellRunner } from '../src/core/commands.js';
+import { sha256File } from '../src/core/fsx.js';
+import { FakeShellRunner, type ShellRunner } from '../src/core/commands.js';
 import { defaultConfig } from '../src/core/config.js';
 import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 import { TaskStore } from '../src/supervisor/store.js';
@@ -308,11 +309,401 @@ describe('rijo run', () => {
         });
       },
     );
+    d.runner.on(
+      (task) => task.id.startsWith('review-fix-'),
+      (task) => {
+        const target = path.join(task.workspace!.root, 'src', 'a.ts');
+        fs.appendFileSync(target, 'export const reviewedRepair = true;\n');
+        return ok(task, {
+          files_written: ['src/a.ts'],
+          payload: { done: true, notes: 'Applied the review repair.' },
+        });
+      },
+    );
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok, outcome.message).toBe(true);
     expect(d.runner.executed.some((t) => t.id.startsWith('review-fix-01-'))).toBe(true);
     expect(reviews).toBe(2);
+  });
+
+  it('applies a pending native review repair before it exports the next review', async () => {
+    const d = deps(root);
+    const workflowEpoch = createWorkflowEpoch();
+    let reviews = 0;
+    let repairs = 0;
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) => {
+        reviews++;
+        if (reviews === 1) {
+          return ok(task, {
+            payload: {
+              approved: false,
+              findings: [
+                {
+                  type: 'implementation_bug',
+                  severity: 'high',
+                  description: 'Add the durable repair marker.',
+                  file: 'src/a.ts',
+                },
+              ],
+            },
+          });
+        }
+        if (reviews === 2) {
+          return ok(task, {
+            ok: false,
+            summary:
+              'The native result bundle has no result for task code-review-01-l1 because no exact native identity matched.',
+          });
+        }
+        return ok(task, { payload: { approved: true, findings: [] } });
+      },
+    );
+    d.runner.on(
+      (task) => task.id.startsWith('review-fix-'),
+      (task) => {
+        repairs++;
+        if (repairs === 1) {
+          return ok(task, {
+            ok: false,
+            summary:
+              'The native result bundle has no result for task review-fix-01-l1 because no exact native identity matched.',
+          });
+        }
+        const target = path.join(task.workspace!.root, 'src', 'a.ts');
+        fs.appendFileSync(target, 'export const repairedAfterNativePause = true;\n');
+        return ok(task, {
+          files_written: ['src/a.ts'],
+          payload: { done: true, notes: 'Applied the repair.' },
+        });
+      },
+    );
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const runtime = { ...d, workflowEpoch };
+
+    await expect(runWorkflow(root, {}, runtime)).rejects.toThrow(
+      'NATIVE_RESULT_REQUIRED: The native result bundle has no result for task review-fix-01-l1',
+    );
+    await expect(runWorkflow(root, {}, runtime)).rejects.toThrow(
+      'NATIVE_RESULT_REQUIRED: The native result bundle has no result for task code-review-01-l1',
+    );
+
+    const repairedSource = fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8');
+    expect(repairedSource).toContain(
+      'repairedAfterNativePause',
+    );
+    expect(
+      JSON.parse(
+        fs.readFileSync(
+          path.join(milestoneDir(root), 'phases', '01-catalog', 'REPAIR.json'),
+          'utf8',
+        ),
+      ),
+    ).toMatchObject({
+      kind: 'review',
+      loop: 1,
+      status: 'APPLIED',
+      task: { id: 'review-fix-01-l1' },
+    });
+    expect(new TaskStore(new RijoPaths(root)).read('review-fix-01-l1')?.state).toBe(
+      'SUCCEEDED',
+    );
+
+    const sourcePath = path.join(root, 'src', 'a.ts');
+    const baselinePath = path.join(
+      root,
+      '.rijo',
+      'runtime',
+      'phase-baselines',
+      'M001-01.json',
+    );
+    const withoutRepair = repairedSource.replace(
+      'export const repairedAfterNativePause = true;\n',
+      '',
+    );
+    fs.writeFileSync(sourcePath, withoutRepair);
+    const rewriteControlledHash = () => {
+      const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8')) as {
+        controlled_snapshot: Array<[string, string]>;
+      };
+      baseline.controlled_snapshot = baseline.controlled_snapshot.map(([file, hash]) =>
+        file === 'src/a.ts' ? [file, sha256File(sourcePath)] : [file, hash],
+      );
+      fs.writeFileSync(baselinePath, `${JSON.stringify(baseline, null, 2)}\n`);
+    };
+    rewriteControlledHash();
+    const missingPatch = await runWorkflow(root, {}, runtime);
+    expect(missingPatch.status).toBe('blocked');
+    expect(missingPatch.message).toContain(
+      'applied repair receipt does not match the controlled checkout',
+    );
+
+    fs.writeFileSync(sourcePath, repairedSource);
+    rewriteControlledHash();
+    const outcome = await runWorkflow(root, {}, runtime);
+    expect(outcome.ok, outcome.message).toBe(true);
+    expect(repairs).toBe(2);
+    expect(reviews).toBe(3);
+  });
+
+  it('recovers a committed review repair after a crash before its receipt advances', async () => {
+    const d = deps(root);
+    let reviews = 0;
+    let repairs = 0;
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) => {
+        reviews++;
+        return ok(task, {
+          payload:
+            reviews === 1
+              ? {
+                  approved: false,
+                  findings: [
+                    {
+                      type: 'implementation_bug',
+                      severity: 'high',
+                      description: 'Add the crash-safe repair marker.',
+                      file: 'src/a.ts',
+                    },
+                  ],
+                }
+              : { approved: true, findings: [] },
+        });
+      },
+    );
+    d.runner.on(
+      (task) => task.id.startsWith('review-fix-'),
+      (task) => {
+        repairs++;
+        const target = path.join(task.workspace!.root, 'src', 'a.ts');
+        fs.appendFileSync(target, 'export const recoveredRepair = true;\n');
+        return ok(task, {
+          files_written: ['src/a.ts'],
+          payload: { done: true, notes: 'Applied the repair.' },
+        });
+      },
+    );
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    let injected = false;
+
+    await expect(
+      runWorkflow(root, {}, {
+        ...d,
+        taskPatchHooks: {
+          afterApplied: (_transactionId, taskId) => {
+            if (injected || !taskId.startsWith('review-fix-')) return;
+            injected = true;
+            throw new Error('INJECTED-CRASH after review repair apply');
+          },
+        },
+      }),
+    ).rejects.toThrow('INJECTED-CRASH after review repair apply');
+
+    expect(fs.readFileSync(path.join(root, 'src', 'a.ts'), 'utf8')).toContain(
+      'recoveredRepair',
+    );
+    const repairPath = path.join(
+      milestoneDir(root),
+      'phases',
+      '01-catalog',
+      'REPAIR.json',
+    );
+    expect(JSON.parse(fs.readFileSync(repairPath, 'utf8'))).toMatchObject({
+      status: 'PENDING',
+      task: { id: 'review-fix-01-l1' },
+    });
+
+    const resumed = await runWorkflow(root, {}, d);
+
+    expect(resumed.ok, resumed.message).toBe(true);
+    expect(JSON.parse(fs.readFileSync(repairPath, 'utf8'))).toMatchObject({
+      status: 'APPLIED',
+      task: { id: 'review-fix-01-l1' },
+    });
+    expect(repairs).toBe(1);
+    expect(reviews).toBe(2);
+    expect(
+      fs.readdirSync(path.join(root, '.rijo', 'runtime', 'transactions')),
+    ).toEqual([]);
+    fs.appendFileSync(repairPath, ' ');
+    expect(detectDrift(new RijoPaths(root)).drifted).toContain(
+      path.relative(path.join(root, '.rijo'), repairPath).split(path.sep).join('/'),
+    );
+  });
+
+  it('resumes a pending native verification repair before it verifies again', async () => {
+    const d = deps(root);
+    const sourcePath = path.join(root, 'src', 'a.ts');
+    const shell: ShellRunner = {
+      run(command, options) {
+        if (
+          command === 'echo test-a' &&
+          (!fs.existsSync(sourcePath) ||
+            !fs.readFileSync(sourcePath, 'utf8').includes('verificationRepair'))
+        ) {
+          return {
+            command,
+            exit_code: 1,
+            summary: 'The verification repair is not present.',
+            duration_ms: 1,
+            blocked: false,
+            category: 'test',
+            sandbox: 'test-double',
+            trust: 'repository-script',
+            network: 'none',
+          };
+        }
+        return d.shell.run(command, options);
+      },
+    };
+    let repairs = 0;
+    d.runner.on(
+      (task) => task.id.startsWith('verify-fix-'),
+      (task) => {
+        repairs++;
+        if (repairs === 1) {
+          return ok(task, {
+            ok: false,
+            summary:
+              'The native result bundle has no result for task verify-fix-01-l1 because no exact native identity matched.',
+          });
+        }
+        const target = path.join(task.workspace!.root, 'src', 'a.ts');
+        fs.appendFileSync(target, 'export const verificationRepair = true;\n');
+        return ok(task, {
+          files_written: ['src/a.ts'],
+          payload: { done: true, notes: 'Applied the verification repair.' },
+        });
+      },
+    );
+    await newWorkflow(root, { planFile: '@PLAN.md' }, { ...d, shell });
+    const runtime = { ...d, shell, workflowEpoch: createWorkflowEpoch() };
+
+    await expect(runWorkflow(root, {}, runtime)).rejects.toThrow(
+      'NATIVE_RESULT_REQUIRED: The native result bundle has no result for task verify-fix-01-l1',
+    );
+    const resumed = await runWorkflow(root, {}, runtime);
+
+    expect(resumed.ok, resumed.message).toBe(true);
+    expect(fs.readFileSync(sourcePath, 'utf8')).toContain('verificationRepair');
+    expect(repairs).toBe(2);
+    expect(
+      JSON.parse(
+        fs.readFileSync(
+          path.join(milestoneDir(root), 'phases', '01-catalog', 'REPAIR.json'),
+          'utf8',
+        ),
+      ),
+    ).toMatchObject({
+      kind: 'verification',
+      loop: 1,
+      status: 'APPLIED',
+      task: { id: 'verify-fix-01-l1' },
+    });
+  });
+
+  it('rejects an applied repair receipt when its safe symlink disappears', async () => {
+    const d = deps(root);
+    let reviews = 0;
+    let repairs = 0;
+    d.runner.on(
+      (task) => task.id.startsWith('code-review-'),
+      (task) => {
+        reviews++;
+        if (reviews === 1) {
+          return ok(task, {
+            payload: {
+              approved: false,
+              findings: [
+                {
+                  type: 'implementation_bug',
+                  severity: 'high',
+                  description: 'Replace the module with the approved internal link.',
+                  file: 'src/a.ts',
+                },
+              ],
+            },
+          });
+        }
+        if (reviews === 2) {
+          return ok(task, {
+            payload: {
+              approved: false,
+              findings: [
+                {
+                  type: 'implementation_bug',
+                  severity: 'high',
+                  description: 'Add the second bounded repair.',
+                  file: 'src/b.ts',
+                },
+              ],
+            },
+          });
+        }
+        return ok(task, {
+          ok: false,
+          summary:
+            'The native result bundle has no result for task code-review-01-l2 because no exact native identity matched.',
+        });
+      },
+    );
+    d.runner.on(
+      (task) => task.id.startsWith('review-fix-'),
+      (task) => {
+        repairs++;
+        const relative = repairs === 1 ? 'src/a.ts' : 'src/b.ts';
+        const target = path.join(task.workspace!.root, relative);
+        if (repairs === 1) {
+          fs.rmSync(target);
+          fs.symlinkSync('b.ts', target);
+        } else {
+          fs.appendFileSync(target, 'export const secondRepair = true;\n');
+        }
+        return ok(task, {
+          files_written: [relative],
+          payload: { done: true, notes: 'Applied the bounded repair.' },
+        });
+      },
+    );
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const runtime = { ...d, workflowEpoch: createWorkflowEpoch() };
+
+    await expect(runWorkflow(root, {}, runtime)).rejects.toThrow(
+      'NATIVE_RESULT_REQUIRED: The native result bundle has no result for task code-review-01-l2',
+    );
+
+    const linkedPath = path.join(root, 'src', 'a.ts');
+    expect(fs.lstatSync(linkedPath).isSymbolicLink()).toBe(true);
+    const receipt = JSON.parse(
+      fs.readFileSync(
+        path.join(milestoneDir(root), 'phases', '01-catalog', 'REPAIR.json'),
+        'utf8',
+      ),
+    ) as {
+      controlled_updates: Array<{
+        path: string;
+        state: { kind: string; target?: string };
+      }>;
+    };
+    expect(receipt.controlled_updates).toEqual(
+      expect.arrayContaining([
+        { path: 'src/a.ts', state: { kind: 'symlink', target: 'b.ts' } },
+        expect.objectContaining({
+          path: 'src/b.ts',
+          state: expect.objectContaining({ kind: 'file' }),
+        }),
+      ]),
+    );
+    fs.rmSync(linkedPath);
+    const resumed = await runWorkflow(root, {}, runtime);
+
+    expect(resumed.status).toBe('blocked');
+    expect(resumed.details?.join('\n')).toContain(
+      'Current symlink does not match the repair receipt: src/a.ts.',
+    );
   });
 
   it('returns a legacy spec_gap finding to phase planning', async () => {
@@ -552,6 +943,22 @@ describe('rijo run', () => {
     // shell always fails for the plan's test command
     const failingShell = new FakeShellRunner([{ match: /echo test-a/, exitCode: 1, output: 'FAIL' }]);
     const d2 = { ...d, shell: failingShell };
+    let repairWrites = 0;
+    d.runner.on(
+      (task) => task.id.startsWith('verify-fix-'),
+      (task) => {
+        repairWrites++;
+        const target = path.join(task.workspace!.root, 'src', 'a.ts');
+        fs.appendFileSync(
+          target,
+          `export const verificationRepair${repairWrites} = true;\n`,
+        );
+        return ok(task, {
+          files_written: ['src/a.ts'],
+          payload: { done: true, notes: 'Applied a bounded verification repair.' },
+        });
+      },
+    );
     await newWorkflow(root, { planFile: '@PLAN.md' }, d2);
     const outcome = await runWorkflow(root, {}, d2);
     expect(outcome.status).toBe('blocked');

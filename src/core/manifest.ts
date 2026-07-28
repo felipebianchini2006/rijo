@@ -31,6 +31,7 @@ const PHASE_TRACKED = [
   'PLAN.md',
   'VERIFICATION.md',
   'REVIEW.md',
+  'REPAIR.json',
   'UI-SMOKE.json',
 ];
 

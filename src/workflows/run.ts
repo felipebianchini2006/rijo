@@ -115,6 +115,57 @@ const ReviewPayloadSchema = z.object({
 });
 type ReviewPayload = z.infer<typeof ReviewPayloadSchema>;
 
+const RepairSpecSchema = z.object({
+  id: z.string().min(1),
+  objective: z.string().min(1),
+  acceptance: z.array(z.string()),
+  commands: z.array(z.string()),
+  notes: z.string(),
+});
+
+const RepairControlledUpdateSchema = z.object({
+  path: z.string().min(1),
+  state: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('absent') }),
+    z.object({
+      kind: z.literal('file'),
+      sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    }),
+    z.object({ kind: z.literal('symlink'), target: z.string() }),
+  ]),
+});
+
+const PhaseRepairReceiptSchema = z
+  .object({
+    version: z.literal(1),
+    phase: z.string().regex(/^\d{2}$/),
+    kind: z.enum(['verification', 'review']),
+    loop: z.number().int().min(1),
+    status: z.enum(['PENDING', 'APPLIED']),
+    task: RepairSpecSchema,
+    created_at: z.string().datetime({ offset: true }),
+    applied_at: z.string().datetime({ offset: true }).optional(),
+    transaction_id: z.string().min(1).optional(),
+    controlled_updates: z.array(RepairControlledUpdateSchema).optional(),
+  })
+  .superRefine((receipt, issue) => {
+    if (
+      receipt.status === 'APPLIED' &&
+      (!receipt.applied_at ||
+        !receipt.transaction_id ||
+        !receipt.controlled_updates ||
+        receipt.controlled_updates.length === 0)
+    ) {
+      issue.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'An applied repair receipt requires applied_at, transaction_id, and controlled_updates.',
+      });
+    }
+  });
+type PhaseRepairReceipt = z.infer<typeof PhaseRepairReceiptSchema>;
+type RepairSpec = z.infer<typeof RepairSpecSchema>;
+
 interface TddRedEvidence {
   task_id: string;
   commands: CommandEvidence[];
@@ -280,6 +331,101 @@ function markPlanReplanned(
 
 function phaseRecoveryBaselinePath(ctx: WorkflowContext, milestone: string, phase: string): string {
   return path.join(ctx.paths.runtimeDir, 'phase-baselines', `${milestone}-${phase}.json`);
+}
+
+function phaseRepairReceiptPath(pp: PhasePaths): string {
+  return path.join(pp.dir, 'REPAIR.json');
+}
+
+function readPhaseRepairReceipt(pp: PhasePaths): PhaseRepairReceipt | null {
+  const parsed = PhaseRepairReceiptSchema.safeParse(
+    readJsonIfExists<unknown>(phaseRepairReceiptPath(pp)),
+  );
+  return parsed.success ? parsed.data : null;
+}
+
+function persistPhaseRepairReceipt(
+  ctx: WorkflowContext,
+  pp: PhasePaths,
+  receipt: PhaseRepairReceipt,
+): void {
+  persistPhaseGateFile(
+    ctx,
+    phaseRepairReceiptPath(pp),
+    `${JSON.stringify(PhaseRepairReceiptSchema.parse(receipt), null, 2)}\n`,
+  );
+}
+
+function appliedPhaseRepairReceipt(
+  receipt: PhaseRepairReceipt,
+  patch: PendingTaskPatch,
+  appliedAt: string,
+): PhaseRepairReceipt {
+  const cumulative = new Map(
+    (receipt.controlled_updates ?? []).map((update) => [update.path, update]),
+  );
+  for (const update of patch.controlled_updates) cumulative.set(update.path, update);
+  return PhaseRepairReceiptSchema.parse({
+    ...receipt,
+    status: 'APPLIED',
+    applied_at: appliedAt,
+    transaction_id: patch.transaction_id,
+    controlled_updates: [...cumulative.values()].sort((left, right) =>
+      left.path.localeCompare(right.path),
+    ),
+  });
+}
+
+function validateAppliedRepairReceipt(
+  receipt: PhaseRepairReceipt,
+  projectRoot: string,
+  controlledSnapshot: FileSnapshot,
+  currentSnapshot: FileSnapshot,
+): string[] {
+  if (receipt.status !== 'APPLIED') return [];
+  const updates = receipt.controlled_updates ?? [];
+  const issues: string[] = [];
+  for (const update of updates) {
+    const absolute = path.join(projectRoot, update.path);
+    if (update.state.kind === 'file') {
+      if ((currentSnapshot.get(update.path) ?? null) !== update.state.sha256) {
+        issues.push(`Current source does not match the repair receipt: ${update.path}.`);
+      }
+      if ((controlledSnapshot.get(update.path) ?? null) !== update.state.sha256) {
+        issues.push(`The phase checkpoint does not include the repair receipt: ${update.path}.`);
+      }
+      continue;
+    }
+    if (update.state.kind === 'symlink') {
+      let target: string | null = null;
+      try {
+        if (fs.lstatSync(absolute).isSymbolicLink()) target = fs.readlinkSync(absolute);
+      } catch {
+        target = null;
+      }
+      if (target !== update.state.target) {
+        issues.push(`Current symlink does not match the repair receipt: ${update.path}.`);
+      }
+      if (controlledSnapshot.has(update.path)) {
+        issues.push(`The phase checkpoint contains an invalid file entry for repaired symlink: ${update.path}.`);
+      }
+      continue;
+    }
+    let present = false;
+    try {
+      fs.lstatSync(absolute);
+      present = true;
+    } catch {
+      present = false;
+    }
+    if (present) {
+      issues.push(`A path deleted by the repair is present: ${update.path}.`);
+    }
+    if (controlledSnapshot.has(update.path)) {
+      issues.push(`The phase checkpoint still contains a path deleted by the repair: ${update.path}.`);
+    }
+  }
+  return issues;
 }
 
 function writePhaseRecoveryBaseline(
@@ -1235,8 +1381,11 @@ async function executePhase(
       }
       for (const update of patch.controlled_updates) {
         if (update.path === '.rijo' || update.path.startsWith('.rijo/')) continue;
-        if (update.hash === null) controlledSnapshot.delete(update.path);
-        else controlledSnapshot.set(update.path, update.hash);
+        if (update.state.kind === 'file') {
+          controlledSnapshot.set(update.path, update.state.sha256);
+        } else {
+          controlledSnapshot.delete(update.path);
+        }
       }
     }
     writePhaseRecoveryBaseline(
@@ -1266,7 +1415,23 @@ async function executePhase(
     for (const patch of recoveredTaskPatches) {
       const task = readPlan(pp.plan).tasks.find((candidate) => candidate.id === patch.task);
       if (!task) {
-        return blocked(ctx, `Phase ${phase.id}: retained task patch references unknown task ${patch.task}.`, []);
+        const repair = readPhaseRepairReceipt(pp);
+        if (!repair || repair.phase !== phase.id || repair.task.id !== patch.task) {
+          return blocked(ctx, `Phase ${phase.id}: retained task patch references unknown task ${patch.task}.`, []);
+        }
+        if (patch.controlled_updates.length === 0) {
+          return blocked(ctx, `Phase ${phase.id}: retained repair patch ${patch.transaction_id} has no source change.`, [
+            'RIJO did not advance the repair receipt.',
+          ]);
+        }
+        if (repair.status === 'PENDING') {
+          persistPhaseRepairReceipt(
+            ctx,
+            pp,
+            appliedPhaseRepairReceipt(repair, patch, now().toISOString()),
+          );
+        }
+        continue;
       }
       if (task.status === 'RUNNING') {
         transition(task.id, 'IMPLEMENTED', 'recovered committed task patch');
@@ -1302,14 +1467,37 @@ async function executePhase(
       controlledSnapshot,
     );
   }
-  const checkpointControlledSnapshot = (): void => {
-    controlledSnapshot = snapshotFiles(ctx.projectRoot);
-    writePhaseRecoveryBaseline(
-      recoveryBaselinePath,
-      phaseBaseline,
-      dirtyAtStart,
-      controlledSnapshot,
+  const applyRepairReceipt = async (
+    receipt: PhaseRepairReceipt,
+  ): Promise<WorkflowOutcome | null> => {
+    const repair = await runRepairAttempt(
+      ctx,
+      milestone.id,
+      phase.id,
+      pp,
+      plan!,
+      receipt.task,
     );
+    if (typeof repair !== 'string') return repair;
+    const retained = listPendingTaskPatches(paths).find(
+      (patch) => patch.transaction_id === repair,
+    );
+    if (!retained || !retained.final_state_matches) {
+      return blocked(ctx, `Phase ${phase.id}: retained repair patch ${repair} is incomplete or conflicts with the checkout.`, [
+        'RIJO kept the repair transaction for deterministic recovery.',
+      ]);
+    }
+    if (retained.controlled_updates.length === 0) {
+      return blocked(ctx, `Phase ${phase.id}: repair task ${receipt.task.id} produced no source change.`, [
+        'A successful repair must change at least one path in its write scope.',
+      ]);
+    }
+    persistPhaseRepairReceipt(
+      ctx,
+      pp,
+      appliedPhaseRepairReceipt(receipt, retained, now().toISOString()),
+    );
+    return checkpointTaskPatches([retained]);
   };
 
   // Deterministic resume: a RUNNING task from a crashed run is reset (its
@@ -1668,6 +1856,28 @@ async function executePhase(
   let reviewLoops = 0;
   let evidences: CommandEvidence[] = [];
   let acceptedReviewInputHash: string | null = null;
+  const resumedRepair = readPhaseRepairReceipt(pp);
+  if (resumedRepair) {
+    reviewLoops = resumedRepair.loop;
+    if (resumedRepair.status === 'PENDING') {
+      const repairOutcome = await applyRepairReceipt(resumedRepair);
+      if (repairOutcome) return repairOutcome;
+    } else {
+      const repairIssues = validateAppliedRepairReceipt(
+        resumedRepair,
+        ctx.projectRoot,
+        controlledSnapshot,
+        snapshotFiles(ctx.projectRoot),
+      );
+      if (repairIssues.length > 0) {
+        return blocked(
+          ctx,
+          `Phase ${phase.id}: the applied repair receipt does not match the controlled checkout.`,
+          repairIssues,
+        );
+      }
+    }
+  }
   while (true) {
     stage('VERIFY', 'Run build, lint, and focused tests.');
     for (const t of readPlan(pp.plan).tasks) {
@@ -1707,15 +1917,25 @@ async function executePhase(
         );
       }
       reviewLoops++;
-      const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
-        id: `verify-fix-${phase.id}-l${reviewLoops}`,
-        objective: 'Fix the verification failures below with the smallest coherent change. Do not weaken tests to make them pass.',
-        acceptance: ['All verification commands exit 0'],
-        commands: failures.map((f) => f.command),
-        notes: failures.map((f) => `${f.command} → exit ${f.exit_code}\n${f.summary.slice(0, 800)}`).join('\n\n'),
+      const receipt = PhaseRepairReceiptSchema.parse({
+        version: 1,
+        phase: phase.id,
+        kind: 'verification',
+        loop: reviewLoops,
+        status: 'PENDING',
+        task: {
+          id: `verify-fix-${phase.id}-l${reviewLoops}`,
+          objective: 'Fix the verification failures below with the smallest coherent change. Do not weaken tests to make them pass.',
+          acceptance: ['All verification commands exit 0'],
+          commands: failures.map((f) => f.command),
+          notes: failures.map((f) => `${f.command} → exit ${f.exit_code}\n${f.summary.slice(0, 800)}`).join('\n\n'),
+        },
+        created_at: now().toISOString(),
+        controlled_updates: readPhaseRepairReceipt(pp)?.controlled_updates ?? [],
       });
+      persistPhaseRepairReceipt(ctx, pp, receipt);
+      const repairOutcome = await applyRepairReceipt(receipt);
       if (repairOutcome) return repairOutcome;
-      checkpointControlledSnapshot();
       continue;
     }
 
@@ -1801,15 +2021,25 @@ async function executePhase(
         return blocked(ctx, `Phase ${phase.id}: code review produced no usable verdict after ${config.limits.review_loops} cycles.`, [crRes.summary]);
       }
       reviewLoops++;
-      const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
-        id: `review-fix-${phase.id}-l${reviewLoops}`,
-        objective: 'Address the reviewer feedback below with minimal coherent changes; keep all verification commands passing.',
-        acceptance: ['Reviewer feedback addressed', 'Verification commands still pass'],
-        commands: [],
-        notes: `Reviewer verdict (unstructured): ${crRes.summary}`,
+      const receipt = PhaseRepairReceiptSchema.parse({
+        version: 1,
+        phase: phase.id,
+        kind: 'review',
+        loop: reviewLoops,
+        status: 'PENDING',
+        task: {
+          id: `review-fix-${phase.id}-l${reviewLoops}`,
+          objective: 'Address the reviewer feedback below with minimal coherent changes; keep all verification commands passing.',
+          acceptance: ['Reviewer feedback addressed', 'Verification commands still pass'],
+          commands: [],
+          notes: `Reviewer verdict (unstructured): ${crRes.summary}`,
+        },
+        created_at: now().toISOString(),
+        controlled_updates: readPhaseRepairReceipt(pp)?.controlled_updates ?? [],
       });
+      persistPhaseRepairReceipt(ctx, pp, receipt);
+      const repairOutcome = await applyRepairReceipt(receipt);
       if (repairOutcome) return repairOutcome;
-      checkpointControlledSnapshot();
       continue;
     }
     let reviewData = cr.data;
@@ -1915,15 +2145,25 @@ async function executePhase(
     reviewLoops++;
     discardDecisionProposals(ctx, crRes);
     if (securityEnvelope) discardDecisionProposals(ctx, securityEnvelope);
-    const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
-      id: `review-fix-${phase.id}-l${reviewLoops}`,
-      objective: 'Address the valid review findings below with minimal coherent changes.',
-      acceptance: ['Findings addressed', 'Verification commands still pass'],
-      commands: [],
-      notes: actionable.map((f) => `${f.type}/${f.severity}: ${f.description}${f.file ? ` (${f.file})` : ''}`).join('\n'),
+    const receipt = PhaseRepairReceiptSchema.parse({
+      version: 1,
+      phase: phase.id,
+      kind: 'review',
+      loop: reviewLoops,
+      status: 'PENDING',
+      task: {
+        id: `review-fix-${phase.id}-l${reviewLoops}`,
+        objective: 'Address the valid review findings below with minimal coherent changes.',
+        acceptance: ['Findings addressed', 'Verification commands still pass'],
+        commands: [],
+        notes: actionable.map((f) => `${f.type}/${f.severity}: ${f.description}${f.file ? ` (${f.file})` : ''}`).join('\n'),
+      },
+      created_at: now().toISOString(),
+      controlled_updates: readPhaseRepairReceipt(pp)?.controlled_updates ?? [],
     });
+    persistPhaseRepairReceipt(ctx, pp, receipt);
+    const repairOutcome = await applyRepairReceipt(receipt);
     if (repairOutcome) return repairOutcome;
-    checkpointControlledSnapshot();
   }
 
   if (!acceptedReviewInputHash) {
@@ -2046,11 +2286,12 @@ async function executePhase(
  */
 async function runRepairAttempt(
   ctx: WorkflowContext,
+  milestoneId: string,
   phaseId: string,
   pp: PhasePaths,
   plan: PhasePlan,
-  spec: { id: string; objective: string; acceptance: string[]; commands: string[]; notes: string },
-): Promise<WorkflowOutcome | null> {
+  spec: RepairSpec,
+): Promise<WorkflowOutcome | string> {
   const repairTask: AgentTaskDraft = {
     id: spec.id,
     role: 'worker',
@@ -2072,9 +2313,19 @@ async function runRepairAttempt(
     if (!res.ok) {
       return blocked(ctx, `Phase ${phaseId}: repair worker failed.`, [res.summary]);
     }
-    handle.attempt.workspace.applyVerifiedPatch();
+    const applied = handle.attempt.workspace.applyVerifiedPatch({
+      taskPatch: {
+        milestone: milestoneId,
+        phase: phaseId,
+        task: spec.id,
+      },
+    });
     commitDecisionProposals(ctx, res);
-    return null;
+    if (!applied.transaction_id) {
+      throw new Error(`Phase ${phaseId}: repair patch did not retain a transaction receipt.`);
+    }
+    ctx.taskPatchHooks.afterApplied?.(applied.transaction_id, spec.id);
+    return applied.transaction_id;
   } catch (err) {
     if (isNativeResultRequired(err)) {
       preserveNativeWorkspace = true;

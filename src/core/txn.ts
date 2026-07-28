@@ -697,7 +697,7 @@ export interface PendingTaskPatch {
   phase: string;
   task: string;
   worker_task: string;
-  controlled_updates: Array<{ path: string; hash: string | null }>;
+  controlled_updates: Array<{ path: string; state: TxnPathState }>;
   final_state_matches: boolean;
 }
 
@@ -721,7 +721,12 @@ function pendingTaskPatchFromDir(dir: string, projectRoot: string): PendingTaskP
     .filter((operation) => operation.type !== 'directory')
     .map((operation) => ({
       path: operation.path,
-      hash: operation.type === 'file' ? operation.sha256 : null,
+      state:
+        operation.type === 'file'
+          ? ({ kind: 'file', sha256: operation.sha256 } as const)
+          : operation.type === 'symlink'
+            ? ({ kind: 'symlink', target: operation.target } as const)
+            : ({ kind: 'absent' } as const),
     }));
   return {
     transaction_id: path.basename(dir),
