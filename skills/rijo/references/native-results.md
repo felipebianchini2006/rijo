@@ -2,6 +2,8 @@
 
 Use this protocol to transfer native subagent results to the deterministic core.
 Do not start a provider process.
+Keep the working directory at the project root that contains `.rijo/`.
+Inspect runtime files without changing the working directory to `.rijo/runtime/`.
 
 Create `.rijo/runtime/native-results.json` with this initial content:
 

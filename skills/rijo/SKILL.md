@@ -9,6 +9,8 @@ Use the active host session as the lead orchestrator.
 Use native subagents for bounded delegated work.
 Keep canonical project memory in `.rijo/`.
 Use `.rijo/bin/rijo.cjs` for every deterministic helper.
+Run every helper from the project root that contains `.rijo/`.
+Do not change the working directory to `.rijo/runtime/`.
 
 ## Route the command
 

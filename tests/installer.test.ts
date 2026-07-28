@@ -122,7 +122,7 @@ describe('native installer API', () => {
     );
     fs.writeFileSync(
       path.join(installed, 'dist', 'cli', 'index.js'),
-      "console.log(`LOCAL_RIJO ${process.argv.slice(2).join(' ')}`);\n",
+      "console.log(JSON.stringify({ marker: 'LOCAL_RIJO', cwd: process.cwd(), args: process.argv.slice(2) }));\n",
     );
     const lock = {
       name: path.basename(root),
@@ -135,12 +135,18 @@ describe('native installer API', () => {
     };
     fs.writeFileSync(binding.lockfile, JSON.stringify(lock, null, 2));
 
+    const nestedCwd = path.join(root, '.rijo', 'runtime');
+    fs.mkdirSync(nestedCwd, { recursive: true });
     const local = spawnSync(process.execPath, [binding.launcher, 'internal', 'status'], {
-      cwd: root,
+      cwd: nestedCwd,
       encoding: 'utf8',
     });
     expect(local.status).toBe(0);
-    expect(local.stdout.trim()).toBe('LOCAL_RIJO internal status');
+    expect(JSON.parse(local.stdout)).toEqual({
+      marker: 'LOCAL_RIJO',
+      cwd: fs.realpathSync(root),
+      args: ['internal', 'status'],
+    });
 
     lock.packages['node_modules/rijo'].version = '9.9.9';
     fs.writeFileSync(binding.lockfile, JSON.stringify(lock, null, 2));
