@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { redact } from '../security/redact.js';
@@ -42,6 +42,7 @@ export interface ShellRunOptions {
 
 export interface ShellRunner {
   run(command: string, opts?: ShellRunOptions): CommandEvidence;
+  runAsync?(command: string, opts?: ShellRunOptions): Promise<CommandEvidence>;
 }
 
 const SUMMARY_LIMIT = 2000;
@@ -242,6 +243,93 @@ export class SystemShellRunner implements ShellRunner {
       trust: plan.command.trust,
       network: plan.command.network,
     };
+  }
+
+  async runAsync(command: string, opts: ShellRunOptions = {}): Promise<CommandEvidence> {
+    const decision = evaluateCommand(command);
+    if (decision.ok && decision.executable === 'test') {
+      return this.run(command, opts);
+    }
+    const plan = planCommand(command, {
+      cwd: opts.cwd ?? process.cwd(),
+      config: this.execConfig,
+      allowInstall: opts.allowInstall,
+      allowLoopback: opts.allowLoopback,
+    });
+    if (!plan.ok) {
+      const fallback = evaluateCommand(command);
+      return {
+        command,
+        exit_code: EXIT_BLOCKED,
+        summary: `blocked by execution policy: ${plan.reason}`,
+        duration_ms: 0,
+        blocked: true,
+        category: fallback.ok ? fallback.category : 'custom',
+        sandbox: 'blocked',
+      };
+    }
+
+    const started = Date.now();
+    const timeoutMs = opts.timeoutMs ?? plan.command.timeoutMs;
+    return await new Promise<CommandEvidence>((resolve) => {
+      const child = spawn(plan.spawn.executable, plan.spawn.args, {
+        shell: process.platform === 'win32',
+        cwd: plan.command.cwd,
+        env: plan.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      const maxBytes = 16 * 1024 * 1024;
+      const collect = (chunk: Buffer) => {
+        chunks.push(chunk);
+        totalBytes += chunk.length;
+        while (totalBytes > maxBytes && chunks.length > 1) {
+          totalBytes -= chunks.shift()!.length;
+        }
+      };
+      child.stdout?.on('data', collect);
+      child.stderr?.on('data', collect);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGTERM');
+      }, timeoutMs);
+      child.once('error', (error) => {
+        clearTimeout(timer);
+        const summary = redact(error.message);
+        resolve({
+          command,
+          exit_code: 1,
+          summary,
+          duration_ms: Date.now() - started,
+          blocked: false,
+          category: plan.command.category,
+          sandbox: plan.sandbox,
+          trust: plan.command.trust,
+          network: plan.command.network,
+        });
+      });
+      child.once('close', (code, signal) => {
+        clearTimeout(timer);
+        const output = Buffer.concat(chunks).toString('utf8').trim();
+        const timeoutNote = timedOut ? `Command timed out after ${timeoutMs}ms.` : '';
+        const signalNote = signal && !timedOut ? `Command stopped with signal ${signal}.` : '';
+        const combined = [output, timeoutNote, signalNote].filter(Boolean).join('\n');
+        const tail = combined.length > SUMMARY_LIMIT ? `…${combined.slice(-SUMMARY_LIMIT)}` : combined;
+        resolve({
+          command,
+          exit_code: timedOut ? 1 : (code ?? 1),
+          summary: redact(tail),
+          duration_ms: Date.now() - started,
+          blocked: false,
+          category: plan.command.category,
+          sandbox: plan.sandbox,
+          trust: plan.command.trust,
+          network: plan.command.network,
+        });
+      });
+    });
   }
 }
 

@@ -52,6 +52,59 @@ export interface GateDeps {
 /** Windows needs a shell to resolve/execute .cmd shims (npm, playwright). */
 const WIN_SHELL = process.platform === 'win32';
 
+async function runShell(
+  shell: ShellRunner,
+  command: string,
+  options: Parameters<ShellRunner['run']>[1],
+): Promise<CommandEvidence> {
+  if (shell.runAsync) return await shell.runAsync(command, options);
+  return shell.run(command, options);
+}
+
+async function runPlaywright(
+  bin: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return await new Promise((resolve) => {
+    const child = spawn(bin, args, {
+      cwd,
+      env,
+      shell: WIN_SHELL,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => {
+      stdout = `${stdout}${chunk}`.slice(-(32 * 1024 * 1024));
+    });
+    child.stderr?.on('data', (chunk: string) => {
+      stderr = `${stderr}${chunk}`.slice(-(32 * 1024 * 1024));
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+    }, timeoutMs);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      resolve({ exitCode: 1, stdout, stderr: `${stderr}\n${error.message}`.trim() });
+    });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      resolve({
+        exitCode: timedOut ? 1 : (code ?? 1),
+        stdout,
+        stderr: timedOut ? `${stderr}\nPlaywright timed out after ${timeoutMs}ms.`.trim() : stderr,
+      });
+    });
+  });
+}
+
 function toolVersion(bin: string, args: string[], cwd?: string): string {
   const r = spawnSync(bin, args, { encoding: 'utf8', cwd, shell: WIN_SHELL });
   return r.status === 0 ? (r.stdout ?? '').trim() : 'unavailable';
@@ -162,7 +215,7 @@ export async function runProductionGate(
     }
     if (exists(path.join(gateDir, 'package-lock.json'))) {
       deps.emit('gate.install', 'Installing dependencies with npm ci --ignore-scripts.');
-      const ev = deps.shell.run('npm ci --no-audit --no-fund', { cwd: gateDir, allowInstall: true, timeoutMs: 10 * 60 * 1000 });
+      const ev = await runShell(deps.shell, 'npm ci --no-audit --no-fund', { cwd: gateDir, allowInstall: true, timeoutMs: 10 * 60 * 1000 });
       commands.push(ev);
       if (ev.exit_code !== 0) {
         return { ...blockedReport([`Dependency installation failed in the gate checkout (exit ${ev.exit_code}).`], commit), commands };
@@ -180,7 +233,7 @@ export async function runProductionGate(
         'gate.install',
         `Installing the locked browser versions: ${qa.browsers.join(', ')}.`,
       );
-      const browserInstall = deps.shell.run(installCommand, {
+      const browserInstall = await runShell(deps.shell, installCommand, {
         cwd: gateDir,
         allowInstall: true,
         timeoutMs: 10 * 60 * 1000,
@@ -204,7 +257,7 @@ export async function runProductionGate(
     const deterministicCheckStart = commands.length;
     for (const script of ['typecheck', 'lint', 'build', 'test']) {
       if (pkg.scripts?.[script]) {
-        const ev = deps.shell.run(`npm run ${script}`, { cwd: gateDir });
+        const ev = await runShell(deps.shell, `npm run ${script}`, { cwd: gateDir });
         commands.push(ev);
         deps.emit('gate.check', `${script} → exit ${ev.exit_code}`);
       }
@@ -298,18 +351,17 @@ export async function runProductionGate(
     }
     const started = Date.now();
     const pwEnv = buildEnv(gateDir, config.execution);
-    const pw = spawnSync(pwBin, ['test', `--config=${pwConfigPath}`], {
-      cwd: gateDir,
-      env: pwEnv,
-      encoding: 'utf8',
-      timeout: config.execution.command_timeout_ms,
-      maxBuffer: 32 * 1024 * 1024,
-      shell: WIN_SHELL,
-    });
+    const pw = await runPlaywright(
+      pwBin,
+      ['test', `--config=${pwConfigPath}`],
+      gateDir,
+      pwEnv,
+      config.execution.command_timeout_ms,
+    );
     commands.push({
       command: 'playwright test (gate, RIJO-generated specs)',
-      exit_code: pw.status ?? 1,
-      summary: `${(pw.stdout ?? '').slice(-1500)}\n${(pw.stderr ?? '').slice(-500)}`.trim(),
+      exit_code: pw.exitCode,
+      summary: `${pw.stdout.slice(-1500)}\n${pw.stderr.slice(-500)}`.trim(),
       duration_ms: Date.now() - started,
       blocked: false,
       category: 'test',
