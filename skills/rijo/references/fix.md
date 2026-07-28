@@ -12,5 +12,8 @@ Run these stages in order:
 6. Run the regression test.
 7. Run affected verification commands.
 8. Document the fix in `.rijo/fixes/`.
+9. Read `native-results.md`.
+10. Record the reproduction and repair in a result bundle.
+11. Run `node .rijo/bin/rijo.cjs internal fix-open "<description>" --results @.rijo/runtime/native-results.json`.
 
 Create a new phase only for an architectural, destructive, security-wide, or business-intent change.

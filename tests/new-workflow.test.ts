@@ -154,10 +154,19 @@ describe('rijo new (greenfield)', () => {
     expect(sources.sources.length).toBeGreaterThan(0);
     expect(sources.sources[0]).toMatchObject({ url: expect.stringContaining('nodejs.org') });
     const cache = JSON.parse(fs.readFileSync(paths.researchCache, 'utf8'));
-    expect(cache.entries[0]!.key).toBe('node-lts');
+    expect(cache.entries).toHaveLength(3);
+    expect(cache.entries.map((entry: { key: string }) => entry.key)).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^project-stack-/),
+        expect.stringMatching(/^project-architecture-/),
+        expect.stringMatching(/^project-risks-/),
+      ]),
+    );
     const researchTask = d.runner.executed.find((task) => task.id === 'new-research-1')!;
     expect(researchTask.return_format).toContain('confidence: high|medium|low');
     expect(researchTask.return_format).toContain('checked_at: ISO-8601 string');
+    expect(d.runner.executed.filter((task) => task.id.startsWith('new-research-'))).toHaveLength(3);
+    expect(d.runner.executed.find((task) => task.id === 'new-roadmap')).toBeDefined();
   });
 
   it('normalizes a numeric research confidence score', async () => {

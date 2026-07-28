@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { newWorkflow } from '../src/workflows/new.js';
 import { runWorkflow } from '../src/workflows/run.js';
-import { checkWorkflow } from '../src/workflows/check.js';
+import { checkWorkflow, testWorkflow } from '../src/workflows/check.js';
 import { openQaCheckpoint } from '../src/workflows/qa-checkpoint.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readManifest } from '../src/core/manifest.js';
@@ -131,7 +131,7 @@ describe('rijo check', () => {
     expect(report).toContain('[high]');
   });
 
-  it('--fix groups failures and re-runs only failing journeys, bounded at 2 rounds', async () => {
+  it('--fix records defects and runs a complete regression pass after repair', async () => {
     const d = deps(root, { capabilities: { browser: true } });
     prepareReadyProject(root, d);
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
@@ -161,8 +161,91 @@ describe('rijo check', () => {
     const outcome = await checkWorkflow(root, { fix: true }, d);
     expect(outcome.ok, outcome.message).toBe(true);
     expect(d.runner.executed.filter((t) => t.id.startsWith('check-fix-'))).toHaveLength(1);
-    // J01 re-ran; J02 did not (2 initial + 1 rerun = 3 journey executions)
-    expect(d.runner.executed.filter((t) => t.id.startsWith('journey-'))).toHaveLength(3);
+    // Every journey runs again after a repair.
+    expect(d.runner.executed.filter((t) => t.id.startsWith('journey-'))).toHaveLength(4);
+    const results = path.join(new RijoPaths(root).qaDir, 'test-results');
+    expect(fs.existsSync(path.join(results, 'J01', 'PASS-01.json'))).toBe(true);
+    expect(fs.existsSync(path.join(results, 'J01', 'PASS-02.json'))).toBe(true);
+    expect(fs.existsSync(path.join(results, 'J02', 'PASS-02.json'))).toBe(true);
+  });
+
+  it('test repairs defects by default and still executes every journey', async () => {
+    const d = deps(root, { capabilities: { browser: true } });
+    prepareReadyProject(root, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    await runWorkflow(root, { target: 'all' }, d);
+    let repaired = false;
+    d.runner.on(
+      (t) => t.id.startsWith('journey-'),
+      (t) => {
+        const id = t.id.replace(/-pass-\d+$/, '').replace('journey-', '');
+        const failing = id === 'J01' && !repaired;
+        return ok(t, {
+          payload: {
+            journey_id: id,
+            passed: !failing,
+            steps: ['open', 'submit'],
+            console_errors: [],
+            network_errors: [],
+            findings: failing
+              ? [{ severity: 'high', description: 'submit fails', evidence: null }]
+              : [],
+            screenshots: [],
+          },
+        });
+      },
+    );
+    d.runner.on(
+      (t) => t.id.startsWith('check-fix-'),
+      (t) => {
+        repaired = true;
+        return ok(t, { payload: { done: true, notes: 'submit repaired' } });
+      },
+    );
+
+    const outcome = await testWorkflow(root, {}, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    expect(d.runner.executed.filter((t) => t.id.startsWith('check-fix-'))).toHaveLength(1);
+    expect(d.runner.executed.filter((t) => t.id.startsWith('journey-'))).toHaveLength(4);
+  });
+
+  it('returns NOT_READY after the defect and regression budgets are exhausted', async () => {
+    const d = deps(root, { capabilities: { browser: true } });
+    prepareReadyProject(root, d);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    await runWorkflow(root, { target: 'all' }, d);
+    d.runner.on(
+      (t) => t.id.startsWith('journey-'),
+      (t) => {
+        const id = t.id.replace(/-pass-\d+$/, '').replace('journey-', '');
+        const failing = id === 'J01';
+        return ok(t, {
+          payload: {
+            journey_id: id,
+            passed: !failing,
+            steps: ['open', 'submit'],
+            console_errors: [],
+            network_errors: [],
+            findings: failing
+              ? [{ severity: 'high', description: 'persistent submit failure', evidence: null }]
+              : [],
+            screenshots: [],
+          },
+        });
+      },
+    );
+    d.runner.on(
+      (t) => t.id.startsWith('check-fix-'),
+      (t) => ok(t, { payload: { done: true, notes: 'attempted repair' } }),
+    );
+
+    const outcome = await testWorkflow(root, {}, d);
+
+    expect(outcome.status).toBe('not_ready');
+    expect(d.runner.executed.filter((t) => t.id.startsWith('check-fix-'))).toHaveLength(2);
+    expect(d.runner.executed.filter((t) => t.id.startsWith('journey-'))).toHaveLength(6);
+    expect(fs.readFileSync(readinessPath(root), 'utf8')).toContain('persistent submit failure');
   });
 });
 

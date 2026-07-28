@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import { exists, readText, writeFileAtomic } from '../core/fsx.js';
+import { ensureDir, exists, readText, writeFileAtomic, writeJsonAtomic } from '../core/fsx.js';
 import { serializeFrontmatter, parseFrontmatter } from '../core/frontmatter.js';
 import { activeMilestone, type MilestoneRef } from '../core/milestones.js';
 import { readRequirements } from '../core/roadmap.js';
@@ -65,7 +65,11 @@ export async function testWorkflow(
   opts: Omit<CheckOptions, 'production'> = {},
   deps: WorkflowDeps = {},
 ): Promise<WorkflowOutcome> {
-  return checkWorkflow(projectRoot, { ...opts, production: false }, deps);
+  return checkWorkflow(
+    projectRoot,
+    { ...opts, fix: opts.fix ?? true, production: false },
+    deps,
+  );
 }
 
 /**
@@ -137,40 +141,86 @@ export async function checkCore(
       bus.emit('check.journeys', { stage: 'JOURNEYS', message: 'The browser is unavailable. Journeys were not executed (BLOCKED).' });
     } else {
       bus.emit('check.journeys', { stage: 'JOURNEYS', message: `Run ${journeys.length} journeys with isolated agents.` });
-      journeyResults = await runJourneys(ctx, milestone.paths.qaDir, journeys);
+      let regressionPass = 1;
+      journeyResults = await runJourneys(
+        ctx,
+        milestone.paths.qaDir,
+        journeys,
+        regressionPass,
+      );
 
       // ---- 12: --fix loop (bounded). After each repair the WHOLE matrix is
       // re-run — deterministic checks (build/lint/typecheck/test) AND the
       // failing journeys — so READY reflects the repaired state, not the old one.
       if (opts.fix) {
-        for (let round = 1; round <= config.limits.qa_fix_loops; round++) {
+        const attempts = new Map<string, number>();
+        while (regressionPass < config.limits.qa_regression_passes) {
           const failingJourneys = journeyResults.filter((r) => !r.passed);
           const failingChecks = checks.filter((c) => c.exit_code !== 0);
           if (failingJourneys.length === 0 && failingChecks.length === 0) break;
-          bus.emit('check.fix', { stage: 'REPAIR', message: `Round ${round}: repair the root cause.` });
-          const fixTask: AgentTaskDraft = {
-            id: `check-fix-${round}`,
-            role: 'worker',
-            objective: 'Group the failing checks and journey findings by root cause and fix them in limited scope. Do not fix symptoms individually when one cause explains several failures.',
-            canonical_files: [paths.rules].filter(exists),
-            code_files: [],
-            write_scope: ['**'],
-            acceptance_criteria: ['Failing journeys and checks pass on re-run'],
-            verification_commands: [],
-            return_format: 'JSON payload: {done: boolean, notes: string}',
-            notes: [
-              ...failingChecks.map((c) => `check ${c.command} → exit ${c.exit_code}`),
-              ...failingJourneys.map((f) => `${f.journey_id}: ${f.findings.map((x) => `${x.severity} ${x.description}`).join('; ')}`),
-            ].join('\n'),
-          };
-          const fixRes = await dispatch(ctx, fixTask, { stage: 'EXECUTE' });
-          if (!fixRes.ok) break;
-          commitDecisionProposals(ctx, fixRes);
-          fixesApplied.push(`round ${round}: ${fixRes.summary}`);
-          // re-run the entire deterministic matrix, not only the failing subset
+          const defectGroups = [
+            ...failingJourneys.map((result) => ({
+              id: result.journey_id,
+              notes: result.findings
+                .map((finding) => `${finding.severity}: ${finding.description}`)
+                .join('\n'),
+            })),
+            ...(failingChecks.length > 0
+              ? [{
+                  id: 'deterministic-checks',
+                  notes: failingChecks
+                    .map((check) => `${check.command} → exit ${check.exit_code}`)
+                    .join('\n'),
+                }]
+              : []),
+          ];
+          let attemptedRepair = false;
+          for (const defect of defectGroups) {
+            const attemptNumber = (attempts.get(defect.id) ?? 0) + 1;
+            if (attemptNumber > config.limits.qa_defect_attempts) continue;
+            attempts.set(defect.id, attemptNumber);
+            attemptedRepair = true;
+            bus.emit('check.fix', {
+              stage: 'REPAIR',
+              message: `Repair ${defect.id}. Attempt ${attemptNumber}/${config.limits.qa_defect_attempts}.`,
+            });
+            const fixTask: AgentTaskDraft = {
+              id: `check-fix-${defect.id}-a${attemptNumber}`,
+              role: 'worker',
+              objective:
+                'Reproduce the recorded defect. Fix its root cause with the smallest coherent change. Do not weaken tests.',
+              canonical_files: [paths.rules].filter(exists),
+              code_files: [],
+              write_scope: ['**'],
+              acceptance_criteria: ['The recorded defect no longer reproduces.'],
+              verification_commands: [],
+              return_format: 'JSON payload: {done: boolean, notes: string}',
+              notes: defect.notes,
+            };
+            const repair = prepareAttempt(ctx, fixTask);
+            try {
+              const fixRes = await dispatch(ctx, repair.task, { stage: 'EXECUTE' });
+              if (!fixRes.ok) {
+                discardDecisionProposals(ctx, fixRes);
+                continue;
+              }
+              repair.workspace.validate();
+              repair.workspace.applyVerifiedPatch();
+              commitDecisionProposals(ctx, fixRes);
+              fixesApplied.push(`${defect.id} attempt ${attemptNumber}: ${fixRes.summary}`);
+            } finally {
+              repair.workspace.discard();
+            }
+          }
+          if (!attemptedRepair) break;
           checks = runDeterministicChecks(ctx);
-          const rerun = await runJourneys(ctx, milestone.paths.qaDir, journeys.filter((j) => failingJourneys.some((f) => f.journey_id === j.id)));
-          journeyResults = journeyResults.map((r) => rerun.find((x) => x.journey_id === r.journey_id) ?? r);
+          regressionPass++;
+          journeyResults = await runJourneys(
+            ctx,
+            milestone.paths.qaDir,
+            journeys,
+            regressionPass,
+          );
         }
       }
 
@@ -364,7 +414,7 @@ export async function checkCore(
     if (decision.status === 'READY') return completed(ctx, `Production readiness: READY (commit ${commit?.slice(0, 8) ?? 'n/a'}).`, details);
     return {
       ok: false,
-      status: 'blocked' as const,
+      status: decision.status === 'NOT_READY' ? 'not_ready' as const : 'blocked' as const,
       message: `Production readiness: ${decision.status}.`,
       details,
     };
@@ -580,7 +630,12 @@ async function productionCheck(
   if (status === 'READY') {
     return completed(ctx, `Production readiness: READY (commit ${gate.tested_commit.slice(0, 8)}).`, details);
   }
-  return { ok: false, status: 'blocked' as const, message: `Production readiness: ${status}.`, details };
+  return {
+    ok: false,
+    status: status === 'NOT_READY' ? 'not_ready' as const : 'blocked' as const,
+    message: `Production readiness: ${status}.`,
+    details,
+  };
 }
 
 function detectHasBuild(ctx: WorkflowContext): boolean {
@@ -625,9 +680,14 @@ function runDeterministicChecks(ctx: WorkflowContext): CommandEvidence[] {
   });
 }
 
-async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journey[]): Promise<JourneyResult[]> {
+async function runJourneys(
+  ctx: WorkflowContext,
+  qaDir: string,
+  journeys: Journey[],
+  pass = 1,
+): Promise<JourneyResult[]> {
   const tasks: AgentTaskDraft[] = journeys.map((j) => ({
-    id: `journey-${j.id}`,
+    id: pass === 1 ? `journey-${j.id}` : `journey-${j.id}-pass-${pass}`,
     role: 'qa',
     objective: [
       `Execute journey ${j.id} as a real user: enter the system, run the complete flow, click relevant actions, verify persistence and side effects.`,
@@ -637,7 +697,7 @@ async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journe
     ].join('\n'),
     canonical_files: [],
     code_files: [],
-    write_scope: [qaDir.replace(/\\/g, '/') + '/**'],
+    write_scope: [],
     acceptance_criteria: j.requirement_ids,
     verification_commands: [],
     return_format:
@@ -651,9 +711,8 @@ async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journe
     const parsed = JourneyResultSchema.safeParse(r.payload);
     if (r.ok && parsed.success) commitDecisionProposals(ctx, r);
     else discardDecisionProposals(ctx, r);
-    out.push(
-      parsed.success
-        ? parsed.data
+    const result: JourneyResult = parsed.success
+        ? { ...parsed.data, journey_id: journeys[i]!.id }
         : {
             journey_id: journeys[i]!.id,
             passed: false,
@@ -662,8 +721,15 @@ async function runJourneys(ctx: WorkflowContext, qaDir: string, journeys: Journe
             network_errors: [],
             findings: [{ severity: 'high', description: `Journey agent failed: ${r.summary}`, evidence: null }],
             screenshots: [],
-          },
-    );
+          };
+    out.push(result);
+    const resultDir = path.join(qaDir, 'test-results', journeys[i]!.id);
+    ensureDir(resultDir);
+    writeJsonAtomic(path.join(resultDir, `PASS-${String(pass).padStart(2, '0')}.json`), {
+      pass,
+      recorded_at: ctx.now().toISOString(),
+      result,
+    });
   }
   return out;
 }

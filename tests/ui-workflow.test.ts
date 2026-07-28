@@ -22,6 +22,7 @@ describe('rijo ui (hardened import pipeline)', () => {
     zip.addFile('index.html', Buffer.from('<html><body><h1>Home</h1></body></html>'));
     zip.addFile('about.html', Buffer.from('<html><body>About</body></html>'));
     zip.addFile('assets/logo.svg', Buffer.from('<svg/>'));
+    zip.addFile('assets/photo.png', Buffer.from([0, 1, 2, 255]));
     zip.addFile('mock-data.json', Buffer.from('{"products": []}'));
     const p = path.join(root, name);
     zip.writeZip(p);
@@ -94,11 +95,64 @@ describe('rijo ui (hardened import pipeline)', () => {
     }
 
     expect(fs.existsSync(path.join(importDir, 'IMPORT.md'))).toBe(true);
+    expect(fs.existsSync(path.join(importDir, 'VISUAL-COMPARISON.md'))).toBe(true);
 
     // the patch was applied to the checkout — converted files actually exist in the project
     for (const dest of UI_MAPPING_PAYLOAD.mappings.map((m) => m.to)) {
       expect(fs.existsSync(path.join(root, dest)), `expected ${dest} to exist in the checkout`).toBe(true);
     }
+  });
+
+  it('merges HTML and ZIP inputs, deduplicates identical paths, and references binary assets', async () => {
+    const d = deps(root, { capabilities: { browser: true } });
+    wireUi(d, root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const zipPath = makeDesignZip();
+    fs.writeFileSync(
+      path.join(root, 'index.html'),
+      '<html><body><h1>Home</h1></body></html>',
+    );
+
+    const outcome = await uiWorkflow(
+      root,
+      { inputs: ['@index.html', `@${path.basename(zipPath)}`] },
+      d,
+    );
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const importDir = path.join(new RijoPaths(root).importsDir, IMPORT_ID);
+    expect(
+      fs.readdirSync(path.join(importDir, 'staging')).filter((name) => name === 'index.html'),
+    ).toHaveLength(1);
+    const artifacts = JSON.parse(
+      fs.readFileSync(path.join(importDir, 'ARTIFACTS.json'), 'utf8'),
+    );
+    expect(artifacts.primary_html).toBe('index.html');
+    expect(artifacts.artifacts).toEqual([
+      expect.objectContaining({
+        staged_path: 'staging/assets/photo.png',
+        size: 4,
+        media_type: 'image/png',
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    ]);
+  });
+
+  it('blocks a path collision with different content', async () => {
+    const d = deps(root, { capabilities: { browser: true } });
+    wireUi(d, root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+    const zipPath = makeDesignZip();
+    fs.writeFileSync(path.join(root, 'index.html'), '<html>Different design</html>');
+
+    const outcome = await uiWorkflow(
+      root,
+      { inputs: ['@index.html', `@${path.basename(zipPath)}`] },
+      d,
+    );
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('Path collision has different content');
   });
 
   it('blocks when mocks remain in the production path (deterministic scan on real files)', async () => {

@@ -52,6 +52,21 @@ function localPlanPayload(phaseId: string) {
         evidence_expected: 'build passes',
         done: false,
       },
+      {
+        id: 'T03',
+        name: 'Verify module integration',
+        requirement_ids: [],
+        technical_justification: 'bounded integration evidence',
+        files: ['src/c.ts'],
+        mapped_references: [newMappedReference('src/c.ts')],
+        write_scope: ['src/c.ts'],
+        depends_on: ['T02'],
+        parallel: false,
+        tdd: false,
+        tests: [],
+        evidence_expected: 'integration remains coherent',
+        done: false,
+      },
     ],
   };
 }
@@ -126,6 +141,14 @@ function fakeHostResult(task: AgentTaskWire, root: string) {
     });
   }
   if (task.id === 'new-extract') return okResult({ payload: EXTRACTION_PAYLOAD });
+  if (task.id === 'new-roadmap') {
+    return okResult({
+      payload: {
+        phases: EXTRACTION_PAYLOAD.phases,
+        rationale: 'The phases deliver observable behavior in dependency order.',
+      },
+    });
+  }
   return okResult();
 }
 

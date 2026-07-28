@@ -54,7 +54,7 @@ const AGENT_DEFS: NativeClaudeAgent[] = [
     name: 'rijo-phase-planner',
     role: 'researcher',
     description: 'Research one active phase and produce a bounded RIJO phase plan.',
-    body: 'Read only the active phase context. Research only the phase delta. Produce two to four bounded tasks. Define requirement identifiers, files, write scopes, dependencies, acceptance criteria, tests, evidence, Test-Driven Development requirements, and parallel safety. Return the plan to the lead. Do not change files.',
+    body: 'Read only the active phase context. Research only the phase delta. Produce three to six bounded tasks. Do not create artificial tasks. Define requirement identifiers, files, write scopes, dependencies, acceptance criteria, tests, evidence, Test-Driven Development requirements, and parallel safety. Return the plan to the lead. Do not change files.',
     effort: 'high',
     maxTurns: 20,
     tools: ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],

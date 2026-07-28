@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { parseArgs } from 'node:util';
 import { RijoPaths } from '../core/paths.js';
-import { appendLine, ensureDir } from '../core/fsx.js';
+import { appendLine, ensureDir, readJson } from '../core/fsx.js';
 import { TaskRecordSchema, type TaskRecord } from '../core/schemas/index.js';
 import { readStatus, renderStatusLine, stderrSink } from '../core/progress.js';
 import { readState } from '../core/state.js';
@@ -31,7 +31,14 @@ import {
   installRijo,
   type InstallHost,
 } from '../install/index.js';
-import { NativeResultRunner } from '../agents/native-results.js';
+import {
+  NativeRequestV2Schema,
+  NativeResultRunner,
+} from '../agents/native-results.js';
+import {
+  NativeLifecycleLedger,
+  createNativeLifecycleEvent,
+} from '../agents/native-lifecycle.js';
 import { activeMilestone } from '../core/milestones.js';
 import { readRequirements, readRoadmap } from '../core/roadmap.js';
 import { SystemShellRunner } from '../core/commands.js';
@@ -132,11 +139,10 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
     }
     case 'ui': {
       const { host, rest: uiRest } = extractHostFlag(rest);
-      const input = uiRest[0];
-      if (!input) return usage('rijo ui @design.zip | @index.html | @design-directory/ [--host claude|codex]');
+      if (uiRest.length === 0) return usage('rijo ui @index.html [@design.zip] [@design-directory/]');
       return host
-        ? withHost(cwd, host, deps, (d) => uiWorkflow(cwd, { input }, d))
-        : withNative(cwd, deps, (d) => uiWorkflow(cwd, { input }, d));
+        ? withHost(cwd, host, deps, (d) => uiWorkflow(cwd, { inputs: uiRest }, d))
+        : withNative(cwd, deps, (d) => uiWorkflow(cwd, { inputs: uiRest }, d));
     }
     case 'fix': {
       const { host, rest: fixRest } = extractHostFlag(rest);
@@ -185,6 +191,69 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       const { resultFile, args: internalArgs } = extractNativeResultsFlag(rest);
       const [helper, ...helperArgs] = internalArgs;
       if (helper === 'status') return statusCli(helperArgs, cwd);
+      if (
+        [
+          'task-dispatch',
+          'task-start',
+          'task-observe',
+          'task-complete',
+          'task-fail',
+          'task-timeout',
+          'task-cancelled',
+          'task-cancel-unavailable',
+        ].includes(helper ?? '')
+      ) {
+        const { positionals, values } = parseArgs({
+          args: helperArgs,
+          allowPositionals: true,
+          options: {
+            host: { type: 'string' },
+            handle: { type: 'string' },
+            detail: { type: 'string' },
+          },
+        });
+        const requestFile = positionals[0]?.replace(/^@/, '');
+        if (!requestFile || positionals.length > 1) {
+          return usage(`rijo internal ${helper} @native-request.json [--host HOST] [--handle ID] [--detail TEXT]`);
+        }
+        try {
+          const request = NativeRequestV2Schema.parse(
+            readJson(path.resolve(cwd, requestFile)),
+          );
+          const ledger = new NativeLifecycleLedger(new RijoPaths(cwd));
+          if (helper === 'task-dispatch') {
+            ledger.dispatch(request);
+          } else {
+            const eventName = {
+              'task-start': 'start',
+              'task-observe': 'progress',
+              'task-complete': 'complete',
+              'task-fail': 'failure',
+              'task-timeout': 'timeout',
+              'task-cancelled': 'cancelled',
+              'task-cancel-unavailable': 'cancel-unavailable',
+            }[helper!] as
+              | 'start'
+              | 'progress'
+              | 'complete'
+              | 'failure'
+              | 'timeout'
+              | 'cancelled'
+              | 'cancel-unavailable';
+            ledger.record(
+              createNativeLifecycleEvent(request, eventName, {
+                host: values.host ?? 'native',
+                host_handle: values.handle ?? null,
+                detail: values.detail ?? null,
+              }),
+            );
+          }
+          return 0;
+        } catch (error) {
+          console.error(`rijo: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
       if (helper === 'lifecycle') {
         const event = helperArgs[0];
         if (!event || helperArgs.length > 1 || !/^[A-Za-z][A-Za-z0-9_-]*$/.test(event)) {
@@ -237,6 +306,38 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
           return usage('rijo internal project-init @PLAN.md --results @.rijo/runtime/native-results.json');
         }
         return withNativeResults(cwd, resultFile, deps, (d) => newWorkflow(cwd, { planFile: plan }, d));
+      }
+      if (helper === 'ui-import') {
+        if (helperArgs.length === 0) {
+          return usage('rijo internal ui-import @index.html [@design.zip]');
+        }
+        if (!resultFile) {
+          return usage('rijo internal ui-import @index.html [@design.zip] --results @.rijo/runtime/native-results.json');
+        }
+        return withNativeResults(cwd, resultFile, deps, (d) =>
+          uiWorkflow(cwd, { inputs: helperArgs }, d),
+        );
+      }
+      if (helper === 'fix-open') {
+        const description = helperArgs.filter((argument) => !argument.startsWith('@')).join(' ');
+        const evidenceFiles = helperArgs
+          .filter((argument) => argument.startsWith('@'))
+          .map((argument) => argument.slice(1));
+        if (!description) return usage('rijo internal fix-open "issue description" [@evidence]');
+        if (!resultFile) {
+          return usage('rijo internal fix-open "issue description" [@evidence] --results @.rijo/runtime/native-results.json');
+        }
+        return withNativeResults(cwd, resultFile, deps, (d) =>
+          fixWorkflow(cwd, { description, evidenceFiles }, d),
+        );
+      }
+      if (helper === 'next-init') {
+        const plan = helperArgs[0];
+        if (!plan || helperArgs.length > 1) return usage('rijo internal next-init @NEXT-PLAN.md');
+        if (!resultFile) {
+          return usage('rijo internal next-init @NEXT-PLAN.md --results @.rijo/runtime/native-results.json');
+        }
+        return withNativeResults(cwd, resultFile, deps, (d) => nextWorkflow(cwd, plan, d));
       }
       if (helper === 'phase-open') {
         const phase = helperArgs[0];
@@ -306,7 +407,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         return withDeterministic(cwd, deps, (d) => recoverNativeState(cwd, d));
       }
       return usage(
-        'rijo internal status|lifecycle|safe-command|map-codebase|project-init|phase-open|plan-validate|qa-open|qa-record|milestone-finish|recovery',
+        'rijo internal status|task-dispatch|task-start|task-observe|task-complete|task-fail|task-timeout|task-cancelled|task-cancel-unavailable|safe-command|map-codebase|project-init|ui-import|fix-open|next-init|phase-open|plan-validate|qa-open|qa-record|milestone-finish|recovery',
       );
     }
     case 'install': {

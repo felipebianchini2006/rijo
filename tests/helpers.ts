@@ -253,6 +253,21 @@ export function planPayloadFor(phaseId: string, reqIds: string[] = []) {
         evidence_expected: 'build passes',
         done: false,
       },
+      {
+        id: 'T03',
+        name: 'Verify the integrated behavior',
+        requirement_ids: [],
+        technical_justification: 'phase verification',
+        files: ['tests/integration.test.ts'],
+        mapped_references: [newMappedReference('tests/integration.test.ts')],
+        write_scope: ['tests/integration.test.ts'],
+        depends_on: ['T02'],
+        parallel: false,
+        tdd: false,
+        tests: ['echo integration'],
+        evidence_expected: 'integration behavior passes',
+        done: false,
+      },
     ],
   };
 }
@@ -318,6 +333,17 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
         }),
     )
     .on(
+      (t) => t.id === 'new-roadmap',
+      (t) =>
+        ok(t, {
+          payload: {
+            phases: (opts.extraction as typeof EXTRACTION_PAYLOAD | undefined)?.phases ??
+              EXTRACTION_PAYLOAD.phases,
+            rationale: 'The phases deliver observable behavior in dependency order.',
+          },
+        }),
+    )
+    .on(
       (t) => t.id.startsWith('spec-'),
       (t) => {
         // spec writer runs in an isolated workspace; the relative spec path is its write scope
@@ -332,7 +358,18 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
       (t) => t.id.startsWith('plan-') && !t.id.startsWith('plan-review'),
       (t) => {
         const phaseId = t.id.match(/plan-(\d{2})/)?.[1] ?? '01';
-        if (opts.planPayload) return ok(t, { payload: opts.planPayload(phaseId) });
+        if (opts.planPayload) {
+          const payload = opts.planPayload(phaseId);
+          if (
+            payload &&
+            typeof payload === 'object' &&
+            Array.isArray((payload as { tasks?: unknown[] }).tasks) &&
+            (payload as { tasks: unknown[] }).tasks.length === 2
+          ) {
+            (payload as { tasks: unknown[] }).tasks.push(planPayloadFor(phaseId).tasks[2]!);
+          }
+          return ok(t, { payload });
+        }
         return ok(t, { payload: mappedPlanPayloadFor(root, phaseId, phaseReqIds(root, phaseId)) });
       },
     )

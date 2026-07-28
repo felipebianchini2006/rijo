@@ -18,7 +18,8 @@ Store checked dates and source links.
 
 ## PHASE_PLAN
 
-Create two to four bounded tasks.
+Create three to six bounded tasks.
+Do not create artificial tasks to reach a number.
 Define requirement identifiers, files, write scopes, dependencies, acceptance criteria, tests, evidence, Test-Driven Development requirements, and parallel safety.
 Read `active_phase_dir` from `node .rijo/bin/rijo.cjs internal status --json`.
 Run `node .rijo/bin/rijo.cjs internal plan-validate @<active_phase_dir>/PLAN.md`.

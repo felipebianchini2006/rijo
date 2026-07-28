@@ -7,6 +7,7 @@ import {
   inventory,
   readText,
   readTextIfExists,
+  sha256,
   writeFileAtomic,
 } from '../core/fsx.js';
 import { computePlanHash } from '../durable/engine.js';
@@ -184,10 +185,10 @@ export async function newWorkflow(
         [`To start the next milestone run: rijo new @${path.basename(planPath)} --next`],
       );
     }
-    bus.emit('new.project_research', {
+    bus.emit('new.scope_parse', {
       status: 'running',
-      stage: 'PROJECT_RESEARCH',
-      message: `[RIJO] PROJECT_RESEARCH`,
+      stage: 'SCOPE_PARSE',
+      message: '[RIJO] SCOPE_PARSE',
     });
 
     // ---- git
@@ -452,10 +453,39 @@ export async function newWorkflow(
     const mp = milestonePaths(newDir);
     const milestone: MilestoneRef = { id: newId, slug: newSlug, dir: newDir, paths: mp };
 
-    // ---- research (parallel on first milestone, delta afterwards)
+    // ---- research (three bounded read-only lanes)
+    bus.emit('new.project_research', {
+      status: 'running',
+      stage: 'PROJECT_RESEARCH',
+      message: `[RIJO ${milestone.id}] PROJECT_RESEARCH`,
+    });
     bus.emit('new.research', { stage: 'RESEARCH', message: 'Run focused technical research.' });
     const store = new ResearchStore(paths, now);
-    const topics = extraction.research_topics.slice(0, 4);
+    const researchKey = sha256(planContent).slice(0, 12);
+    const requestedTopics = extraction.research_topics.map((topic) => topic.topic).join('; ');
+    const topics = [
+      {
+        key: `project-stack-${researchKey}`,
+        topic: 'Stable stack versions and official implementation practices',
+        volatile: true,
+        focus:
+          'Select stable stack versions. Use official release, support, and implementation guidance.',
+      },
+      {
+        key: `project-architecture-${researchKey}`,
+        topic: 'Architecture boundaries, integrations, and system limits',
+        volatile: true,
+        focus:
+          'Define simple architecture boundaries. Validate integrations, compatibility, and operational limits.',
+      },
+      {
+        key: `project-risks-${researchKey}`,
+        topic: 'Gaps, pitfalls, data integrity, and security surfaces',
+        volatile: true,
+        focus:
+          'Find scope gaps, common failure modes, data risks, and security controls for affected features.',
+      },
+    ];
     const toResearch = topics.filter((t) => !store.lookup(t.key));
     const cached = topics.filter((t) => store.lookup(t.key));
     let researchSummaries: string[] = cached.map((t) => `- ${t.topic}: (cache) ${store.lookup(t.key)!.summary}`);
@@ -463,7 +493,13 @@ export async function newWorkflow(
       const tasks: AgentTaskDraft[] = toResearch.map((t, i) => ({
         id: `new-research-${i + 1}`,
         role: 'researcher',
-        objective: `Research: ${t.topic}. Prefer official docs, release/LTS pages, changelogs, security advisories, official registries. Never assume newest is best; weigh stability, support, security, compatibility, migration cost. Separate fact, inference and recommendation.`,
+        objective: [
+          `Research lane: ${t.topic}.`,
+          t.focus,
+          'Prefer official docs, release pages, support policies, registries, and primary advisories.',
+          'Do not assume that the newest version is the best version.',
+          'Separate facts, inferences, and recommendations.',
+        ].join(' '),
         canonical_files: [],
         code_files: [],
         write_scope: [],
@@ -471,7 +507,7 @@ export async function newWorkflow(
         verification_commands: [],
         return_format:
           'JSON payload: {summary: string, sources: [{claim: string, source: string, url: string, checked_at: ISO-8601 string, version: string, confidence: high|medium|low, tier: official|advisory|secondary}]}. Use the exact confidence and tier strings. Use tier=official for official docs or registries. Use tier=advisory for primary security advisories.',
-        notes: '',
+        notes: `Plan-specific volatile topics: ${requestedTopics || 'none declared'}.`,
       }));
       const results = await dispatchBatch(ctx, tasks, undefined, () => ({ stage: 'RESEARCH' }));
       const waivers = new Map(config.research.waivers.map((w) => [w.key, w.reason]));
@@ -561,8 +597,121 @@ export async function newWorkflow(
       }
     }
 
+    // ---- independent outcome-oriented roadmapper
+    bus.emit('new.decision_validation', {
+      stage: 'DECISION_VALIDATION',
+      message: 'Validate researched decisions before system design.',
+    });
+    bus.emit('new.system_design', {
+      stage: 'SYSTEM_DESIGN',
+      message: 'Define the system boundaries and roadmap outcomes.',
+    });
+    const RoadmapPayloadSchema = z.object({
+      phases: PlanExtractionSchema.shape.phases.min(1).max(6),
+      rationale: z.string().min(1),
+    });
+    const roadmapTask: AgentTaskDraft = {
+      id: 'new-roadmap',
+      role: 'planner',
+      objective: [
+        'Create an outcome-oriented roadmap from the approved scope and the research synthesis.',
+        'Use three to six natural phases for a typical project.',
+        'Use fewer phases when the scope is genuinely smaller.',
+        'Do not add phases only to reach a number.',
+        'Do not create separate security, test, cleanup, audit, or refactor phases.',
+        'Put security, data integrity, error handling, and verification in the phase that creates each surface.',
+        'Map every requirement index exactly once.',
+      ].join(' '),
+      canonical_files: [planPath],
+      code_files: [],
+      write_scope: [],
+      acceptance_criteria: [
+        'Each phase ends in observable product behavior.',
+        'Dependencies are explicit.',
+        'Every requirement is assigned once.',
+      ],
+      verification_commands: [],
+      return_format:
+        'JSON payload: {phases:[{name,requirement_indexes[],depends_on_indexes[],ui_surface}], rationale:string}.',
+      notes: [
+        `PROJECT: ${extraction.project_name}`,
+        `SUMMARY: ${extraction.project_summary}`,
+        `REQUIREMENTS:\n${extraction.requirements.map((requirement, index) => `${index}: ${requirement.description} — ${requirement.acceptance}`).join('\n')}`,
+        `RESEARCH:\n${researchSummaries.join('\n')}`,
+        `RULES:\n${extraction.rules.join('\n')}`,
+      ].join('\n\n'),
+    };
+    const roadmapResult = await dispatch(ctx, roadmapTask, { stage: 'PLAN' });
+    const roadmapPayload = RoadmapPayloadSchema.safeParse(roadmapResult.payload);
+    if (!roadmapResult.ok || !roadmapPayload.success) {
+      discardDecisionProposals(ctx, roadmapResult);
+      return failed(ctx, 'Independent roadmap generation failed.', [
+        roadmapResult.summary,
+        ...(roadmapPayload.success
+          ? []
+          : roadmapPayload.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`)),
+      ]);
+    }
+    const roadmapFidelity = validatePlanExtractionFidelity(planContent, {
+      ...extraction,
+      phases: roadmapPayload.data.phases,
+    });
+    if (roadmapFidelity.length > 0) {
+      discardDecisionProposals(ctx, roadmapResult);
+      return failed(ctx, 'Independent roadmap validation failed.', roadmapFidelity);
+    }
+    extraction.phases = roadmapPayload.data.phases;
+    phases.splice(
+      0,
+      phases.length,
+      ...extraction.phases.map((phase, index) =>
+        RoadmapPhaseSchema.parse({
+          id: String(index + 1).padStart(2, '0'),
+          slug: slugName(phase.name),
+          name: phase.name,
+          depends_on: phase.depends_on_indexes.map((dependency) =>
+            String(dependency + 1).padStart(2, '0'),
+          ),
+          requirements: [],
+          status: 'PENDING',
+          ui_surface: phase.ui_surface,
+        }),
+      ),
+    );
+    for (const requirement of requirements) requirement.phase = null;
+    extraction.phases.forEach((phase, phaseIndex) => {
+      for (const requirementIndex of phase.requirement_indexes) {
+        const requirement = requirements[requirementIndex];
+        if (requirement && !requirement.phase) {
+          requirement.phase = phases[phaseIndex]!.id;
+          phases[phaseIndex]!.requirements.push(requirement.id);
+        }
+      }
+    });
+    for (const requirement of requirements) {
+      if (!requirement.phase && phases.length > 0) {
+        requirement.phase = phases[0]!.id;
+        phases[0]!.requirements.push(requirement.id);
+        decisions.push(`Assigned ${requirement.id} to phase 01 because it was not indexed by the approved roadmap payload.`);
+      }
+    }
+    const roadmapIssues = validateTraceability({ requirements, phases });
+    if (roadmapIssues.some((issue) => issue.severity === 'error')) {
+      discardDecisionProposals(ctx, roadmapResult);
+      return failed(
+        ctx,
+        'Independent roadmap traceability validation failed.',
+        roadmapIssues.map((issue) => `${issue.code}: ${issue.message} — ${issue.fix}`),
+      );
+    }
+    commitDecisionProposals(ctx, roadmapResult);
+    decisions.push(`Roadmap: ${roadmapPayload.data.rationale}`);
+
     // ---- build EVERY canonical artifact of the transition in memory
-    bus.emit('new.persist', { stage: 'ROADMAP', message: 'Write canonical context and the roadmap.' });
+    bus.emit('new.persist', {
+      stage: 'CONTEXT_COMMIT',
+      message: `[RIJO ${milestone.id}] CONTEXT_COMMIT`,
+    });
     const scopeContent = serializeFrontmatter(
       { milestone: milestone.id, source_plan: path.basename(planPath), created_at: now().toISOString() },
       [
@@ -600,6 +749,7 @@ export async function newWorkflow(
       extraction,
       brown,
       decisions,
+      researchSummaries,
       requirementsContent,
       roadmapContent,
     );
@@ -808,6 +958,7 @@ function buildGlobalArtifacts(
   extraction: PlanExtraction,
   brown: BrownfieldInfo,
   decisions: string[],
+  researchSummaries: string[],
   requirementsContent: string,
   roadmapContent: string,
 ): Array<{ path: string; content: string }> {
@@ -849,6 +1000,9 @@ function buildGlobalArtifacts(
         '',
         extraction.stack_summary || 'To be determined by phase 01 research.',
         '',
+        '## Project research',
+        ...(researchSummaries.length ? researchSummaries : ['- No project research was required.']),
+        '',
         ...(brown.stackNotes.length ? ['## Detected environment', ...brown.stackNotes.map((n) => `- ${n}`)] : []),
         ...(brown.baselineCommands.length
           ? ['', '## Detected commands (execution evidence is in .rijo/codebase/BASELINE.md)', ...brown.baselineCommands.map((c) => `- \`${c}\``)]
@@ -872,6 +1026,9 @@ function buildGlobalArtifacts(
           ? 'Use the evidence-backed codebase map in `.rijo/codebase/`.'
           : 'Use the roadmap phases as reversible vertical slices.',
         '',
+        '## Researched constraints',
+        ...(researchSummaries.length ? researchSummaries : ['- No additional constraints were found.']),
+        '',
       ].join('\n'),
     ),
   });
@@ -885,6 +1042,9 @@ function buildGlobalArtifacts(
         'Record external systems, credentials, permissions, and failure behavior here.',
         '',
         'No external integration is approved by inference.',
+        '',
+        '## Researched integration constraints',
+        ...(researchSummaries.length ? researchSummaries : ['- No external integration was selected.']),
         '',
       ].join('\n'),
     ),

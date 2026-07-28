@@ -1,11 +1,19 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
-import { exists, ensureDir, writeFileAtomic, readTextIfExists } from '../core/fsx.js';
+import {
+  exists,
+  ensureDir,
+  readTextIfExists,
+  sha256File,
+  writeFileAtomic,
+  writeJsonAtomic,
+} from '../core/fsx.js';
 import { serializeFrontmatter } from '../core/frontmatter.js';
 import { extractZipSafely, UnsafeZipError, MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_TOTAL_BYTES, type ZipInspection } from '../security/zip.js';
 import { scanForMocks } from '../security/mockscan.js';
 import { activeMilestone } from '../core/milestones.js';
+import { readRoadmap, renderRoadmap } from '../core/roadmap.js';
 import { touchManifest } from '../core/manifest.js';
 import { readState, writeState, initialState } from '../core/state.js';
 import type { AgentTaskDraft } from '../agents/protocol.js';
@@ -27,7 +35,8 @@ import {
 
 export interface UiOptions {
   /** @design.zip, @index.html or @design-directory/ */
-  input: string;
+  input?: string;
+  inputs?: string[];
 }
 
 const MappingSchema = z.object({
@@ -66,11 +75,24 @@ export async function uiWorkflow(
 /** Import a design using an existing context and lock (composes with `new`). */
 export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<WorkflowOutcome> {
   const { projectRoot, paths, bus, now } = ctx;
-  const inputPath = path.resolve(projectRoot, opts.input.replace(/^@/, ''));
-  if (!exists(inputPath)) return failed(ctx, `Design input not found: ${opts.input}`);
-  if (fs.lstatSync(inputPath).isSymbolicLink()) {
-    return blocked(ctx, 'Design input rejected: the input root is a symbolic link.', [opts.input]);
+  const inputArgs = opts.inputs ?? (opts.input ? [opts.input] : []);
+  if (inputArgs.length === 0) return failed(ctx, 'At least one design input is required.');
+  const inputPaths = inputArgs.map((input) =>
+    path.resolve(projectRoot, input.replace(/^@/, '')),
+  );
+  const missingIndex = inputPaths.findIndex((inputPath) => !exists(inputPath));
+  if (missingIndex >= 0) {
+    return failed(ctx, `Design input not found: ${inputArgs[missingIndex]}`);
   }
+  const linkedIndex = inputPaths.findIndex((inputPath) =>
+    fs.lstatSync(inputPath).isSymbolicLink(),
+  );
+  if (linkedIndex >= 0) {
+    return blocked(ctx, 'Design input rejected: the input root is a symbolic link.', [
+      inputArgs[linkedIndex]!,
+    ]);
+  }
+  const inputNames = inputPaths.map((inputPath) => path.basename(inputPath));
 
   {
     const importId = now().toISOString().replace(/[-:.TZ]/g, '').slice(0, 12);
@@ -82,23 +104,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     bus.emit('ui.extract', { status: 'running', stage: 'IMPORT', message: 'Extract the design with safety controls.' });
     let inspection: ZipInspection;
     try {
-      if (inputPath.toLowerCase().endsWith('.zip')) {
-        inspection = extractZipSafely(inputPath, stagingDir);
-      } else if (fs.lstatSync(inputPath).isDirectory()) {
-        ensureDir(stagingDir);
-        inspection = copyDirectorySafely(inputPath, stagingDir);
-      } else {
-        const st = fs.lstatSync(inputPath);
-        if (!st.isFile()) {
-          return blocked(ctx, 'Design input rejected: not a regular file.', [opts.input]);
-        }
-        if (st.size > MAX_ENTRY_BYTES) {
-          return blocked(ctx, `Design input rejected: file exceeds ${MAX_ENTRY_BYTES} bytes.`, [opts.input]);
-        }
-        ensureDir(stagingDir);
-        fs.copyFileSync(inputPath, path.join(stagingDir, path.basename(inputPath)));
-        inspection = { entries: [{ name: path.basename(inputPath), size: st.size }], warnings: [], executables: [], installScripts: [] };
-      }
+      inspection = mergeDesignInputs(inputPaths, importDir, stagingDir);
     } catch (err) {
       if (err instanceof UnsafeZipError) {
         return blocked(ctx, `Design archive rejected: ${err.message}`, ['The archive violates the safety policy (traversal/symlink/size/executable).']);
@@ -112,10 +118,32 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     writeFileAtomic(
       path.join(importDir, 'INVENTORY.md'),
       serializeFrontmatter(
-        { import_id: importId, source: path.basename(inputPath), files: inspection.entries.length, warnings: inspection.warnings },
+        {
+          import_id: importId,
+          sources: inputNames,
+          primary_html: findPrimaryHtml(inspection),
+          files: inspection.entries.length,
+          warnings: inspection.warnings,
+        },
         invSummary,
       ),
     );
+    const artifactManifest = path.join(importDir, 'ARTIFACTS.json');
+    writeJsonAtomic(artifactManifest, {
+      schema_version: 1,
+      primary_html: findPrimaryHtml(inspection),
+      artifacts: inspection.entries
+        .filter((entry) => isBinaryAsset(entry.name))
+        .map((entry) => ({
+          staged_path: path
+            .relative(importDir, path.join(stagingDir, entry.name))
+            .split(path.sep)
+            .join('/'),
+          sha256: sha256File(path.join(stagingDir, entry.name)),
+          size: entry.size,
+          media_type: mediaType(entry.name),
+        })),
+    });
     // ---- 5: detect target stack
     const stackNote = readTextIfExists(paths.stack) ?? '';
     const pkgRaw = readTextIfExists(path.join(projectRoot, 'package.json'));
@@ -144,8 +172,11 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         'For every origin file decide the destination path (component/route/asset/api/state/style/test/config), deliberate divergences, and which UI states (loading, empty, error, success) each page must implement.',
         'Destinations must be exact project-relative paths — never globs, never .rijo, never node_modules.',
       ].join('\n'),
-      canonical_files: [paths.rules, paths.stack].filter(exists),
-      code_files: inspection.entries.slice(0, 50).map((e) => path.join(stagingDir, e.name)),
+      canonical_files: [paths.rules, paths.stack, artifactManifest].filter(exists),
+      code_files: inspection.entries
+        .filter((entry) => !isBinaryAsset(entry.name))
+        .slice(0, 50)
+        .map((entry) => path.join(stagingDir, entry.name)),
       write_scope: [],
       acceptance_criteria: ['Every relevant origin file has a destination', 'Routes and API contracts are mapped', 'All four UI states are planned'],
       verification_commands: [],
@@ -205,7 +236,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     commitDecisionProposals(ctx, mapRes);
 
     // ---- conversion in an ISOLATED workspace, bounded by the derived scope
-    bus.emit('ui.convert_exec', { stage: 'IMPORT', message: `convertendo em workspace isolado (${writeScope.length} destinos)` });
+    bus.emit('ui.convert_exec', { stage: 'IMPORT', message: `Convert in an isolated workspace (${writeScope.length} destinations).` });
     const convertTask: AgentTaskDraft = {
       id: `ui-convert-${importId}`,
       role: 'worker',
@@ -214,8 +245,11 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         'Native practices of the framework (routing, data fetching, forms, accessibility, error boundaries, loading/empty/error/success states).',
         'No iframes, no runtime dependency on the prototype, no copied bundles, NO mocks in the production path (typed contracts/ports for missing backends; fixtures only in tests).',
       ].join('\n'),
-      canonical_files: [paths.rules, paths.stack, mappingPath].filter(exists),
-      code_files: inspection.entries.slice(0, 50).map((e) => path.join(stagingDir, e.name)),
+      canonical_files: [paths.rules, paths.stack, mappingPath, artifactManifest].filter(exists),
+      code_files: inspection.entries
+        .filter((entry) => !isBinaryAsset(entry.name))
+        .slice(0, 50)
+        .map((entry) => path.join(stagingDir, entry.name)),
       write_scope: writeScope,
       acceptance_criteria: ['All mapped destinations implemented', 'No mock remains in the production path'],
       verification_commands: [],
@@ -320,11 +354,27 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
 
     // ---- 16-17: record origin/licenses + update state
     writeFileAtomic(
+      path.join(importDir, 'VISUAL-COMPARISON.md'),
+      [
+        `# Visual comparison — import ${importId}`,
+        '',
+        `Primary source: ${findPrimaryHtml(inspection) ?? 'not detected'}`,
+        'Viewports: desktop, tablet, mobile',
+        `Result: ${validationNote}`,
+        '',
+        '## Intentional divergences',
+        ...(mapping.data.divergences.length
+          ? mapping.data.divergences.map((divergence) => `- ${divergence}`)
+          : ['- none']),
+        '',
+      ].join('\n'),
+    );
+    writeFileAtomic(
       path.join(importDir, 'IMPORT.md'),
       serializeFrontmatter(
         {
           import_id: importId,
-          source: path.basename(inputPath),
+          sources: inputNames,
           imported_at: now().toISOString(),
           components: conv.data.components_created,
           routes: conv.data.routes_mapped,
@@ -334,7 +384,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         [
           `# Import ${importId}`,
           '',
-          `Source: ${path.basename(inputPath)} (treated as untrusted input).`,
+          `Sources: ${inputNames.join(', ')} (treated as untrusted input).`,
           `Asset origin/licenses: verify before production; recorded warnings: ${inspection.warnings.join('; ') || 'none'}.`,
           '',
           conv.data.notes,
@@ -343,6 +393,16 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       ),
     );
     const milestone = activeMilestone(paths);
+    if (milestone && exists(milestone.paths.roadmap)) {
+      const roadmap = readRoadmap(milestone.paths.roadmap);
+      const affected =
+        roadmap.phases.find((phase) => phase.status !== 'DONE' && phase.ui_surface) ??
+        roadmap.phases.find((phase) => phase.status !== 'DONE');
+      if (affected) {
+        affected.ui_surface = true;
+        writeFileAtomic(milestone.paths.roadmap, renderRoadmap(roadmap));
+      }
+    }
     const prev = readState(paths) ?? initialState(now);
     writeState(
       paths,
@@ -358,6 +418,133 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       validationNote,
     ]);
   }
+}
+
+function mergeDesignInputs(
+  inputPaths: string[],
+  importDir: string,
+  stagingDir: string,
+): ZipInspection {
+  const sourceStaging = path.join(importDir, '.source-staging');
+  ensureDir(sourceStaging);
+  ensureDir(stagingDir);
+  const merged: ZipInspection = {
+    entries: [],
+    warnings: [],
+    executables: [],
+    installScripts: [],
+  };
+  const paths = new Map<string, string>();
+  const hashes = new Map<string, string>();
+  let total = 0;
+  try {
+    for (let index = 0; index < inputPaths.length; index++) {
+      const inputPath = inputPaths[index]!;
+      const sourceDir = path.join(sourceStaging, String(index + 1));
+      ensureDir(sourceDir);
+      let inspection: ZipInspection;
+      if (inputPath.toLowerCase().endsWith('.zip')) {
+        inspection = extractZipSafely(inputPath, sourceDir);
+      } else if (fs.lstatSync(inputPath).isDirectory()) {
+        inspection = copyDirectorySafely(inputPath, sourceDir);
+      } else {
+        const stat = fs.lstatSync(inputPath);
+        if (!stat.isFile()) throw new UnsafeZipError('Design input is not a regular file.');
+        if (stat.size > MAX_ENTRY_BYTES) {
+          throw new UnsafeZipError(`Design input exceeds ${MAX_ENTRY_BYTES} bytes.`);
+        }
+        const name = path.basename(inputPath);
+        fs.copyFileSync(inputPath, path.join(sourceDir, name));
+        inspection = {
+          entries: [{ name, size: stat.size }],
+          warnings: [],
+          executables: [],
+          installScripts: [],
+        };
+      }
+      merged.warnings.push(
+        ...inspection.warnings.map((warning) => `${path.basename(inputPath)}: ${warning}`),
+      );
+      merged.executables.push(...inspection.executables);
+      merged.installScripts.push(...inspection.installScripts);
+      for (const entry of inspection.entries) {
+        const normalized = entry.name.replace(/\\/g, '/');
+        const source = path.join(sourceDir, normalized);
+        const hash = sha256File(source);
+        const existingHash = paths.get(normalized);
+        if (existingHash && existingHash !== hash) {
+          throw new UnsafeZipError(
+            `Path collision has different content: ${normalized}`,
+            normalized,
+          );
+        }
+        if (existingHash) continue;
+        total += entry.size;
+        if (total > MAX_TOTAL_BYTES) {
+          throw new UnsafeZipError(`Combined design inputs exceed ${MAX_TOTAL_BYTES} bytes.`);
+        }
+        const target = path.join(stagingDir, normalized);
+        ensureDir(path.dirname(target));
+        const canonical = hashes.get(hash);
+        if (canonical) {
+          try {
+            fs.linkSync(canonical, target);
+          } catch {
+            fs.copyFileSync(canonical, target);
+          }
+        } else {
+          fs.copyFileSync(source, target);
+          hashes.set(hash, target);
+        }
+        paths.set(normalized, hash);
+        merged.entries.push({ name: normalized, size: entry.size });
+      }
+    }
+  } finally {
+    fs.rmSync(sourceStaging, { recursive: true, force: true });
+  }
+  return merged;
+}
+
+function findPrimaryHtml(inspection: ZipInspection): string | null {
+  const html = inspection.entries
+    .map((entry) => entry.name)
+    .filter((name) => /\.html?$/i.test(name))
+    .sort((left, right) => {
+      const leftIndex = /(^|\/)index\.html?$/i.test(left) ? 0 : 1;
+      const rightIndex = /(^|\/)index\.html?$/i.test(right) ? 0 : 1;
+      return leftIndex - rightIndex || left.localeCompare(right);
+    });
+  return html[0] ?? null;
+}
+
+function isBinaryAsset(file: string): boolean {
+  return /\.(png|jpe?g|gif|webp|ico|woff2?|ttf|otf|eot|pdf|mp4|webm|mov|mp3|wav)$/i.test(
+    file,
+  );
+}
+
+function mediaType(file: string): string {
+  const extension = path.extname(file).toLowerCase();
+  return (
+    {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp',
+      '.ico': 'image/x-icon',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+      '.ttf': 'font/ttf',
+      '.otf': 'font/otf',
+      '.pdf': 'application/pdf',
+      '.mp4': 'video/mp4',
+      '.webm': 'video/webm',
+      '.mp3': 'audio/mpeg',
+      '.wav': 'audio/wav',
+    }[extension] ?? 'application/octet-stream'
+  );
 }
 
 function buildInventory(inspection: ZipInspection): string {

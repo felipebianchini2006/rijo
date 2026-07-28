@@ -295,6 +295,8 @@ export const ConfigSchema = z.object({
       plan_revisions: z.number().int().min(0).default(2),
       review_loops: z.number().int().min(0).default(2),
       qa_fix_loops: z.number().int().min(0).default(2),
+      qa_defect_attempts: z.number().int().min(0).default(2),
+      qa_regression_passes: z.number().int().min(1).default(3),
       fix_attempts: z.number().int().min(0).default(2),
       max_parallel_agents: z.number().int().min(1).default(4),
     })
@@ -355,8 +357,12 @@ export const StageSchema = z.enum([
   'MAP_COMMIT',
   'MAP_DONE',
   // Native public workflow stages. Legacy values remain below for compatibility.
+  'SCOPE_PARSE',
   'PROJECT_RESEARCH',
+  'DECISION_VALIDATION',
+  'SYSTEM_DESIGN',
   'ROADMAP_READY',
+  'CONTEXT_COMMIT',
   'PHASE_LOAD',
   'PHASE_RESEARCH',
   'PHASE_PLAN',
@@ -563,7 +569,7 @@ export type PlanFreshness = z.infer<typeof PlanFreshnessSchema>;
 /** Planner-authored shape. Freshness is stamped by the deterministic core. */
 export const PhasePlanDraftSchema = z.object({
   phase: z.string(),
-  tasks: z.array(PlanTaskSchema).min(2).max(4),
+  tasks: z.array(PlanTaskSchema).min(3).max(6),
 });
 export type PhasePlanDraft = z.infer<typeof PhasePlanDraftSchema>;
 

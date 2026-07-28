@@ -815,7 +815,7 @@ async function executePhase(
       const planTask: AgentTaskDraft = {
         id: `plan-${phase.id}-r${revisions}`,
         role: 'planner',
-        objective: `Produce the execution plan for phase ${phase.id}: between 2 and 4 tasks, exact files or code regions, dependencies, per-worker write scope, executable test commands and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Each tests[] entry must be an executable verification command such as "npm test", never a prose scenario or expected result. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
+        objective: `Produce the execution plan for phase ${phase.id}: between 3 and 6 tasks, exact files or code regions, dependencies, per-worker write scope, executable test commands and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Do not create artificial tasks. Use the simplest design that supports this milestone and the next likely milestone. Reject abstractions without a consumer, duplicate layers, and speculative infrastructure. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Each tests[] entry must be an executable verification command such as "npm test", never a prose scenario or expected result. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
         canonical_files: [
           paths.rules,
           pp.research,
@@ -824,7 +824,7 @@ async function executePhase(
         ].filter(exists),
         code_files: [],
         write_scope: [],
-        acceptance_criteria: ['2-4 tasks', 'every task writes at least one concrete file (non-empty files[] and write_scope[])', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
+        acceptance_criteria: ['3-6 tasks', 'every task writes at least one concrete file (non-empty files[] and write_scope[])', 'every task has requirement IDs or technical justification', 'write scopes are exact'],
         verification_commands: [],
         return_format:
           'JSON payload matching PhasePlanDraft: {phase, tasks:[{id:"T01", name, requirement_ids[], technical_justification, files[/*>=1 exact path*/], mapped_references:[{path,intent:"existing",file_hash,symbol?}|{path,intent:"new",parent_module,placement_evidence:[{path,reason}]}] /* required and must cover every task file */, write_scope[/*only exact declared files*/], depends_on[], parallel, tdd, tests[/*executable command strings only, e.g. "npm test"*/], evidence_expected}]}. ' +
@@ -878,7 +878,7 @@ async function executePhase(
         }
         revisions++;
         reviewNotes = parsed.error.issues.map(
-          (i) => `Invalid plan payload at ${i.path.join('.') || '(root)'}: ${i.message}. Every task needs a non-empty files[] and write_scope[]; ids must be T01..T04; return a payload matching the PhasePlan schema exactly.`,
+          (i) => `Invalid plan payload at ${i.path.join('.') || '(root)'}: ${i.message}. Every task needs a non-empty files[] and write_scope[]; ids must be T01..T06; return a payload matching the PhasePlan schema exactly.`,
         );
         plan = null;
         continue;
@@ -1416,10 +1416,71 @@ async function executePhase(
       checkpointControlledSnapshot();
       continue;
     }
-    writeReviewDoc(pp, cr.data, reviewLoops, now);
+    let reviewData = cr.data;
+    let securityEnvelope: ValidatedAgentEnvelope | null = null;
+    const securityContext = [
+      phase.name,
+      ...reqDoc.requirements
+        .filter((requirement) => requirement.phase === phase.id)
+        .flatMap((requirement) => [requirement.description, requirement.acceptance]),
+      ...reviewedPaths,
+    ].join('\n');
+    if (
+      /\b(auth(?:entication|orization)?|permission|payment|money|secret|credential|upload|delete|destruct|trust boundary|personal data)\b/i.test(
+        securityContext,
+      )
+    ) {
+      stage('ENGINEERING_REVIEW', 'Run the risk-triggered security review.');
+      const securityTask: AgentTaskDraft = {
+        id: `security-review-${phase.id}-l${reviewLoops}`,
+        role: 'reviewer',
+        objective:
+          'Review only the changed high-risk surface. Check authorization, trust boundaries, secret handling, destructive actions, upload validation, money movement, and data integrity as applicable. Return only evidence-backed findings. Do not change files.',
+        canonical_files: [pp.spec, pp.plan].filter(exists),
+        code_files: plan.tasks.flatMap((task) =>
+          task.files.map((file) => path.resolve(ctx.projectRoot, file)),
+        ),
+        write_scope: [],
+        acceptance_criteria: ['Every applicable high-risk boundary is reviewed.'],
+        verification_commands: [],
+        return_format:
+          'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}.',
+        notes: `RISK CONTEXT:\n${securityContext}\n\nDIFF SUMMARY:\n${diffSummary}`,
+      };
+      const securityReview = await dispatchReadOnly(ctx, securityTask, {
+        stage: 'ENGINEERING_REVIEW',
+        requirementTags: ['security'],
+      });
+      securityEnvelope = securityReview.result;
+      const securityPayload = ReviewPayloadSchema.safeParse(securityReview.result.payload);
+      if (
+        securityReview.violation.length > 0 ||
+        !securityReview.result.ok ||
+        !securityPayload.success
+      ) {
+        discardDecisionProposals(ctx, securityReview.result);
+        discardDecisionProposals(ctx, crRes);
+        if (reviewLoops >= config.limits.review_loops) {
+          return blocked(
+            ctx,
+            `Phase ${phase.id}: the required security review did not produce a valid verdict.`,
+            securityReview.violation.length > 0
+              ? securityReview.violation
+              : [securityReview.result.summary],
+          );
+        }
+        reviewLoops++;
+        continue;
+      }
+      reviewData = {
+        approved: reviewData.approved && securityPayload.data.approved,
+        findings: [...reviewData.findings, ...securityPayload.data.findings],
+      };
+    }
+    writeReviewDoc(pp, reviewData, reviewLoops, now);
     touchManifest(paths, () => {}, now);
     const blockingSeverities = new Set(['blocker', 'critical', 'high']);
-    const specGaps = cr.data.findings.filter(
+    const specGaps = reviewData.findings.filter(
       (f) => (f.type === 'intent_gap' || f.type === 'spec_gap') && blockingSeverities.has(f.severity),
     );
     if (specGaps.length > 0) {
@@ -1433,11 +1494,12 @@ async function executePhase(
     // overturn green executable evidence or manufacture a technical blocker.
     // This is the operational form of the autonomous-decision policy: only a
     // high-impact finding enters the bounded repair/block path.
-    const actionable = cr.data.findings.filter(
+    const actionable = reviewData.findings.filter(
       (f) => !['defer', 'reject'].includes(f.type) && blockingSeverities.has(f.severity),
     );
     if (actionable.length === 0) {
       commitDecisionProposals(ctx, crRes);
+      if (securityEnvelope) commitDecisionProposals(ctx, securityEnvelope);
       break;
     }
     if (reviewLoops >= config.limits.review_loops) {
@@ -1449,6 +1511,7 @@ async function executePhase(
     }
     reviewLoops++;
     discardDecisionProposals(ctx, crRes);
+    if (securityEnvelope) discardDecisionProposals(ctx, securityEnvelope);
     const repairOutcome = await runRepairAttempt(ctx, phase.id, pp, plan, {
       id: `review-fix-${phase.id}-l${reviewLoops}`,
       objective: 'Address the valid review findings below with minimal coherent changes.',

@@ -423,7 +423,7 @@ export function commitPortableDurableArtifacts(ctx: WorkflowContext, reason: str
 
 export interface WorkflowOutcome {
   ok: boolean;
-  status: 'completed' | 'blocked' | 'failed';
+  status: 'completed' | 'not_ready' | 'blocked' | 'failed';
   message: string;
   details?: string[];
 }

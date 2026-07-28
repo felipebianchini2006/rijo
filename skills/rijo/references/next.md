@@ -12,6 +12,9 @@ Preserve all prior milestone history.
 7. Research only new or changed project-level facts.
 8. Create a new high-level roadmap.
 9. Update active project state.
+10. Read `native-results.md`.
+11. Record the research and roadmap in a result bundle.
+12. Run `node .rijo/bin/rijo.cjs internal next-init @NEXT-PLAN.md --results @.rijo/runtime/native-results.json`.
 
 Do not rewrite historical documents.
 Do not implement roadmap phases.

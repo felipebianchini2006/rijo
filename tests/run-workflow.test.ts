@@ -61,7 +61,7 @@ describe('rijo run', () => {
     expect(state.last_commit).toBe(d.git.commits.find((c) => c.message.includes('verified'))!.hash);
     // workers ran with fresh briefs and strict scopes
     const workers = d.runner.executed.filter((t) => t.id.startsWith('exec-01-'));
-    expect(workers).toHaveLength(2);
+    expect(workers).toHaveLength(3);
     expect(workers[0]!.write_scope).toEqual(['src/a.ts']);
     expect(workers[0]!.objective).toContain("local file-inspection and patch/edit tools");
     expect(workers[0]!.objective).toContain('Do NOT execute repository code');
@@ -93,6 +93,8 @@ describe('rijo run', () => {
     expect(roadmap.phases.every((p) => p.status === 'DONE')).toBe(true);
     // one commit per verified phase
     expect(d.git.commits.filter((c) => c.message.includes('verified'))).toHaveLength(2);
+    expect(d.runner.executed.some((task) => task.id.startsWith('security-review-01-'))).toBe(false);
+    expect(d.runner.executed.some((task) => task.id.startsWith('security-review-02-'))).toBe(true);
   });
 
   it('installs newly declared Node.js dependencies through the managed gate before verification', async () => {
@@ -461,7 +463,7 @@ describe('rijo run', () => {
     await newWorkflow(root, { planFile: '@PLAN.md' }, wired);
     const outcome = await runWorkflow(root, {}, wired);
     expect(outcome.ok, outcome.message).toBe(true);
-    expect(calls.map((call) => call.exit)).toEqual([1, 0]);
+    expect(calls.map((call) => call.exit)).toEqual([1, 0, 0]);
     expect(calls[0]!.cwd).toContain('.rijo/runtime/workspaces/ws-tdd-red-01-T01-');
     const verification = fs.readFileSync(
       path.join(milestoneDir(root), 'phases', '01-catalog', 'VERIFICATION.md'),
@@ -517,9 +519,9 @@ describe('rijo run', () => {
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
     const outcome = await runWorkflow(root, {}, d);
     expect(outcome.ok).toBe(true);
-    // both parallel workers were dispatched (single group of 2)
+    // Both parallel workers and the dependent integration task were dispatched.
     const workers = d.runner.executed.filter((t) => t.id.startsWith('exec-01-'));
-    expect(workers).toHaveLength(2);
+    expect(workers).toHaveLength(3);
   });
 
   it('scope violation by a worker is rejected and leaves no changes', async () => {
