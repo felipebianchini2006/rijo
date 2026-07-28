@@ -60,14 +60,15 @@ export function readJsonIfExists<T = unknown>(p: string): T | null {
  * cannot leave a torn file, and the existing target is never destroyed until
  * its replacement is safely in place — if anything fails, the original stays.
  */
-export function writeFileAtomic(p: string, content: string): void {
+function writeAtomic(p: string, content: string | Buffer): void {
   ensureDir(path.dirname(p));
   const suffix = `${process.pid}.${Math.floor(Math.random() * 1e9).toString(36)}`;
   const tmp = path.join(path.dirname(p), `.${path.basename(p)}.${suffix}.tmp`);
   // write + flush the temp file durably
   const fd = fs.openSync(tmp, 'w');
   try {
-    fs.writeFileSync(fd, content, 'utf8');
+    if (typeof content === 'string') fs.writeFileSync(fd, content, 'utf8');
+    else fs.writeFileSync(fd, content);
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -98,6 +99,14 @@ export function writeFileAtomic(p: string, content: string): void {
       throw err2;
     }
   }
+}
+
+export function writeFileAtomic(p: string, content: string): void {
+  writeAtomic(p, content);
+}
+
+export function writeBufferAtomic(p: string, content: Buffer): void {
+  writeAtomic(p, content);
 }
 
 export function writeJsonAtomic(p: string, value: unknown): void {

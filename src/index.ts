@@ -32,7 +32,25 @@ export { StdioTransport, RpcAgentRunner, type RpcTransport } from './agents/rpc.
 export type { WorkflowContext, WorkflowDeps, WorkflowOutcome } from './workflows/shared.js';
 export type { AgentRunner, RunnerCapabilities } from './agents/runner.js';
 export { FakeAgentRunner, UnboundAgentRunner } from './agents/runner.js';
-export { NativeResultRunner } from './agents/native-results.js';
+export {
+  NativeArtifactReferenceSchema,
+  NativeProtocolUpgradeError,
+  NativeRequestV2Schema,
+  NativeResultBundleV2Schema,
+  NativeResultRunner,
+  NativeResultV2Schema,
+  createNativeRequestV2,
+  type NativeArtifactReference,
+  type NativeRequestV2,
+  type NativeResultBundleV2,
+  type NativeResultV2,
+} from './agents/native-results.js';
+export {
+  NativeLifecycleEventSchema,
+  NativeLifecycleLedger,
+  createNativeLifecycleEvent,
+  type NativeLifecycleEvent,
+} from './agents/native-lifecycle.js';
 export { AgentTaskSchema, AgentResultSchema, type AgentTask, type AgentResult } from './agents/protocol.js';
 export { renderBrief } from './agents/prompts.js';
 export { evaluateCommand, FakeShellRunner, SystemShellRunner, type ShellRunner, type CommandEvidence } from './core/commands.js';

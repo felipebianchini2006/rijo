@@ -229,6 +229,7 @@ export const TaskRecordSchema = z.object({
   host_thread_id: z.string().nullable().default(null),
   host_turn_id: z.string().nullable().default(null),
   host_process_id: z.number().int().nullable().default(null),
+  host_native_handle: z.string().nullable().default(null),
   workspace_id: z.string().nullable().default(null),
   workspace_path: z.string().nullable().default(null),
   baseline_commit: z.string().nullable().default(null),
