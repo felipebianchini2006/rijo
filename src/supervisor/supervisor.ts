@@ -308,13 +308,9 @@ export class Supervisor {
     };
   }
 
-  private discardSupersededWorkspace(record: TaskRecord, task: AgentTask): void {
-    if (
-      record.workspace_path === null ||
-      record.workspace_id === null ||
-      task.workspace?.id === record.workspace_id
-    ) {
-      return;
+  private managedWorkspace(record: TaskRecord): { id: string; root: string } | null {
+    if (record.workspace_path === null || record.workspace_id === null) {
+      return null;
     }
     const workspacesRoot = path.resolve(this.paths.runtimeDir, 'workspaces');
     const candidate = path.resolve(record.workspace_path);
@@ -323,11 +319,19 @@ export class Supervisor {
       relative === '' ||
       path.isAbsolute(relative) ||
       relative.split(path.sep).includes('..') ||
-      path.basename(candidate) !== record.workspace_id
+      path.basename(candidate) !== record.workspace_id ||
+      !fs.existsSync(candidate) ||
+      fs.lstatSync(candidate).isSymbolicLink()
     ) {
-      return;
+      return null;
     }
-    fs.rmSync(candidate, { recursive: true, force: true });
+    return { id: record.workspace_id, root: candidate };
+  }
+
+  private discardSupersededWorkspace(record: TaskRecord, task: AgentTask): void {
+    const managed = this.managedWorkspace(record);
+    if (!managed || task.workspace?.id === managed.id) return;
+    fs.rmSync(managed.root, { recursive: true, force: true });
   }
 
   /**
@@ -417,12 +421,8 @@ export class Supervisor {
       });
     }
     const deferredNativeWorkspace =
-      prior &&
-      reusesNativeIdentity &&
-      prior.workspace_id !== null &&
-      prior.workspace_path !== null &&
-      task.workspace?.id !== prior.workspace_id
-        ? prior
+      prior && reusesNativeIdentity && task.workspace?.id !== prior.workspace_id
+        ? this.managedWorkspace(prior)
         : null;
     if (prior && supersedesAwaitingNativeRequest) {
       this.discardSupersededWorkspace(prior, task);
@@ -594,11 +594,21 @@ export class Supervisor {
           started_at: this.toIso(),
           soft_deadline_at: this.toIso(softDeadline),
           hard_deadline_at: this.toIso(hardDeadline),
-          workspace_id: deferredNativeWorkspace?.workspace_id ?? currentTask.workspace?.id ?? null,
-          workspace_path: deferredNativeWorkspace?.workspace_path ?? currentTask.workspace?.root ?? null,
+          workspace_id: deferredNativeWorkspace?.id ?? currentTask.workspace?.id ?? null,
+          workspace_path: deferredNativeWorkspace?.root ?? currentTask.workspace?.root ?? null,
         });
 
-        const attemptTask = this.buildAttemptTask(currentTask, identity, idempotencyKey);
+        const runnerTask =
+          deferredNativeWorkspace && currentTask.workspace
+            ? {
+                ...currentTask,
+                workspace: {
+                  ...currentTask.workspace,
+                  replay_source: deferredNativeWorkspace,
+                },
+              }
+            : currentTask;
+        const attemptTask = this.buildAttemptTask(runnerTask, identity, idempotencyKey);
         const abort = new AbortController();
         st.abort = abort;
         if (opts.signal) {
@@ -652,12 +662,12 @@ export class Supervisor {
                 },
                 'native_workspace_materialized',
                 {
-                  prior_workspace_id: deferredNativeWorkspace.workspace_id,
+                  prior_workspace_id: deferredNativeWorkspace.id,
                   workspace_id: currentTask.workspace?.id ?? null,
                   result_validated: true,
                 },
               );
-              this.discardSupersededWorkspace(deferredNativeWorkspace, currentTask);
+              fs.rmSync(deferredNativeWorkspace.root, { recursive: true, force: true });
             }
             this.active.delete(logicalId);
             return outcome.result;

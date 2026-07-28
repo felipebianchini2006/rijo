@@ -74,7 +74,10 @@ Add the task result with this shape:
   "files_written": [],
   "scope_requests": [],
   "decision_proposals": [],
-  "artifacts": []
+  "artifacts": [],
+  "preserved_files": [],
+  "deleted_paths": [],
+  "renames": []
 }
 ```
 
@@ -86,6 +89,59 @@ Use `files` for complete text files.
 Encode the text with Unicode Transformation Format 8.
 Use project-relative target paths as the keys.
 Keep reviewer and researcher `files` empty.
+Return a non-empty file delta for each successful writer task.
+Do not report writer success with empty file fields.
+
+Use `preserved_files` for a delayed result from an assigned workspace.
+Copy `workspace_id` from the original request.
+Set `baseline_sha256` to the secure hash of the file before the task.
+Set `baseline_sha256` to `null` when the task created the file.
+Set `sha256` to the secure hash of the completed file.
+Use this exact shape:
+
+```json
+{
+  "target_path": "src/feature.ts",
+  "sha256": "<64 hexadecimal characters>",
+  "workspace_id": "ws-exec-01-T01-example",
+  "baseline_sha256": "<64 hexadecimal characters>"
+}
+```
+
+RIJO reads the file from the exact retained workspace.
+RIJO validates the file against its workspace baseline.
+RIJO copies the verified bytes into the current workspace.
+RIJO rejects a preserved file with no baseline delta.
+
+Use `deleted_paths` for each explicit file deletion.
+Provide the secure hash of the file before deletion.
+Use this exact shape:
+
+```json
+{
+  "path": "src/obsolete.ts",
+  "sha256": "<64 hexadecimal characters>"
+}
+```
+
+Use `renames` for each explicit file rename.
+Provide the source path.
+Provide the target path.
+Provide the secure hash of the source file.
+Use this exact shape:
+
+```json
+{
+  "source_path": "src/old-name.ts",
+  "target_path": "src/new-name.ts",
+  "source_sha256": "<64 hexadecimal characters>"
+}
+```
+
+Keep all operation paths relative to the project root.
+Use forward slashes in every operation path.
+Keep every operation path inside the request write scope.
+List every changed source and target path in `files_written`.
 
 Reference each binary artifact with this shape:
 

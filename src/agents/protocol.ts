@@ -46,7 +46,15 @@ export const AgentTaskSchema = z.object({
    * the controlled checkout is off-limits and any change there is a violation.
    * Reviewers and researchers get null (read-only by default).
    */
-  workspace: z.object({ id: z.string(), root: z.string() }).nullable().default(null),
+  workspace: z.object({
+    id: z.string(),
+    root: z.string(),
+    /**
+     * Original workspace retained for an exact native-result replay.
+     * The runner may read verified bytes from this workspace only.
+     */
+    replay_source: z.object({ id: z.string(), root: z.string() }).optional(),
+  }).nullable().default(null),
   /**
    * Immutable canonical baseline this task was briefed against: the sha256 of
    * the manifest's hash map at dispatch time. A result is only applicable

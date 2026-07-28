@@ -9,6 +9,7 @@ import {
 } from '../src/agents/native-results.js';
 import { AgentTaskSchema } from '../src/agents/protocol.js';
 import { sha256 } from '../src/core/fsx.js';
+import { AttemptWorkspace } from '../src/core/workspace.js';
 import { detectDrift } from '../src/core/manifest.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { readStatus } from '../src/core/progress.js';
@@ -202,6 +203,7 @@ describe('native result ingestion', () => {
     expect(first.ok).toBe(false);
     const requestFile = path.join(root, 'native-requests.jsonl');
     const request = JSON.parse(fs.readFileSync(requestFile, 'utf8').trim());
+    expect(request.workspace_id).toBe('ws-writer-a');
     expect(request.canonical_files).toEqual([path.join(workspaceA, '.rijo', 'RULES.md')]);
     expect(request.code_files).toEqual([path.join(workspaceA, 'src', 'feature.ts')]);
 
@@ -326,6 +328,88 @@ describe('native result ingestion', () => {
     expect(new TaskStore(paths).read(workspaceA.id)?.workspace_id).toBe('ws-materialization-c');
     expect(fs.readFileSync(path.join(workspaceC.workspace!.root, 'src', 'feature.ts'), 'utf8'))
       .toContain('feature = true');
+  });
+
+  it('materializes a preserved delayed result into the current workspace and checkout', async () => {
+    const root = tmpProject('rijo-native-preserved-replay-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    const baseline = 'export const feature = false;\n';
+    const changed = 'export const feature = true;\n';
+    fs.writeFileSync(path.join(root, 'src', 'feature.ts'), baseline);
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const makeWorkspace = () =>
+      AttemptWorkspace.create(root, {
+        taskId: 'exec-preserved-replay',
+        writeScope: ['src/feature.ts'],
+        baselineCanonicalHash: 'baseline-01',
+      });
+    const makeTask = (workspace: AttemptWorkspace) =>
+      AgentTaskSchema.parse({
+        id: 'exec-preserved-replay',
+        role: 'worker',
+        objective: 'Change the feature.',
+        canonical_files: [],
+        code_files: [path.join(workspace.root, 'src', 'feature.ts')],
+        write_scope: ['src/feature.ts'],
+        acceptance_criteria: ['The changed feature reaches the checkout.'],
+        verification_commands: [],
+        return_format: 'JSON result.',
+        workspace: { id: workspace.id, root: workspace.root },
+        canonical_baseline: 'baseline-01',
+      });
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 0,
+      replacement_backoff_ms: [],
+    };
+    const originalWorkspace = makeWorkspace();
+    const originalTask = makeTask(originalWorkspace);
+    const pending = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: originalTask, role: 'worker' });
+    expect(pending.ok).toBe(false);
+    const request = JSON.parse(
+      fs.readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8').trim(),
+    );
+
+    fs.writeFileSync(path.join(originalWorkspace.root, 'src', 'feature.ts'), changed);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Changed the feature in the original attempt workspace.',
+        payload: { done: true },
+        files_written: ['src/feature.ts'],
+        preserved_files: [{
+          target_path: 'src/feature.ts',
+          sha256: sha256(changed),
+          workspace_id: originalWorkspace.id,
+          baseline_sha256: sha256(baseline),
+        }],
+      }],
+    }));
+
+    const currentWorkspace = makeWorkspace();
+    const currentTask = makeTask(currentWorkspace);
+    const accepted = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: currentTask, role: 'worker' });
+
+    expect(accepted.ok, accepted.summary).toBe(true);
+    expect(fs.existsSync(originalWorkspace.root)).toBe(false);
+    expect(fs.readFileSync(path.join(currentWorkspace.root, 'src', 'feature.ts'), 'utf8'))
+      .toBe(changed);
+    expect(currentWorkspace.validate().changed).toEqual(['src/feature.ts']);
+    expect(currentWorkspace.applyVerifiedPatch().applied).toEqual(['src/feature.ts']);
+    expect(fs.readFileSync(path.join(root, 'src', 'feature.ts'), 'utf8')).toBe(changed);
   });
 
   it('replaces a native writer result rejected by deterministic validation with a new fenced identity', async () => {

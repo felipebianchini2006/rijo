@@ -80,6 +80,7 @@ export const NativeRequestV2Schema = NativeIdentitySchema.extend({
   role: z.string().min(1),
   tier: z.string().optional(),
   objective: z.string().min(1),
+  workspace_id: z.string().nullable(),
   canonical_files: z.array(z.string()),
   code_files: z.array(z.string()),
   write_scope: z.array(z.string()),
@@ -162,6 +163,7 @@ function requestHashInput(task: AgentTask): Omit<NativeRequestV2, 'request_id' |
     role: task.role,
     ...(task.tier ? { tier: task.tier } : {}),
     objective: task.objective,
+    workspace_id: task.workspace?.id ?? null,
     canonical_files: task.canonical_files,
     code_files: task.code_files,
     write_scope: task.write_scope,
@@ -236,6 +238,7 @@ export function createNativeRequestV2(task: AgentTask): NativeRequestV2 {
   // exact supervised identity can resume while the request contains real paths.
   const hashBody = {
     ...body,
+    workspace_id: body.workspace_id === null ? null : '$WORKSPACE',
     canonical_files: body.canonical_files.map((value) => stableWorkspacePath(task, value)),
     code_files: body.code_files.map((value) => stableWorkspacePath(task, value)),
   };
@@ -421,11 +424,12 @@ export class NativeResultRunner implements AgentRunner {
         }
       }
 
-      const absolute = (relative: string): string => {
-        const target = path.resolve(task.workspace!.root, relative);
-        assertContainedWithoutSymlinks(task.workspace!.root, target);
+      const absoluteAt = (root: string, relative: string): string => {
+        const target = path.resolve(root, relative);
+        assertContainedWithoutSymlinks(root, target);
         return target;
       };
+      const absolute = (relative: string): string => absoluteAt(task.workspace!.root, relative);
       const verifiedFileHash = (relative: string, purpose: string): string | AgentResult => {
         const target = absolute(relative);
         if (!exists(target) || !fs.lstatSync(target).isFile()) {
@@ -449,21 +453,48 @@ export class NativeResultRunner implements AgentRunner {
         artifactBytes.set(artifact.target_path, bytes);
       }
       const verifiedPreservedChanges = new Set<string>();
+      const preservedBytes = new Map<string, Buffer>();
       for (const file of entry.preserved_files) {
-        if (
-          file.workspace_id !== task.workspace.id ||
-          task.attempt?.workspace_id !== task.workspace.id
-        ) {
+        if (task.attempt?.workspace_id !== task.workspace.id) {
+          return reject(`Native result target workspace identity is invalid: ${file.target_path}.`);
+        }
+        const replaySource = task.workspace.replay_source;
+        const source =
+          file.workspace_id === task.workspace.id
+            ? { id: task.workspace.id, root: task.workspace.root }
+            : replaySource?.id === file.workspace_id
+              ? replaySource
+              : null;
+        if (!source) {
           return reject(
             `Native result preserved file belongs to a different attempt workspace: ${file.target_path}.`,
           );
         }
-        const actual = verifiedFileHash(file.target_path, 'preserved file');
-        if (typeof actual !== 'string') return actual;
+        if (source.id !== task.workspace.id) {
+          const workspacesRoot = path.resolve(path.dirname(task.workspace.root));
+          const sourceRoot = path.resolve(source.root);
+          const relativeSource = path.relative(workspacesRoot, sourceRoot);
+          if (
+            relativeSource === '' ||
+            path.isAbsolute(relativeSource) ||
+            relativeSource.split(path.sep).includes('..') ||
+            path.basename(sourceRoot) !== source.id ||
+            !exists(sourceRoot) ||
+            fs.lstatSync(sourceRoot).isSymbolicLink()
+          ) {
+            return reject(`Native result replay workspace is invalid: ${file.target_path}.`);
+          }
+        }
+        const sourceTarget = absoluteAt(source.root, file.target_path);
+        if (!exists(sourceTarget) || !fs.lstatSync(sourceTarget).isFile()) {
+          return reject(`Native result preserved file source is missing: ${file.target_path}.`);
+        }
+        const bytes = fs.readFileSync(sourceTarget);
+        const actual = sha256(bytes);
         if (actual !== file.sha256) {
           return reject(`Native result preserved file hash mismatch: ${file.target_path}.`);
         }
-        const baseline = workspaceBaselineHash(task.workspace.root, file.target_path);
+        const baseline = workspaceBaselineHash(source.root, file.target_path);
         if (!baseline.available) {
           return reject(`Native result preserved file baseline is unavailable: ${file.target_path}.`);
         }
@@ -474,6 +505,7 @@ export class NativeResultRunner implements AgentRunner {
           return reject(`Native result preserved file has no delta from its attempt baseline: ${file.target_path}.`);
         }
         verifiedPreservedChanges.add(file.target_path);
+        preservedBytes.set(file.target_path, bytes);
       }
       for (const operation of entry.deleted_paths) {
         const actual = verifiedFileHash(operation.path, 'deletion');
@@ -529,6 +561,9 @@ export class NativeResultRunner implements AgentRunner {
       }
       for (const artifact of entry.artifacts) {
         writeBufferAtomic(absolute(artifact.target_path), artifactBytes.get(artifact.target_path)!);
+      }
+      for (const file of entry.preserved_files) {
+        writeBufferAtomic(absolute(file.target_path), preservedBytes.get(file.target_path)!);
       }
       for (const operation of entry.renames) {
         const source = absolute(operation.source_path);
