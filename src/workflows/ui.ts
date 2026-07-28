@@ -4,8 +4,11 @@ import { z } from 'zod';
 import {
   exists,
   ensureDir,
+  assertContainedWithoutSymlinks,
   readTextIfExists,
+  sha256,
   sha256File,
+  writeBufferAtomic,
   writeFileAtomic,
   writeJsonAtomic,
 } from '../core/fsx.js';
@@ -54,6 +57,27 @@ const MappingSchema = z.object({
   divergences: z.array(z.string()).default([]),
   states_covered: z.array(z.enum(['loading', 'empty', 'error', 'success'])).default([]),
 });
+
+interface BinaryArtifactReference {
+  source_path: string;
+  staged_path: string;
+  absolute_path: string;
+  sha256: string;
+  size: number;
+  media_type: string;
+}
+
+interface MappedBinaryArtifact {
+  target_path: string;
+  artifact: BinaryArtifactReference;
+}
+
+class BinaryAssetIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BinaryAssetIntegrityError';
+  }
+}
 
 /**
  * rijo ui — treat the design artifact as untrusted input and a visual
@@ -128,21 +152,27 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
         invSummary,
       ),
     );
+    const binaryArtifacts: BinaryArtifactReference[] = inspection.entries
+      .filter((entry) => isBinaryAsset(entry.name))
+      .map((entry) => {
+        const absolutePath = path.join(stagingDir, entry.name);
+        return {
+          source_path: entry.name,
+          staged_path: path
+            .relative(importDir, absolutePath)
+            .split(path.sep)
+            .join('/'),
+          absolute_path: absolutePath,
+          sha256: sha256File(absolutePath),
+          size: entry.size,
+          media_type: mediaType(entry.name),
+        };
+      });
     const artifactManifest = path.join(importDir, 'ARTIFACTS.json');
     writeJsonAtomic(artifactManifest, {
       schema_version: 1,
       primary_html: findPrimaryHtml(inspection),
-      artifacts: inspection.entries
-        .filter((entry) => isBinaryAsset(entry.name))
-        .map((entry) => ({
-          staged_path: path
-            .relative(importDir, path.join(stagingDir, entry.name))
-            .split(path.sep)
-            .join('/'),
-          sha256: sha256File(path.join(stagingDir, entry.name)),
-          size: entry.size,
-          media_type: mediaType(entry.name),
-        })),
+      artifacts: binaryArtifacts.map(({ absolute_path: _absolutePath, ...artifact }) => artifact),
     });
     // ---- 5: detect target stack
     const stackNote = readTextIfExists(paths.stack) ?? '';
@@ -196,15 +226,41 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     // ---- write scope DERIVED from the mapping — never '**'
     const scopeIssues: string[] = [];
     const writeScope: string[] = [];
+    const destinations = new Map<string, string>();
     for (const m of mapping.data.mappings) {
       const to = m.to.replace(/\\/g, '/');
       if (to.includes('*')) scopeIssues.push(`glob destination not allowed: ${to}`);
       else if (to.startsWith('.rijo') || to.startsWith('.git') || to.includes('node_modules')) scopeIssues.push(`forbidden destination: ${to}`);
       else if (path.isAbsolute(to) || to.startsWith('..')) scopeIssues.push(`destination escapes the project: ${to}`);
-      else writeScope.push(to);
+      else {
+        const collisionKey = to.normalize('NFC').toLowerCase();
+        const prior = destinations.get(collisionKey);
+        if (prior) scopeIssues.push(`duplicate destination: ${to} collides with ${prior}`);
+        else {
+          destinations.set(collisionKey, to);
+          writeScope.push(to);
+        }
+      }
     }
     if (scopeIssues.length > 0) {
       return blocked(ctx, 'UI mapping produced an invalid write scope.', scopeIssues);
+    }
+    const artifactsBySource = new Map(
+      binaryArtifacts.map((artifact) => [artifact.source_path.replace(/\\/g, '/'), artifact]),
+    );
+    const mappedBinaryArtifacts: MappedBinaryArtifact[] = [];
+    for (const item of mapping.data.mappings) {
+      const artifact = artifactsBySource.get(item.from.replace(/\\/g, '/'));
+      if (!artifact) continue;
+      if (item.kind !== 'asset') {
+        return blocked(ctx, 'UI mapping produced an invalid binary asset mapping.', [
+          `${item.from} must use mapping kind "asset".`,
+        ]);
+      }
+      mappedBinaryArtifacts.push({
+        target_path: item.to.replace(/\\/g, '/'),
+        artifact,
+      });
     }
     const requiredStates = ['loading', 'empty', 'error', 'success'] as const;
     const missingStates = requiredStates.filter((st) => !mapping.data.states_covered.includes(st));
@@ -257,11 +313,19 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       notes: '',
     };
     const attemptH = replaceableAttempt(ctx, convertTask, {}, { stage: 'UI_SMOKE' });
+    const prepareReplacement = attemptH.prepareReplacement;
     let deltaFiles: string[] = [];
     let conversionEnvelope: import('./shared.js').ValidatedAgentEnvelope | null = null;
     let validationEnvelope: import('./shared.js').ValidatedAgentEnvelope | null = null;
     try {
-      const res = await dispatch(ctx, attemptH.attempt.task, { stage: 'UI_SMOKE' }, { prepareReplacement: attemptH.prepareReplacement });
+      stageBinaryAssets(attemptH.attempt.workspace.root, mappedBinaryArtifacts);
+      const res = await dispatch(ctx, attemptH.attempt.task, { stage: 'UI_SMOKE' }, {
+        prepareReplacement: async (generation, previousFailure) => {
+          const replacement = await prepareReplacement(generation, previousFailure);
+          stageBinaryAssets(attemptH.attempt.workspace.root, mappedBinaryArtifacts);
+          return replacement;
+        },
+      });
       conversionEnvelope = res;
       const conv = z.object({ converted: z.boolean(), components_created: z.array(z.string()).default([]), notes: z.string().default('') }).safeParse(res.payload);
       if (!res.ok || !conv.success || !conv.data.converted) {
@@ -272,6 +336,22 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       deltaFiles = delta.changed;
       if (deltaFiles.length === 0) {
         return blocked(ctx, 'UI conversion produced no changes.', []);
+      }
+      const missingDestinations = writeScope.filter((destination) => {
+        const target = path.join(attemptH.attempt.workspace.root, destination);
+        return !exists(target) || !fs.lstatSync(target).isFile();
+      });
+      if (missingDestinations.length > 0) {
+        return blocked(ctx, 'UI conversion did not produce all mapped destinations.', missingDestinations);
+      }
+      const corruptAssets = mappedBinaryArtifacts.filter(({ target_path, artifact }) => {
+        const target = path.join(attemptH.attempt.workspace.root, target_path);
+        return fs.statSync(target).size !== artifact.size || sha256File(target) !== artifact.sha256;
+      });
+      if (corruptAssets.length > 0) {
+        return blocked(ctx, 'UI binary asset integrity validation failed.', [
+          ...corruptAssets.map(({ target_path }) => target_path),
+        ]);
       }
 
       // ---- deterministic mock scan on the REAL changed files (payload is never proof)
@@ -343,6 +423,9 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
       if (validationEnvelope) commitDecisionProposals(ctx, validationEnvelope);
       if (conversionEnvelope) commitDecisionProposals(ctx, conversionEnvelope);
     } catch (err) {
+      if (err instanceof BinaryAssetIntegrityError) {
+        return blocked(ctx, 'UI binary asset integrity validation failed.', [err.message]);
+      }
       if (err instanceof Error && ['WorkspaceScopeError', 'CanonicalWriteError', 'SymlinkEscapeError', 'PatchConflictError'].includes(err.name)) {
         return blocked(ctx, `UI conversion discarded — ${err.message}`, []);
       }
@@ -545,6 +628,43 @@ function mediaType(file: string): string {
       '.wav': 'audio/wav',
     }[extension] ?? 'application/octet-stream'
   );
+}
+
+function stageBinaryAssets(
+  workspaceRoot: string,
+  mappings: MappedBinaryArtifact[],
+): void {
+  for (const { target_path: targetPath, artifact } of mappings) {
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+    let descriptor: number;
+    try {
+      descriptor = fs.openSync(artifact.absolute_path, flags);
+    } catch {
+      throw new BinaryAssetIntegrityError(
+        `Could not open ${artifact.source_path} without following links.`,
+      );
+    }
+    let bytes: Buffer;
+    try {
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isFile() || stat.size !== artifact.size) {
+        throw new BinaryAssetIntegrityError(
+          `${artifact.source_path} no longer matches its staged artifact reference.`,
+        );
+      }
+      bytes = fs.readFileSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    if (sha256(bytes) !== artifact.sha256) {
+      throw new BinaryAssetIntegrityError(
+        `${artifact.source_path} no longer matches its staged artifact hash.`,
+      );
+    }
+    const target = path.resolve(workspaceRoot, targetPath);
+    assertContainedWithoutSymlinks(workspaceRoot, target);
+    writeBufferAtomic(target, bytes);
+  }
 }
 
 function buildInventory(inspection: ZipInspection): string {

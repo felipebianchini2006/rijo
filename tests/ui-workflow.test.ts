@@ -138,6 +138,120 @@ describe('rijo ui (hardened import pipeline)', () => {
     ]);
   });
 
+  it('preserves a mapped binary asset byte for byte through the isolated conversion', async () => {
+    const binary = Buffer.from([0, 1, 2, 255]);
+    const mapping = {
+      ...UI_MAPPING_PAYLOAD,
+      mappings: [
+        { from: 'index.html', to: 'app/page.tsx', kind: 'component', notes: 'home' },
+        { from: 'assets/photo.png', to: 'public/photo.png', kind: 'asset', notes: 'photo' },
+      ],
+      routes: [{ from: 'index.html', to: '/' }],
+    };
+    const d = deps(root, { capabilities: { browser: true } });
+    wireUi(d, root, {
+      mapping,
+      convert: (task) => {
+        const page = path.join(task.workspace!.root, 'app/page.tsx');
+        fs.mkdirSync(path.dirname(page), { recursive: true });
+        fs.writeFileSync(page, 'export default function Page() { return null; }\n');
+        return ok(task, {
+          files_written: ['app/page.tsx'],
+          payload: { converted: true, components_created: task.write_scope, notes: 'converted' },
+        });
+      },
+    });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+
+    const outcome = await uiWorkflow(root, { input: `@${path.basename(makeDesignZip())}` }, d);
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'public/photo.png'))).toEqual(binary);
+  });
+
+  it('blocks when a mapped destination is missing from the conversion', async () => {
+    const mapping = {
+      ...UI_MAPPING_PAYLOAD,
+      mappings: [
+        { from: 'index.html', to: 'app/page.tsx', kind: 'component', notes: 'home' },
+        { from: 'about.html', to: 'app/about/page.tsx', kind: 'component', notes: 'about' },
+      ],
+    };
+    const d = deps(root, { capabilities: { browser: true } });
+    wireUi(d, root, {
+      mapping,
+      convert: (task) => {
+        const page = path.join(task.workspace!.root, 'app/page.tsx');
+        fs.mkdirSync(path.dirname(page), { recursive: true });
+        fs.writeFileSync(page, 'export default function Page() { return null; }\n');
+        return ok(task, {
+          files_written: ['app/page.tsx'],
+          payload: { converted: true, components_created: ['app/page.tsx'], notes: 'partial' },
+        });
+      },
+    });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+
+    const outcome = await uiWorkflow(root, { input: `@${path.basename(makeDesignZip())}` }, d);
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('mapped destinations');
+    expect(outcome.details).toContain('app/about/page.tsx');
+  });
+
+  it('blocks mappings that collide on the same destination', async () => {
+    const mapping = {
+      ...UI_MAPPING_PAYLOAD,
+      mappings: [
+        { from: 'index.html', to: 'public/collision.png', kind: 'component', notes: 'page' },
+        { from: 'assets/photo.png', to: 'public/collision.png', kind: 'asset', notes: 'photo' },
+      ],
+    };
+    const d = deps(root, { capabilities: { browser: true } });
+    wireUi(d, root, { mapping });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+
+    const outcome = await uiWorkflow(root, { input: `@${path.basename(makeDesignZip())}` }, d);
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('invalid write scope');
+    expect(outcome.details?.join('\n')).toContain('duplicate destination');
+  });
+
+  it('blocks when the converter corrupts a staged binary asset', async () => {
+    const mapping = {
+      ...UI_MAPPING_PAYLOAD,
+      mappings: [
+        { from: 'index.html', to: 'app/page.tsx', kind: 'component', notes: 'home' },
+        { from: 'assets/photo.png', to: 'public/photo.png', kind: 'asset', notes: 'photo' },
+      ],
+      routes: [{ from: 'index.html', to: '/' }],
+    };
+    const d = deps(root, { capabilities: { browser: true } });
+    wireUi(d, root, {
+      mapping,
+      convert: (task) => {
+        const page = path.join(task.workspace!.root, 'app/page.tsx');
+        const photo = path.join(task.workspace!.root, 'public/photo.png');
+        fs.mkdirSync(path.dirname(page), { recursive: true });
+        fs.mkdirSync(path.dirname(photo), { recursive: true });
+        fs.writeFileSync(page, 'export default function Page() { return null; }\n');
+        fs.writeFileSync(photo, Buffer.from('corrupt'));
+        return ok(task, {
+          files_written: ['app/page.tsx', 'public/photo.png'],
+          payload: { converted: true, components_created: task.write_scope, notes: 'converted' },
+        });
+      },
+    });
+    await newWorkflow(root, { planFile: '@PLAN.md' }, d);
+
+    const outcome = await uiWorkflow(root, { input: `@${path.basename(makeDesignZip())}` }, d);
+
+    expect(outcome.status).toBe('blocked');
+    expect(outcome.message).toContain('binary asset integrity');
+    expect(fs.existsSync(path.join(root, 'public/photo.png'))).toBe(false);
+  });
+
   it('blocks a path collision with different content', async () => {
     const d = deps(root, { capabilities: { browser: true } });
     wireUi(d, root);
