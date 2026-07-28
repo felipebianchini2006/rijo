@@ -1,11 +1,13 @@
-import { execFileSync, execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
 import { cleanup, tmpProject } from './helpers.js';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const execFileAsync = promisify(execFile);
 
 interface PackFileEntry {
   path: string;
@@ -22,10 +24,20 @@ function parsePackJson(stdout: string): PackEntry[] {
   return JSON.parse(stdout.slice(start)) as PackEntry[];
 }
 
+/** Run a child without a shell while leaving the Vitest worker event loop free. */
+async function run(command: string, args: string[], cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return stdout;
+}
+
 describe('distribution E2E (npm pack + install)', () => {
-  test('tarball installs and the CLI works from dist', () => {
+  test('tarball installs and the CLI works from dist', async () => {
     // ---- pack (prepack runs the tsc build)
-    const packOut = execSync('npm pack --json', { cwd: packageRoot, encoding: 'utf8' });
+    const packOut = await run('npm', ['pack', '--json'], packageRoot);
     const [entry] = parsePackJson(packOut);
     expect(entry).toBeDefined();
     const tarball = path.join(packageRoot, entry!.filename);
@@ -44,7 +56,7 @@ describe('distribution E2E (npm pack + install)', () => {
 
       // ---- run the packed CLI through npm in an empty folder. The installer
       // must bootstrap this exact package without a registry lookup.
-      execFileSync(
+      await run(
         'npm',
         [
           'exec',
@@ -57,7 +69,7 @@ describe('distribution E2E (npm pack + install)', () => {
           '--project',
           '--codex',
         ],
-        { cwd: fixture, encoding: 'utf8' },
+        fixture,
       );
 
       const installed = path.join(fixture, 'node_modules', 'rijo');
@@ -76,11 +88,11 @@ describe('distribution E2E (npm pack + install)', () => {
       const cliEntry = path.join('node_modules', 'rijo', 'dist', 'cli', 'index.js');
 
       // ---- rijo --version
-      const version = execSync(`node "${cliEntry}" --version`, { cwd: fixture, encoding: 'utf8' });
+      const version = await run(process.execPath, [cliEntry, '--version'], fixture);
       expect(version.trim()).toBe('0.2.0-rc.1');
 
       // ---- rijo --status --json on the uninitialized fixture
-      const statusOut = execSync(`node "${cliEntry}" --status --json`, { cwd: fixture, encoding: 'utf8' });
+      const statusOut = await run(process.execPath, [cliEntry, '--status', '--json'], fixture);
       const status = JSON.parse(statusOut);
       expect(status.initialized).toBe(false);
       expect(status.rijo_version).toBe('0.2.0-rc.1');
@@ -94,10 +106,7 @@ describe('distribution E2E (npm pack + install)', () => {
       const boundLock = JSON.parse(fs.readFileSync(path.join(fixture, 'package-lock.json'), 'utf8'));
       expect(boundLock.packages[''].devDependencies.rijo).toBe('0.2.0-rc.1');
       expect(boundLock.packages['node_modules/rijo'].version).toBe('0.2.0-rc.1');
-      const localVersion = execSync('node .rijo/bin/rijo.cjs --version', {
-        cwd: fixture,
-        encoding: 'utf8',
-      });
+      const localVersion = await run(process.execPath, ['.rijo/bin/rijo.cjs', '--version'], fixture);
       expect(localVersion.trim()).toBe('0.2.0-rc.1');
 
       // ---- repeat the public project install through the bound local CLI.
@@ -113,10 +122,10 @@ describe('distribution E2E (npm pack + install)', () => {
       const firstInstall = idempotentFiles.map((file) =>
         fs.readFileSync(path.join(fixture, file)),
       );
-      execFileSync(
+      await run(
         process.execPath,
         ['.rijo/bin/rijo.cjs', 'install', '--project', '--codex'],
-        { cwd: fixture, encoding: 'utf8' },
+        fixture,
       );
       const secondInstall = idempotentFiles.map((file) =>
         fs.readFileSync(path.join(fixture, file)),
@@ -144,7 +153,7 @@ describe('distribution E2E (npm pack + install)', () => {
           "console.log('import-sqlite-backup-ok');",
         ].join('\n'),
       );
-      const importOut = execSync('node import-check.mjs', { cwd: fixture, encoding: 'utf8' });
+      const importOut = await run(process.execPath, ['import-check.mjs'], fixture);
       expect(importOut.trim()).toBe('import-sqlite-backup-ok');
       expect(fs.existsSync(path.join(fixture, '.rijo', 'state', 'backups', 'pack-install.sqlite'))).toBe(true);
     } finally {
