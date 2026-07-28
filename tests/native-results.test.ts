@@ -68,6 +68,7 @@ describe('native result ingestion', () => {
     expect(request.request_hash).toMatch(/^[a-f0-9]{64}$/);
     expect(request.objective).toBe(task.objective);
     expect(request.result_contract.protocol).toBe('NativeResultV2');
+    expect(fs.statSync(path.join(root, 'native-dispatch')).isDirectory()).toBe(true);
     expect(request.result_contract.identity_fields).toEqual([
       'request_id',
       'request_hash',

@@ -9,6 +9,7 @@ import {
   readText,
   sha256,
   sha256File,
+  ensureDir,
   writeBufferAtomic,
   writeFileAtomic,
 } from '../core/fsx.js';
@@ -323,6 +324,7 @@ export class NativeResultRunner implements AgentRunner {
   }
 
   private recordRequest(request: NativeRequestV2): void {
+    ensureDir(path.join(this.bundleDirectory, 'native-dispatch'));
     const prior = exists(this.requestFile)
       ? readText(this.requestFile)
           .trim()
