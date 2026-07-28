@@ -116,7 +116,12 @@ export async function fixWorkflow(
       if (diagnosis.reproduced || diagnosis.escalate) break;
     }
     if (!diagnosis || (!diagnosis.reproduced && !diagnosis.escalate)) {
-      finalize(fixPath, 'ESCALATED', 'Problem could not be reproduced after 2 attempts; escalate to a normal phase (rijo run) with better evidence.', now);
+      finalize(
+        fixPath,
+        'ESCALATED',
+        'The problem was not reproduced after two attempts. Add evidence or create a normal phase with `$rijo next`.',
+        now,
+      );
       return blocked(ctx, 'Fix escalated: problem not reproduced after 2 attempts.', [
         'Escalation criteria met. Consider adding evidence (@log.txt, @evidence.png) or opening a phase.',
       ]);

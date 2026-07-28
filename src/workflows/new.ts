@@ -208,7 +208,7 @@ export async function newWorkflow(
       if (prevState?.stage && prevState.stage !== 'DONE' && prevState.phase) {
         return blocked(ctx, 'An interrupted execution checkpoint exists.', [
           `Milestone ${prevState.milestone}, phase ${prevState.phase}, stage ${prevState.stage}.`,
-          'Resume it with `rijo run` or resolve the checkpoint before starting the next milestone.',
+          'Resume it with `$rijo resume` or resolve the checkpoint before starting the next milestone.',
         ]);
       }
       // A phase mid-flight (or blocked) in the active milestone also holds the
@@ -221,7 +221,7 @@ export async function newWorkflow(
         if (openPhase) {
           return blocked(ctx, 'An interrupted execution checkpoint exists.', [
             `Milestone ${activePrev.id}, phase ${openPhase.id} is ${openPhase.status}.`,
-            'Resume it with `rijo run` or resolve the checkpoint before starting the next milestone.',
+            'Resume it with `$rijo resume` or resolve the checkpoint before starting the next milestone.',
           ]);
         }
       }

@@ -270,7 +270,7 @@ export async function checkCore(
     if (!qaCheckpoint && dirtyAfterFix && decision.status === 'READY') {
       decision.status = 'NOT_READY';
       decision.reasons = [
-        'Working tree was modified by --fix but not committed; commit the fixes and re-run `rijo check` to certify a clean commit.',
+        'The repair changed the working tree. Commit the repair. Then run `$rijo test` again to certify a clean commit.',
       ];
     }
 

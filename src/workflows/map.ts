@@ -457,7 +457,10 @@ export async function mapCore(ctx: WorkflowContext, options: MapCoreOptions = {}
     gaps.push('No agent runtime was bound; deterministic inventory, symbols, surfaces, dependencies, history, and claims were used.');
   }
 
-  bus.emit('map.synthesis', { stage: 'MAP_SYNTHESIS', message: 'consolidando fragments sem duplicar ownership' });
+  bus.emit('map.synthesis', {
+    stage: 'MAP_SYNTHESIS',
+    message: 'Consolidate fragments without duplicate ownership.',
+  });
   const previousClaims =
     operation === 'full'
       ? null
