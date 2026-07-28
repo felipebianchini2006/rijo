@@ -22,7 +22,11 @@ export async function nextWorkflow(
     };
   }
   const entry = manifest.milestones.find((candidate) => candidate.id === milestone.id);
-  if (!entry || entry.status !== 'COMPLETE' || !exists(milestone.paths.closeout)) {
+  if (
+    !entry ||
+    !['COMPLETE', 'PARTIAL'].includes(entry.status) ||
+    !exists(milestone.paths.closeout)
+  ) {
     return {
       ok: false,
       status: 'blocked',

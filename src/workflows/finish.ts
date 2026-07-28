@@ -88,6 +88,14 @@ export async function finishWorkflow(
         ...missingEvidence.map((requirement) => `${requirement.id}: missing evidence`),
       ]);
     }
+    const unresolved = requirements.requirements.filter(
+      (requirement) => requirement.status !== 'DONE' && requirement.status !== 'CANCELLED',
+    );
+    if (unresolved.length > 0) {
+      return blockedReadOnly(ctx, `Milestone ${milestone.id} has unresolved requirements.`, [
+        ...unresolved.map((requirement) => `${requirement.id}: ${requirement.status}`),
+      ]);
+    }
 
     if (!exists(milestone.paths.readiness)) {
       return blockedReadOnly(ctx, 'Full product QA is required before finish.', [
@@ -139,9 +147,6 @@ export async function finishWorkflow(
         ]);
       }
     }
-    const unresolved = requirements.requirements.filter(
-      (requirement) => requirement.status !== 'DONE' && requirement.status !== 'CANCELLED',
-    );
     writeFileAtomic(
       path.join(milestone.dir, 'ARCHIVE.md'),
       [
@@ -158,10 +163,7 @@ export async function finishWorkflow(
       baselineCommit: testedCommit,
       baselineBranch: gitStatus.branch,
       deliveredVersion: null,
-      carryover: unresolved.map((requirement) => ({
-        requirement,
-        disposition: requirement.status === 'BLOCKED' ? 'blocked' as const : 'carried' as const,
-      })),
+      carryover: [],
       evidence: [path.relative(projectRoot, milestone.paths.readiness)],
       residualRisks: qaResult === 'READY' ? [] : [`Product QA result: ${qaResult}`],
       productionState: qaResult,

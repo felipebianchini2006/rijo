@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { serializeFrontmatter } from '../src/core/frontmatter.js';
 import { readManifest } from '../src/core/manifest.js';
 import { RijoPaths } from '../src/core/paths.js';
+import { readRequirements, writeRequirements } from '../src/core/roadmap.js';
 import { finishWorkflow } from '../src/workflows/finish.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { selectResumeRoute } from '../src/workflows/resume.js';
@@ -123,6 +124,36 @@ describe('native workflow lifecycle', () => {
 
     expect(result.ok, result.message).toBe(true);
     expect(readManifest(paths)!.milestones[0]!.status).toBe('COMPLETE');
+  });
+
+  it('finish refuses a requirement that has evidence but is not resolved', async () => {
+    const runtime = deps(root);
+    await newWorkflow(root, { planFile: '@PLAN.md' }, runtime);
+    await startWorkflow(root, runtime);
+    const paths = new RijoPaths(root);
+    const manifest = readManifest(paths)!;
+    const milestone = manifest.milestones.find(
+      (candidate) => candidate.id === manifest.active_milestone,
+    )!;
+    const milestoneDir = paths.milestoneDir(milestone.id, milestone.slug);
+    const requirementsPath = path.join(milestoneDir, 'REQUIREMENTS.md');
+    const requirements = readRequirements(requirementsPath);
+    requirements.requirements[0]!.status = 'BLOCKED';
+    requirements.requirements[0]!.evidence = 'Recorded partial evidence.';
+    writeRequirements(requirementsPath, requirements);
+    fs.writeFileSync(
+      path.join(milestoneDir, 'qa', 'production-readiness.md'),
+      serializeFrontmatter(
+        { status: 'NOT_READY', tested_commit: runtime.git.headCommit(root) },
+        '# Product QA\n\nStatus: NOT_READY\n',
+      ),
+    );
+
+    const result = await finishWorkflow(root, runtime);
+
+    expect(result.status).toBe('blocked');
+    expect(result.message).toContain('unresolved requirements');
+    expect(fs.existsSync(path.join(milestoneDir, 'CLOSEOUT.md'))).toBe(false);
   });
 
   it('finish registers a native host closeout when the portable manifest is still active', async () => {
