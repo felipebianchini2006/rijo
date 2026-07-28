@@ -1620,6 +1620,138 @@ describe('rijo run', () => {
     expect(verification).toContain('expected RED exit 1');
   });
 
+  it('installs project dependencies in a later task RED workspace', async () => {
+    const calls: Array<{ command: string; cwd: string; allowInstall?: boolean }> = [];
+    const dependencyAwareShell = {
+      run(
+        command: string,
+        options: { cwd?: string; allowInstall?: boolean } = {},
+      ) {
+        const cwd = options.cwd ?? root;
+        calls.push({ command, cwd, allowInstall: options.allowInstall });
+        const implemented = fs.existsSync(path.join(cwd, 'src', 'feature.mjs'));
+        const exit =
+          command === 'npm run test:unit'
+            ? implemented
+              ? 0
+              : 1
+            : 0;
+        return {
+          command,
+          exit_code: exit,
+          summary: exit === 0 ? 'pass' : 'AssertionError: expected implemented behavior',
+          duration_ms: 1,
+          blocked: false,
+          category: 'test' as const,
+          sandbox: 'test-double',
+          trust: 'repository-script',
+          network: options.allowInstall ? 'registry' : 'none',
+        };
+      },
+    };
+    const d = deps(root, {
+      planPayload: (phaseId) => ({
+        phase: phaseId,
+        tasks: [
+          {
+            id: 'T01',
+            name: 'Create the locked test toolchain',
+            requirement_ids: [],
+            technical_justification: 'The next task consumes the test toolchain.',
+            files: ['package.json'],
+            mapped_references: [newMappedReference('package.json')],
+            write_scope: ['package.json'],
+            depends_on: [],
+            parallel: false,
+            tdd: false,
+            tests: ['node --version'],
+            evidence_expected: 'The package manifest defines the test toolchain.',
+            done: false,
+          },
+          {
+            id: 'T02',
+            name: 'Add tested behavior',
+            requirement_ids: phaseReqIds(root, phaseId),
+            technical_justification: null,
+            files: ['src/feature.mjs', 'test/feature.test.mjs'],
+            mapped_references: [
+              newMappedReference('src/feature.mjs'),
+              newMappedReference('test/feature.test.mjs'),
+            ],
+            write_scope: ['src/feature.mjs', 'test/feature.test.mjs'],
+            depends_on: ['T01'],
+            parallel: false,
+            tdd: true,
+            tests: ['npm run test:unit'],
+            evidence_expected: 'The behavior test passes.',
+            done: false,
+          },
+        ],
+      }),
+    });
+    d.runner.on(
+      (task) => task.id === 'exec-01-T01',
+      (task) => {
+        fs.writeFileSync(
+          path.join(task.workspace!.root, 'package.json'),
+          JSON.stringify({
+            name: 'later-tdd-dependency-fixture',
+            private: true,
+            scripts: { 'test:unit': 'node --test test/feature.test.mjs' },
+            devDependencies: { typescript: '6.0.3' },
+          }),
+        );
+        return ok(task, {
+          files_written: ['package.json'],
+          payload: { done: true, notes: 'Created the toolchain manifest.' },
+        });
+      },
+    );
+    d.runner.on(
+      (task) => task.id === 'exec-01-T02',
+      (task) => {
+        fs.mkdirSync(path.join(task.workspace!.root, 'src'), { recursive: true });
+        fs.mkdirSync(path.join(task.workspace!.root, 'test'), { recursive: true });
+        fs.writeFileSync(
+          path.join(task.workspace!.root, 'src', 'feature.mjs'),
+          'export const feature = true;\n',
+        );
+        fs.writeFileSync(
+          path.join(task.workspace!.root, 'test', 'feature.test.mjs'),
+          "throw new Error('expected implemented behavior');\n",
+        );
+        return ok(task, {
+          files_written: ['src/feature.mjs', 'test/feature.test.mjs'],
+          payload: { done: true, notes: 'Added the tested behavior.' },
+        });
+      },
+    );
+
+    await newWorkflow(root, { planFile: '@PLAN.md' }, {
+      ...d,
+      shell: dependencyAwareShell,
+    });
+    const outcome = await runWorkflow(root, {}, {
+      ...d,
+      shell: dependencyAwareShell,
+    });
+
+    expect(outcome.ok, outcome.message).toBe(true);
+    const redInstall = calls.find(
+      (call) =>
+        call.command === 'npm install --no-audit --no-fund' &&
+        call.cwd.includes('.rijo/runtime/workspaces/ws-tdd-red-01-T02-'),
+    );
+    expect(redInstall).toMatchObject({ allowInstall: true });
+    expect(
+      calls.some(
+        (call) =>
+          call.command === 'npm run test:unit' &&
+          call.cwd.includes('.rijo/runtime/workspaces/ws-tdd-red-01-T02-'),
+      ),
+    ).toBe(true);
+  });
+
   it.each([
     ['a missing declared test file', 'missing-test'],
     ['an incomplete RED test environment', 'incomplete-environment'],

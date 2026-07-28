@@ -2966,7 +2966,11 @@ function runTddRedProof(
     redWorkspace.validate();
 
     const packageFile = path.join(redWorkspace.root, 'package.json');
-    if (harnessFiles.includes('package.json') && exists(packageFile)) {
+    // Every isolated RED workspace starts without node_modules. Install the
+    // locked project dependencies even when an earlier task created or changed
+    // package.json. A later TDD task must fail for missing behavior, not for a
+    // missing compiler or test runner.
+    if (exists(packageFile)) {
       try {
         const pkg = JSON.parse(readText(packageFile)) as {
           dependencies?: Record<string, unknown>;
