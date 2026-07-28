@@ -20,9 +20,18 @@ Create `.rijo/runtime/native-results.json` with this initial content:
 
 Run the selected internal helper.
 Read each new request from `.rijo/runtime/native-requests.jsonl`.
-Create a durable task record before delegation.
+Copy the complete request to `.rijo/runtime/native-dispatch/<request_id>.json`.
+Run `node .rijo/bin/rijo.cjs internal task-dispatch @.rijo/runtime/native-dispatch/<request_id>.json`.
+The helper confirms that the durable task record exists before delegation.
 Delegate the exact request to one native subagent.
 Record the real host handle when the host provides one.
+Run `node .rijo/bin/rijo.cjs internal task-start @.rijo/runtime/native-dispatch/<request_id>.json --host <host> --handle <handle>`.
+Run `task-observe` only for useful progress.
+Run `task-fail` when the native subagent fails.
+Run `task-timeout` when the native subagent exceeds its deadline.
+Request host cancellation when that capability exists.
+Run `task-cancelled` only after the host confirms cancellation.
+Run `task-cancel-unavailable` when the host cannot confirm cancellation.
 
 Copy these identity fields from the request into the result:
 
@@ -97,6 +106,10 @@ Do not apply a decision proposal directly.
 Preserve every validated result entry.
 Do not replace a prior result entry.
 Do not reorder a prior result entry.
+Stage the complete result bundle.
+Run `node .rijo/bin/rijo.cjs internal task-complete @.rijo/runtime/native-dispatch/<request_id>.json --host <host> --handle <handle>`.
+The completion event does not approve the result.
+The deterministic helper approves the result after exact identity and artifact validation.
 Run the same helper again.
 Repeat until the helper completes or reports a true blocker.
 
