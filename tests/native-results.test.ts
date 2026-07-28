@@ -9,6 +9,8 @@ import {
 import { AgentTaskSchema } from '../src/agents/protocol.js';
 import { detectDrift } from '../src/core/manifest.js';
 import { RijoPaths } from '../src/core/paths.js';
+import { readStatus } from '../src/core/progress.js';
+import { readState } from '../src/core/state.js';
 import { runCli } from '../src/cli/main.js';
 import { defaultExecutor } from '../src/workflows/executor.js';
 import { defaultConfig } from '../src/core/config.js';
@@ -435,6 +437,8 @@ describe('native result ingestion', () => {
 
     expect(detectDrift(paths)).toEqual({ drifted: [], missing: [] });
     expect(fs.existsSync(path.join(paths.runtimeDir, 'native-requests.jsonl'))).toBe(true);
+    expect(readState(paths)?.phase).toBeNull();
+    expect(readStatus(paths)?.phase?.id).toBe('01');
   });
 
   it('completes project setup across native helper turns without regenerating validated tasks', async () => {

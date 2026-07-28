@@ -3,6 +3,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { runCli } from '../src/cli/main.js';
 import { newWorkflow } from '../src/workflows/new.js';
+import { RijoPaths } from '../src/core/paths.js';
+import { activeMilestone } from '../src/core/milestones.js';
+import { readRoadmap } from '../src/core/roadmap.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
 
 describe('runCli', () => {
@@ -84,6 +87,43 @@ describe('runCli', () => {
     expect(parsed.milestones[0]).toMatchObject({ id: 'M001' });
     expect(parsed).toHaveProperty('runtime');
     expect(parsed).toHaveProperty('checkpoint');
+  });
+
+  it('--status --json uses the running phase before the verified checkpoint advances', async () => {
+    writePlanFile(root);
+    expect((await newWorkflow(root, { planFile: 'PLAN.md' }, deps(root))).ok).toBe(true);
+    const paths = new RijoPaths(root);
+    const milestone = activeMilestone(paths)!;
+    const phase = readRoadmap(milestone.paths.roadmap).phases[0]!;
+    fs.writeFileSync(
+      paths.status,
+      JSON.stringify({
+        schema_version: 5,
+        run_id: 'run-native-pending',
+        status: 'running',
+        milestone: { id: milestone.id, name: milestone.slug },
+        phase: { id: phase.id, index: 1, total: 1, name: phase.name },
+        stage: 'PHASE_RESEARCH',
+        task: null,
+        agent: null,
+        completed_units: 0,
+        total_units: 0,
+        last_checkpoint: null,
+        started_at: '2026-07-28T00:00:00.000Z',
+        updated_at: '2026-07-28T00:00:01.000Z',
+        message: 'Awaiting a native result.',
+      }),
+    );
+
+    log.mockClear();
+    expect(await runCli(['--status', '--json'], {}, root)).toBe(0);
+
+    const parsed = JSON.parse(logged());
+    expect(parsed.checkpoint.phase).toBeNull();
+    expect(parsed.runtime.phase.id).toBe(phase.id);
+    expect(parsed.active_phase_dir).toBe(
+      path.relative(root, path.join(milestone.paths.phasesDir, `${phase.id}-${phase.slug}`)),
+    );
   });
 
   it('internal recovery reconciles state without entering an agent workflow', async () => {

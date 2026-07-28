@@ -755,8 +755,15 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   const supervised = readSupervisedTasks(paths);
   const codebase = readCodebaseMapStatus(cwd);
   const currentMilestone = activeMilestone(paths);
-  const activePhase = currentMilestone && state?.phase
-    ? readRoadmap(currentMilestone.paths.roadmap).phases.find((phase) => phase.id === state.phase)
+  const runtimePhaseId =
+    currentMilestone &&
+    (status?.status === 'running' || status?.status === 'waiting') &&
+    status.milestone?.id === currentMilestone.id
+      ? status.phase?.id ?? null
+      : null;
+  const activePhaseId = runtimePhaseId ?? state?.phase ?? null;
+  const activePhase = currentMilestone && activePhaseId
+    ? readRoadmap(currentMilestone.paths.roadmap).phases.find((phase) => phase.id === activePhaseId)
     : null;
   const activePhaseDir = currentMilestone && activePhase
     ? path.relative(
