@@ -76,7 +76,12 @@ interface AgentTaskWire {
   role: string;
   write_scope: string[];
   workspace: { id: string; root: string } | null;
-  attempt: { attempt_id: string; generation: number; lease_id: string } | null;
+  attempt: {
+    workflow_epoch: string;
+    attempt_id: string;
+    generation: number;
+    lease_id: string;
+  } | null;
 }
 
 /** The fake HOST's agent runtime: answers each agent.runTask with a minimal valid AgentResult. */
@@ -89,9 +94,9 @@ function fakeHostResult(task: AgentTaskWire, root: string) {
     files_written: [],
     payload: null,
     scope_requests: [],
-    // Echo the supervised attempt identity: the RPC runner drops any reply
-    // whose attempt_id does not match the current attempt. Every dispatch is
-    // supervised, so the task always carries an attempt.
+    // Echo the complete supervised attempt identity. Native Protocol V2 drops
+    // any reply whose epoch or attempt fields do not match the current attempt.
+    workflow_epoch: task.attempt?.workflow_epoch ?? null,
     attempt_id: task.attempt?.attempt_id ?? null,
     generation: task.attempt?.generation ?? null,
     lease_id: task.attempt?.lease_id ?? null,

@@ -84,7 +84,10 @@ describe('workflow supervision (P0.6 item 3)', () => {
     // The worker always fails; with 2 replacements the supervisor exhausts it.
     d.runner.on((t) => t.id === 'exec-01-T01', (t) => ({
       task_id: t.id, ok: false, summary: 'worker boom', files_written: [], payload: null, scope_requests: [],
-      attempt_id: null, generation: null, lease_id: null,
+      workflow_epoch: t.attempt?.workflow_epoch ?? null,
+      attempt_id: t.attempt?.attempt_id ?? null,
+      generation: t.attempt?.generation ?? null,
+      lease_id: t.attempt?.lease_id ?? null,
     }));
     await newWorkflow(root, { planFile: '@PLAN.md' }, d);
 
@@ -114,7 +117,8 @@ describe('workflow supervision (P0.6 item 3)', () => {
         const a = sup.task.attempt!;
         const result: AgentResult = {
           task_id: sup.task.id, ok: true, summary: 'stale success', files_written: [], payload: { done: true },
-          scope_requests: [], attempt_id: 'someone-elses-attempt', generation: a.generation + 5, lease_id: 'revoked-lease',
+          scope_requests: [], workflow_epoch: a.workflow_epoch,
+          attempt_id: 'someone-elses-attempt', generation: a.generation + 5, lease_id: 'revoked-lease',
         };
         return { attempt_id: a.attempt_id, lease_id: a.lease_id, generation: a.generation, host: this.host, result: Promise.resolve(result) };
       }

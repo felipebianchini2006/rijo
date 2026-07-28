@@ -3,6 +3,7 @@ import { RpcHostController, FORCE_TERMINATE_METHOD } from '../src/hosts/rpcContr
 import type { RpcTransport } from '../src/agents/rpc.js';
 import { AgentTaskSchema, type AgentTask } from '../src/agents/protocol.js';
 import type { SupervisedAgentTask } from '../src/hosts/controller.js';
+import { LEGACY_WORKFLOW_EPOCH } from '../src/core/workflow-epoch.js';
 
 /**
  * RpcHostController driven over a synchronous in-memory transport (the same
@@ -71,6 +72,7 @@ function okResult(taskId: string, attemptId: string, summary = 'done') {
     files_written: [],
     payload: null,
     scope_requests: [],
+    workflow_epoch: LEGACY_WORKFLOW_EPOCH,
     attempt_id: attemptId,
     generation: 1,
     lease_id: `lease-${attemptId}`,
