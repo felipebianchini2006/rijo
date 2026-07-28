@@ -2,7 +2,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import { installRijo, prepareProjectBinding } from '../src/install/index.js';
+import {
+  installProjectDependency,
+  installRijo,
+  prepareProjectBinding,
+  validateInstalledBinding,
+} from '../src/install/index.js';
 import { cleanup, tmpProject } from './helpers.js';
 
 describe('native installer API', () => {
@@ -186,5 +191,49 @@ describe('native installer API', () => {
     });
     expect(divergent.status).toBe(1);
     expect(divergent.stderr).toContain('project binding mismatch');
+  });
+
+  it('keeps a packed project dependency portable for a clean npm ci', () => {
+    const root = tmpProject('rijo-install-portable-');
+    const source = tmpProject('rijo-install-package-source-');
+    roots.push(root, source);
+    fs.mkdirSync(path.join(source, 'dist', 'cli'), { recursive: true });
+    fs.writeFileSync(
+      path.join(source, 'package.json'),
+      JSON.stringify({
+        name: 'rijo',
+        version: '0.2.0-rc.1',
+        type: 'module',
+        files: ['dist'],
+      }),
+    );
+    fs.writeFileSync(
+      path.join(source, 'dist', 'cli', 'index.js'),
+      "console.log('portable fixture');\n",
+    );
+
+    const binding = installProjectDependency(root, { packageSpec: source });
+    const archive = path.join(root, '.rijo', 'tooling', 'rijo-0.2.0-rc.1.tgz');
+    const lock = JSON.parse(fs.readFileSync(binding.lockfile, 'utf8')) as {
+      packages: Record<string, { resolved?: string }>;
+    };
+
+    expect(fs.existsSync(archive)).toBe(true);
+    expect(lock.packages['node_modules/rijo']?.resolved).toBe(
+      'file:.rijo/tooling/rijo-0.2.0-rc.1.tgz',
+    );
+
+    fs.rmSync(path.join(root, 'node_modules'), { recursive: true, force: true });
+    const cleanInstall = spawnSync(
+      'npm',
+      ['ci', '--ignore-scripts', '--no-audit', '--no-fund'],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 5 * 60_000,
+      },
+    );
+    expect(cleanInstall.status, cleanInstall.stderr || cleanInstall.stdout).toBe(0);
+    expect(() => validateInstalledBinding(binding)).not.toThrow();
   });
 });

@@ -113,6 +113,12 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
   const toolingRoot = isolated ? path.join(projectRoot, '.rijo', 'tooling') : projectRoot;
   const manifest = path.join(toolingRoot, 'package.json');
   const lockfile = path.join(toolingRoot, 'package-lock.json');
+  const packageArchive = path.join(
+    projectRoot,
+    '.rijo',
+    'tooling',
+    `rijo-${RIJO_VERSION}.tgz`,
+  );
   const launcher = path.join(projectRoot, '.rijo', 'bin', 'rijo.cjs');
   const ignore = path.join(projectRoot, '.gitignore');
   const bindingFile = path.join(projectRoot, '.rijo', 'tooling-binding.json');
@@ -122,14 +128,14 @@ export function prepareProjectBinding(projectRootInput: string): ProjectBinding 
   const priorOwnership = new Map(
     (priorBinding?.managed_paths ?? []).map((entry) => [entry.path, entry.created_by_rijo]),
   );
-  const managedPaths = [manifest, lockfile, ignore].map((target) => {
+  const managedPaths = [manifest, lockfile, ignore, packageArchive].map((target) => {
     const relativePath = relative(projectRoot, target);
     return {
       path: relativePath,
       created_by_rijo: priorOwnership.get(relativePath) ?? !exists(target),
     };
   });
-  for (const target of [toolingRoot, manifest, lockfile, launcher]) {
+  for (const target of [toolingRoot, manifest, lockfile, launcher, packageArchive]) {
     assertContainedWithoutSymlinks(projectRoot, target);
   }
   ensureDir(toolingRoot);
@@ -220,7 +226,8 @@ export function installProjectDependency(
     }
   }
 
-  const packageSpec = options.packageSpec ?? resolveRunningPackageRoot(binding.version);
+  const packageSource = options.packageSpec ?? resolveRunningPackageRoot(binding.version);
+  const packageSpec = materializePortablePackageArchive(binding, packageSource);
   const result = spawnSync(
     'npm',
     [
@@ -234,6 +241,7 @@ export function installProjectDependency(
     ],
     {
       cwd: binding.toolingRoot,
+      env: npmChildEnvironment(binding.toolingRoot),
       encoding: 'utf8',
       windowsHide: true,
       timeout: 5 * 60_000,
@@ -250,6 +258,78 @@ export function installProjectDependency(
   pinManifestAndLock(binding);
   validateInstalledBinding(binding);
   return binding;
+}
+
+/**
+ * Put the exact package bytes under project control before npm writes the lock.
+ *
+ * An npm/npx cache path is machine-local. A lockfile that points at that path
+ * cannot support npm ci in a clean clone. The project archive keeps an
+ * unpublished release candidate portable without changing the public semantic
+ * version pin in package.json.
+ */
+function materializePortablePackageArchive(
+  binding: ProjectBinding,
+  packageSource: string,
+): string {
+  const source = path.resolve(packageSource);
+  if (!exists(source)) return packageSource;
+
+  const archiveDirectory = path.join(binding.projectRoot, '.rijo', 'tooling');
+  const archive = path.join(archiveDirectory, `rijo-${binding.version}.tgz`);
+  ensureDir(archiveDirectory);
+
+  if (fs.statSync(source).isFile()) {
+    if (path.resolve(source) !== path.resolve(archive)) fs.copyFileSync(source, archive);
+    return portableArchiveSpec(binding, archive);
+  }
+
+  const packed = spawnSync(
+    'npm',
+    [
+      'pack',
+      '--ignore-scripts',
+      '--pack-destination',
+      archiveDirectory,
+      source,
+    ],
+    {
+      cwd: binding.projectRoot,
+      env: npmChildEnvironment(binding.projectRoot),
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 5 * 60_000,
+    },
+  );
+  if (packed.status !== 0) {
+    throw new Error(
+      `The portable RIJO package archive failed: ${(packed.stderr || packed.stdout).trim()}`,
+    );
+  }
+  const produced = path.join(
+    archiveDirectory,
+    packed.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? '',
+  );
+  if (!exists(produced)) {
+    throw new Error('npm pack did not produce the portable RIJO package archive.');
+  }
+  if (path.resolve(produced) !== path.resolve(archive)) {
+    fs.renameSync(produced, archive);
+  }
+  return portableArchiveSpec(binding, archive);
+}
+
+function portableArchiveSpec(binding: ProjectBinding, archive: string): string {
+  const relativeArchive = path.relative(binding.toolingRoot, archive).split(path.sep).join('/');
+  return relativeArchive.startsWith('.') ? relativeArchive : `./${relativeArchive}`;
+}
+
+function npmChildEnvironment(cwd: string): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env['npm_config_local_prefix'];
+  delete env['INIT_CWD'];
+  env['PWD'] = cwd;
+  return env;
 }
 
 /**
