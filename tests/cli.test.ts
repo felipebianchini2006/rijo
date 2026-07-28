@@ -6,6 +6,11 @@ import { newWorkflow } from '../src/workflows/new.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { activeMilestone } from '../src/core/milestones.js';
 import { readRoadmap } from '../src/core/roadmap.js';
+import {
+  openWorkflowOperation,
+  readWorkflowOperation,
+  workflowOperationKey,
+} from '../src/core/workflow-epoch.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
 
 describe('runCli', () => {
@@ -36,6 +41,7 @@ describe('runCli', () => {
     expect(parsed.initialized).toBe(false);
     expect(parsed.active_milestone).toBeNull();
     expect(parsed.milestones).toEqual([]);
+    expect(parsed.native_workflow).toBeNull();
   });
 
   it('unknown command returns 2', async () => {
@@ -76,9 +82,9 @@ describe('runCli', () => {
 
     const parsed = JSON.parse(logged());
     expect(Object.keys(parsed).sort()).toEqual(
-      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'active_phase_dir', 'milestones', 'runtime', 'checkpoint', 'supervisor', 'codebase'].sort(),
+      ['schema_version', 'rijo_version', 'initialized', 'active_milestone', 'active_phase_dir', 'milestones', 'runtime', 'checkpoint', 'supervisor', 'codebase', 'native_workflow'].sort(),
     );
-    expect(parsed.schema_version).toBe(3);
+    expect(parsed.schema_version).toBe(4);
     expect(parsed.rijo_version).toBe('0.2.0-rc.1');
     expect(parsed.initialized).toBe(true);
     expect(parsed.active_milestone).toBe('M001');
@@ -87,6 +93,29 @@ describe('runCli', () => {
     expect(parsed.milestones[0]).toMatchObject({ id: 'M001' });
     expect(parsed).toHaveProperty('runtime');
     expect(parsed).toHaveProperty('checkpoint');
+  });
+
+  it('status exposes the exact active native workflow for resume', async () => {
+    writePlanFile(root);
+    const paths = new RijoPaths(root);
+    const args = ['@PLAN.md'];
+    const active = openWorkflowOperation(
+      paths,
+      'new',
+      workflowOperationKey(root, 'new', args),
+      args,
+    );
+
+    expect(await runCli(['internal', 'status', '--json'], {}, root)).toBe(0);
+
+    const parsed = JSON.parse(logged());
+    expect(parsed.native_workflow).toEqual({
+      operation: 'new',
+      operation_args: args,
+      status: 'ACTIVE',
+      workflow_epoch: active.workflow_epoch,
+      operation_key: active.operation_key,
+    });
   });
 
   it('--status --json uses the running phase before the verified checkpoint advances', async () => {
@@ -138,9 +167,10 @@ describe('runCli', () => {
     expect(logged()).toContain('Native workflow state recovered.');
   });
 
-  it('internal milestone finish validates state without an agent runner', async () => {
+  it('internal milestone finish validates an authorized operation without an agent runner', async () => {
     writePlanFile(root);
     expect((await newWorkflow(root, { planFile: 'PLAN.md' }, deps(root))).ok).toBe(true);
+    expect(await runCli(['internal', 'workflow-open', 'finish'], {}, root)).toBe(0);
 
     log.mockClear();
     const code = await runCli(['internal', 'milestone-finish'], {}, root);
@@ -148,6 +178,24 @@ describe('runCli', () => {
     expect(code).toBe(3);
     expect(logged()).not.toContain('native host must orchestrate');
     expect(logged()).toContain('incomplete');
+    expect(readWorkflowOperation(new RijoPaths(root))).toMatchObject({
+      operation: 'finish',
+      status: 'TERMINAL',
+      terminal_status: 'blocked',
+    });
+  });
+
+  it('internal milestone finish refuses to run without an active finish operation', async () => {
+    writePlanFile(root);
+    expect((await newWorkflow(root, { planFile: 'PLAN.md' }, deps(root))).ok).toBe(true);
+
+    log.mockClear();
+    const code = await runCli(['internal', 'milestone-finish'], {}, root);
+
+    expect(code).toBe(2);
+    expect(error.mock.calls.join('\n')).toContain(
+      'No native finish workflow is open',
+    );
   });
 
   it('internal qa-open creates one idempotent clean-tree baseline', async () => {

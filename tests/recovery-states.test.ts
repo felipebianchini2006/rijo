@@ -9,12 +9,14 @@ import { reconcileSupervisedTasks } from '../src/supervisor/recover.js';
 import { TaskStore } from '../src/supervisor/store.js';
 import { withLock, type WorkflowContext } from '../src/workflows/shared.js';
 import { tmpProject, cleanup } from './helpers.js';
+import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 
 // Seed a durable task record directly in a chosen state (bypassing the normal
 // transition path) so recovery can be exercised for every non-terminal state.
 function seed(paths: RijoPaths, state: SupervisedTaskState, over: Record<string, unknown> = {}): void {
   const store = new TaskStore(paths);
   const rec = TaskRecordSchema.parse({
+    workflow_epoch: createWorkflowEpoch(),
     logical_task_id: 'exec-01-T01',
     attempt_id: 'exec-01-T01#g1-aaaa',
     generation: 1,

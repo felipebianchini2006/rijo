@@ -1,5 +1,6 @@
 import { RijoPaths } from '../core/paths.js';
 import { SupervisorConfigSchema, type SupervisedTaskState, type TaskRecord } from '../core/schemas/index.js';
+import { LEGACY_WORKFLOW_EPOCH } from '../core/workflow-epoch.js';
 import type { HostAgentController, HostAttemptHandle, HostAttemptStatus } from '../hosts/controller.js';
 import { TaskStore } from './store.js';
 
@@ -177,6 +178,20 @@ async function reconcileRecord(
   maxReplacements: number,
 ): Promise<RecoveryEntry | null> {
   const from = rec.state;
+
+  if (rec.workflow_epoch === LEGACY_WORKFLOW_EPOCH) {
+    const terminal = store.terminateLegacyNonterminal(
+      rec,
+      'Recovery fenced a legacy task lease before native workflow migration.',
+    );
+    return {
+      logical_task_id: rec.logical_task_id,
+      from,
+      classification: 'legacy_workflow_epoch',
+      action: 'exhausted',
+      fenced: terminal.revoked_leases.includes(rec.lease_id),
+    };
+  }
 
   // A native helper pause is intentional. The active host writes a result
   // bundle after this process exits. Keep the exact attempt and lease so the

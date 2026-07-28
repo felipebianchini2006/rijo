@@ -171,7 +171,11 @@ interface Pending {
 }
 
 /** Terminal, never-throwing failure result. Used for every non-success path. */
-function failure(taskId: string, summary: string): AgentResult {
+function failure(
+  taskId: string,
+  summary: string,
+  attempt: AgentAttemptIdentity | null = null,
+): AgentResult {
   return {
     task_id: taskId,
     ok: false,
@@ -179,10 +183,10 @@ function failure(taskId: string, summary: string): AgentResult {
     files_written: [],
     payload: null,
     scope_requests: [],
-    workflow_epoch: null,
-    attempt_id: null,
-    generation: null,
-    lease_id: null,
+    workflow_epoch: attempt?.workflow_epoch ?? null,
+    attempt_id: attempt?.attempt_id ?? null,
+    generation: attempt?.generation ?? null,
+    lease_id: attempt?.lease_id ?? null,
   };
 }
 
@@ -238,7 +242,7 @@ export class RpcAgentRunner implements AgentRunner {
     this.dispatched.add(id);
     return new Promise<AgentResult>((resolve, reject) => {
       if (this.disposed) {
-        resolve(failure(task.id, 'HOST_DISCONNECTED'));
+        resolve(failure(task.id, 'HOST_DISCONNECTED', task.attempt));
         return;
       }
       const signal = opts.signal;
@@ -247,7 +251,7 @@ export class RpcAgentRunner implements AgentRunner {
         const p = this.pending.get(id);
         if (!p) return;
         this.cancelOnHost(p, 'aborted');
-        this.settle(p, failure(task.id, 'CANCELLED'));
+        this.settle(p, failure(task.id, 'CANCELLED', p.attempt));
       };
 
       const cleanup = () => {
@@ -262,7 +266,7 @@ export class RpcAgentRunner implements AgentRunner {
               const p = this.pending.get(id);
               if (!p) return;
               this.cancelOnHost(p, 'timeout');
-              this.settle(p, failure(task.id, 'HOST_TIMEOUT'));
+              this.settle(p, failure(task.id, 'HOST_TIMEOUT', p.attempt));
             }, timeoutMs)
           : null;
       if (timer && typeof timer.unref === 'function') timer.unref();
@@ -282,7 +286,7 @@ export class RpcAgentRunner implements AgentRunner {
 
       // Already aborted before dispatch: resolve without touching the host.
       if (signal?.aborted) {
-        this.settle(pending, failure(task.id, 'CANCELLED'));
+        this.settle(pending, failure(task.id, 'CANCELLED', pending.attempt));
         return;
       }
       if (signal) signal.addEventListener('abort', onAbort, { once: true });
@@ -306,7 +310,7 @@ export class RpcAgentRunner implements AgentRunner {
   cancelAll(code = 'CANCELLED', notifyHost = true): void {
     for (const p of [...this.pending.values()]) {
       if (notifyHost) this.cancelOnHost(p, code);
-      this.settle(p, failure(p.taskId, code));
+      this.settle(p, failure(p.taskId, code, p.attempt));
     }
   }
 
@@ -317,7 +321,9 @@ export class RpcAgentRunner implements AgentRunner {
   }
 
   private disconnect(code: string): void {
-    for (const p of [...this.pending.values()]) this.settle(p, failure(p.taskId, code));
+    for (const p of [...this.pending.values()]) {
+      this.settle(p, failure(p.taskId, code, p.attempt));
+    }
   }
 
   private settle(p: Pending, result: AgentResult): void {
@@ -382,13 +388,20 @@ export class RpcAgentRunner implements AgentRunner {
 
     if (env.error !== undefined) {
       const summary = typeof env.error === 'string' ? env.error : JSON.stringify(env.error);
-      this.settle(p, failure(p.taskId, summary));
+      this.settle(p, failure(p.taskId, summary, p.attempt));
       return;
     }
 
     const parsed = AgentResultSchema.safeParse(env.result);
     if (!parsed.success) {
-      this.settle(p, failure(p.taskId, `Host returned an invalid AgentResult: ${parsed.error.message}`));
+      this.settle(
+        p,
+        failure(
+          p.taskId,
+          `Host returned an invalid AgentResult: ${parsed.error.message}`,
+          p.attempt,
+        ),
+      );
       return;
     }
     const result = parsed.data;

@@ -84,16 +84,6 @@ interface Proc {
   closeWaiters: Array<() => void>;
 }
 
-function stampIdentity(task: AgentTask, result: AgentResult): AgentResult {
-  return {
-    ...result,
-    workflow_epoch: task.attempt?.workflow_epoch ?? result.workflow_epoch,
-    attempt_id: task.attempt?.attempt_id ?? result.attempt_id,
-    generation: task.attempt?.generation ?? result.generation,
-    lease_id: task.attempt?.lease_id ?? result.lease_id,
-  };
-}
-
 export class ProcessController implements HostAgentController {
   readonly host: string;
   private readonly procs = new Map<string, Proc>();
@@ -153,11 +143,11 @@ export class ProcessController implements HostAgentController {
     const result = new Promise<AgentResult>((resolve) => {
       child.on('error', (err: NodeJS.ErrnoException) => {
         settle({ code: null, signal: null, stdout: proc.stdout, stderr: proc.stderr || String(err.message ?? err) });
-        resolve(stampIdentity(task, this.opts.parseResult(task, proc.exit!)));
+        resolve(this.opts.parseResult(task, proc.exit!));
       });
       child.on('close', (code, sig) => {
         settle({ code, signal: sig, stdout: proc.stdout, stderr: proc.stderr });
-        resolve(stampIdentity(task, this.opts.parseResult(task, proc.exit!)));
+        resolve(this.opts.parseResult(task, proc.exit!));
       });
     });
 

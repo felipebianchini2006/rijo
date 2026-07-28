@@ -82,7 +82,32 @@ export class FakeAgentRunner implements AgentRunner {
   async runTask(task: AgentTask): Promise<AgentResult> {
     this.executed.push(task);
     const handler = this.handlers.find((h) => h.match(task));
-    if (handler) return handler.handle(task);
+    if (handler) {
+      const result = await handler.handle(task);
+      const hasIdentity = (field: keyof AgentResult): boolean =>
+        Object.prototype.hasOwnProperty.call(result, field);
+      // This test-only runner models a compliant host. Preserve every explicit
+      // identity value so mismatch tests still exercise the production fence.
+      return {
+        ...result,
+        workflow_epoch:
+          hasIdentity('workflow_epoch')
+            ? result.workflow_epoch
+            : task.attempt?.workflow_epoch ?? null,
+        attempt_id:
+          hasIdentity('attempt_id')
+            ? result.attempt_id
+            : task.attempt?.attempt_id ?? null,
+        generation:
+          hasIdentity('generation')
+            ? result.generation
+            : task.attempt?.generation ?? null,
+        lease_id:
+          hasIdentity('lease_id')
+            ? result.lease_id
+            : task.attempt?.lease_id ?? null,
+      };
+    }
     return {
       task_id: task.id,
       ok: true,
@@ -90,10 +115,10 @@ export class FakeAgentRunner implements AgentRunner {
       files_written: [],
       payload: null,
       scope_requests: [],
-      workflow_epoch: null,
-      attempt_id: null,
-      generation: null,
-      lease_id: null,
+      workflow_epoch: task.attempt?.workflow_epoch ?? null,
+      attempt_id: task.attempt?.attempt_id ?? null,
+      generation: task.attempt?.generation ?? null,
+      lease_id: task.attempt?.lease_id ?? null,
     };
   }
 }
@@ -114,10 +139,10 @@ export class UnboundAgentRunner implements AgentRunner {
       files_written: [],
       payload: null,
       scope_requests: [],
-      workflow_epoch: null,
-      attempt_id: null,
-      generation: null,
-      lease_id: null,
+      workflow_epoch: task.attempt?.workflow_epoch ?? null,
+      attempt_id: task.attempt?.attempt_id ?? null,
+      generation: task.attempt?.generation ?? null,
+      lease_id: task.attempt?.lease_id ?? null,
     };
   }
 }

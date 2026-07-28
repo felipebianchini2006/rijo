@@ -27,6 +27,7 @@ import type { ReplayAttemptIdentity } from '../src/agents/runner.js';
 import { TaskRecordSchema } from '../src/core/schemas/index.js';
 import { TaskStore } from '../src/supervisor/store.js';
 import { sha256 } from '../src/core/fsx.js';
+import { createWorkflowEpoch } from '../src/core/workflow-epoch.js';
 
 // ---- unhandled-rejection guard ------------------------------------------------
 const unhandled: unknown[] = [];
@@ -51,6 +52,24 @@ function makeTask(id = 'exec-01-T01', over: Partial<AgentTask> = {}): AgentTask 
     workspace: { id: `ws-${id}-g1`, root: `/tmp/${id}-g1` },
     ...over,
   });
+}
+
+function taskHashForFixture(task: AgentTask): string {
+  return sha256(JSON.stringify({
+    id: task.id,
+    role: task.role,
+    tier: task.tier ?? null,
+    objective: task.objective,
+    canonical_files: task.canonical_files,
+    code_files: task.code_files,
+    write_scope: task.write_scope,
+    acceptance_criteria: task.acceptance_criteria,
+    verification_commands: task.verification_commands,
+    return_format: task.return_format,
+    notes: task.notes,
+    expert_profiles: task.expert_profiles,
+    canonical_baseline: task.canonical_baseline,
+  }));
 }
 
 function cfg(over: Partial<Record<string, unknown>> = {}): SupervisorConfig {
@@ -149,6 +168,7 @@ class FakeController implements HostAgentController {
       files_written: [],
       payload: null,
       scope_requests: [],
+      workflow_epoch: a.workflow_epoch,
       attempt_id: a.attempt_id,
       generation: a.generation,
       lease_id: a.lease_id,
@@ -159,7 +179,14 @@ class FakeController implements HostAgentController {
 
 function newSupervisor(controller: HostAgentController, config: SupervisorConfig, paths = tmpPaths()) {
   const clock = new FakeClock();
-  const supervisor = new Supervisor({ controller, config, paths, clock });
+  const existingEpoch = new TaskStore(paths).read('exec-01-T01')?.workflow_epoch;
+  const supervisor = new Supervisor({
+    controller,
+    config,
+    paths,
+    clock,
+    ...(existingEpoch ? { workflowEpoch: existingEpoch } : {}),
+  });
   return { clock, supervisor, paths };
 }
 
@@ -539,6 +566,7 @@ describe('supervisor — crash recovery reconciliation', () => {
   function writeRecord(paths: RijoPaths, over: Partial<Record<string, unknown>>): void {
     const store = new TaskStore(paths);
     const rec = TaskRecordSchema.parse({
+      workflow_epoch: createWorkflowEpoch(),
       logical_task_id: 'exec-01-T01',
       attempt_id: 'exec-01-T01#g1-aaaa',
       generation: 1,
@@ -662,8 +690,11 @@ describe('supervisor — crash recovery reconciliation', () => {
 
   it('replays an exact SUCCEEDED identity without recreating or resetting its durable record', async () => {
     const paths = tmpPaths();
-    const idempotencyKey = sha256('exec-01-T01').slice(0, 32);
+    const workflowEpoch = createWorkflowEpoch();
+    const idempotencyKey = sha256(`${workflowEpoch}:exec-01-T01`).slice(0, 32);
+    const replayTask = makeTask();
     writeRecord(paths, {
+      workflow_epoch: workflowEpoch,
       state: 'SUCCEEDED',
       attempt_id: 'exec-01-T01#g2-bbbb',
       generation: 2,
@@ -672,9 +703,11 @@ describe('supervisor — crash recovery reconciliation', () => {
       revoked_leases: ['lease-1'],
       finished_at: new Date().toISOString(),
       idempotency_key: idempotencyKey,
+      task_hash: taskHashForFixture(replayTask),
     });
     const c = new FakeController();
     c.replayIdentity = {
+      workflow_epoch: workflowEpoch,
       logical_task_id: 'exec-01-T01',
       attempt_id: 'exec-01-T01#g2-bbbb',
       generation: 2,
@@ -682,7 +715,7 @@ describe('supervisor — crash recovery reconciliation', () => {
       idempotency_key: idempotencyKey,
     };
     const { clock, supervisor } = newSupervisor(c, cfg(), paths);
-    const p = supervisor.superviseTask(makeTask());
+    const p = supervisor.superviseTask(replayTask);
     await clock.advance(0);
     c.deliver(c.lastAttemptId(), c.matching(c.lastAttemptId()));
     await clock.advance(0);

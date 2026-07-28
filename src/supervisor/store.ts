@@ -194,6 +194,81 @@ export class TaskStore {
   }
 
   /**
+   * Fence and terminate a pre-epoch task. A legacy lease is never adopted by
+   * native supervision. The legal transition chain preserves the full event
+   * history and leaves an archivable EXHAUSTED projection for epoch rollover.
+   */
+  terminateLegacyNonterminal(prior: TaskRecord, reason: string): TaskRecord {
+    let current = this.read(prior.logical_task_id);
+    if (!current || current.workflow_epoch !== LEGACY_WORKFLOW_EPOCH) {
+      throw new Error(
+        `Supervised task ${prior.logical_task_id} is not an active legacy projection.`,
+      );
+    }
+    if (current.state === 'SUCCEEDED' || current.state === 'EXHAUSTED') {
+      return current;
+    }
+    const revoked = [
+      ...new Set([...current.revoked_leases, current.lease_id]),
+    ];
+    current = this.patch(
+      current,
+      {
+        revoked_leases: revoked,
+        workspace_id: null,
+        workspace_path: null,
+        last_error: reason,
+      },
+      'legacy_lease_fenced',
+      {
+        revoked_lease_id: current.lease_id,
+        workspace_invalidated: true,
+        reason,
+      },
+    );
+    if (current.state === 'QUEUED') {
+      current = this.transition(
+        current,
+        'CANCELLED',
+        { finished_at: new Date().toISOString() },
+        { reason, migration: 'legacy_workflow_epoch' },
+      );
+    } else if (
+      current.state === 'STARTING' ||
+      current.state === 'RUNNING' ||
+      current.state === 'AWAITING_NATIVE_RESULT' ||
+      current.state === 'SUSPECT' ||
+      current.state === 'CANCELLING'
+    ) {
+      current = this.transition(
+        current,
+        'ORPHANED',
+        {},
+        { reason, migration: 'legacy_workflow_epoch' },
+      );
+    }
+    if (
+      current.state === 'CANCELLED' ||
+      current.state === 'FAILED' ||
+      current.state === 'REPLACING' ||
+      current.state === 'ORPHANED'
+    ) {
+      current = this.transition(
+        current,
+        'EXHAUSTED',
+        { finished_at: new Date().toISOString(), last_error: reason },
+        { reason, migration: 'legacy_workflow_epoch' },
+      );
+    }
+    if (current.state !== 'EXHAUSTED') {
+      throw new Error(
+        `Legacy supervised task ${current.logical_task_id} could not reach a safe terminal state from ${current.state}.`,
+      );
+    }
+    return current;
+  }
+
+  /**
    * Requeue an exact SUCCEEDED native identity without erasing its history.
    * EXHAUSTED is terminal for every replacement count and can never enter here.
    */
@@ -263,7 +338,14 @@ export class TaskStore {
       if (!name.endsWith('.json')) continue;
       const raw = readJsonIfExists(path.join(this.tasksDir, name));
       if (raw === null) continue;
-      const parsed = TaskRecordSchema.safeParse(raw);
+      const candidate =
+        raw &&
+        typeof raw === 'object' &&
+        !Array.isArray(raw) &&
+        !('workflow_epoch' in raw)
+          ? { ...(raw as Record<string, unknown>), workflow_epoch: LEGACY_WORKFLOW_EPOCH }
+          : raw;
+      const parsed = TaskRecordSchema.safeParse(candidate);
       if (parsed.success && !TERMINAL.has(parsed.data.state)) out.push(parsed.data);
     }
     return out;

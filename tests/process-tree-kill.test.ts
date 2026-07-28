@@ -87,9 +87,10 @@ function parseResult(task: AgentTask, exit: RawExit) {
     files_written: [],
     payload: null,
     scope_requests: [],
-    attempt_id: null,
-    generation: null,
-    lease_id: null,
+    workflow_epoch: task.attempt?.workflow_epoch ?? null,
+    attempt_id: task.attempt?.attempt_id ?? null,
+    generation: task.attempt?.generation ?? null,
+    lease_id: task.attempt?.lease_id ?? null,
   };
 }
 

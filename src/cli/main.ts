@@ -55,6 +55,7 @@ import {
   openWorkflowOperation,
   readWorkflowOperation,
   requireWorkflowOperation,
+  workflowOperationKey,
   type WorkflowEpoch,
 } from '../core/workflow-epoch.js';
 
@@ -221,6 +222,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
             paths,
             operationName,
             workflowOperationKey(cwd, operationName, anchor),
+            anchor,
           );
         } finally {
           lock.release();
@@ -230,7 +232,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       return withNative(
         cwd,
         { ...deps, workflowEpoch },
-        (d) => resumeWorkflow(cwd, d),
+        (d) => resumeWorkflow(cwd, d, operation),
         {
           workflowEpoch,
           onOutcome: (outcome) => {
@@ -258,7 +260,12 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
           );
           let opened;
           try {
-            opened = openWorkflowOperation(paths, operation, operationKey);
+            opened = openWorkflowOperation(
+              paths,
+              operation,
+              operationKey,
+              helperArgs.slice(1),
+            );
           } finally {
             lock.release();
           }
@@ -507,7 +514,13 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       }
       if (helper === 'milestone-finish') {
         if (helperArgs.length > 0) return usage('rijo internal milestone-finish');
-        return withDeterministic(cwd, deps, (d) => finishWorkflow(cwd, d));
+        return withDeterministicOperation(
+          cwd,
+          deps,
+          'finish',
+          [],
+          (d) => finishWorkflow(cwd, d),
+        );
       }
       if (helper === 'recovery') {
         if (helperArgs.length > 0) return usage('rijo internal recovery');
@@ -630,6 +643,43 @@ async function withDeterministic(
   }
 }
 
+/** Run one authorized deterministic helper and close its workflow marker. */
+async function withDeterministicOperation(
+  cwd: string,
+  deps: WorkflowDeps,
+  operation: string,
+  operationArgs: string[],
+  body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
+): Promise<number> {
+  const paths = new RijoPaths(cwd);
+  let active;
+  try {
+    active = requireWorkflowOperation(
+      paths,
+      operation,
+      workflowOperationKey(cwd, operation, operationArgs),
+    );
+  } catch (error) {
+    return usage(error instanceof Error ? error.message : String(error));
+  }
+  const durableBinding = await attachProductionDurableEngine(cwd, deps);
+  try {
+    const outcome = await body({
+      ...durableBinding.deps,
+      hostProvider: 'none',
+      workflowEpoch: active.workflow_epoch,
+    });
+    markWorkflowOperationTerminal(
+      paths,
+      active.workflow_epoch,
+      outcome.status,
+    );
+    return report(outcome);
+  } finally {
+    await closeOwnedDurable(durableBinding);
+  }
+}
+
 async function withNativeResults(
   cwd: string,
   resultFile: string,
@@ -682,39 +732,6 @@ async function withNativeResults(
       },
     },
   );
-}
-
-function workflowOperationKey(cwd: string, operation: string, anchor: string[]): string {
-  const normalized = anchor.map((value) => value.replace(/^@/, ''));
-  const content = normalized.map((value) => {
-    const candidate = path.resolve(cwd, value);
-    if (!fs.existsSync(candidate)) return { value, sha256: null };
-    const stat = fs.statSync(candidate);
-    if (stat.isFile()) {
-      return { value, sha256: sha256(fs.readFileSync(candidate)) };
-    }
-    if (stat.isDirectory()) {
-      const files: Array<{ path: string; sha256: string }> = [];
-      const visit = (directory: string): void => {
-        for (const name of fs.readdirSync(directory).sort()) {
-          const absolute = path.join(directory, name);
-          const entry = fs.lstatSync(absolute);
-          if (entry.isSymbolicLink()) continue;
-          if (entry.isDirectory()) visit(absolute);
-          else if (entry.isFile()) {
-            files.push({
-              path: path.relative(candidate, absolute).split(path.sep).join('/'),
-              sha256: sha256(fs.readFileSync(absolute)),
-            });
-          }
-        }
-      };
-      visit(candidate);
-      return { value, sha256: sha256(JSON.stringify(files)) };
-    }
-    return { value, sha256: null };
-  });
-  return sha256(JSON.stringify({ operation, content }));
 }
 
 function readHookInput(): Record<string, unknown> {
@@ -909,6 +926,7 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   const state = readState(paths);
   const supervised = readSupervisedTasks(paths);
   const codebase = readCodebaseMapStatus(cwd);
+  const nativeWorkflow = readWorkflowOperation(paths);
   const currentMilestone = activeMilestone(paths);
   const runtimePhaseId =
     currentMilestone &&
@@ -931,9 +949,9 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
     console.log(
       JSON.stringify(
         {
-          // v3 is additive over v2: codebase-map status is added; all v2
-          // fields keep their shape for older consumers.
-          schema_version: 3,
+          // v4 is additive over v3: the active native workflow marker is
+          // exposed so resume can select the exact reference and helper.
+          schema_version: 4,
           rijo_version: RIJO_VERSION,
           initialized: manifest !== null,
           active_milestone: manifest?.active_milestone ?? null,
@@ -942,6 +960,15 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
           runtime: status,
           checkpoint: state,
           codebase,
+          native_workflow: nativeWorkflow
+            ? {
+                operation: nativeWorkflow.operation,
+                operation_args: nativeWorkflow.operation_args,
+                status: nativeWorkflow.status,
+                workflow_epoch: nativeWorkflow.workflow_epoch,
+                operation_key: nativeWorkflow.operation_key,
+              }
+            : null,
           supervisor: {
             tasks: supervised.map((t) => ({
               logical_task_id: t.logical_task_id,
@@ -966,10 +993,20 @@ async function statusCli(argv: string[], cwd: string): Promise<number> {
   }
 
   if (!manifest) {
+    if (nativeWorkflow) {
+      console.log(
+        `native workflow: ${nativeWorkflow.operation} (${nativeWorkflow.status})`,
+      );
+    }
     console.log('[RIJO] Not initialized. Start with: $rijo new @PLAN.md');
     return 0;
   }
   console.log(`RIJO ${RIJO_VERSION} — active milestone: ${manifest.active_milestone ?? 'none'}`);
+  if (nativeWorkflow) {
+    console.log(
+      `native workflow: ${nativeWorkflow.operation} (${nativeWorkflow.status})`,
+    );
+  }
   for (const m of manifest.milestones) console.log(`  ${m.id}  ${m.slug}  ${m.status}`);
   if (status) console.log(`runtime: ${renderStatusLine(status)} (${status.status})`);
   if (state) {

@@ -14,4 +14,5 @@ Do not implement missing work in this workflow.
 10. Archive detailed phase artifacts.
 11. Keep active context small.
 12. Update `.rijo/STATE.md`.
-13. Run `node .rijo/bin/rijo.cjs internal milestone-finish` to validate and persist the sealed milestone.
+13. Run `node .rijo/bin/rijo.cjs internal workflow-open finish` once.
+14. Run `node .rijo/bin/rijo.cjs internal milestone-finish` to validate and persist the sealed milestone.

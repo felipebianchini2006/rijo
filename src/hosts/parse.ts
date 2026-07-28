@@ -18,9 +18,9 @@ export function buildHostPrompt(task: AgentTask): string {
     scope_requests: [],
     decision_proposals: [],
     workflow_epoch: task.attempt?.workflow_epoch ?? null,
-    attempt_id: null,
-    generation: null,
-    lease_id: null,
+    attempt_id: task.attempt?.attempt_id ?? null,
+    generation: task.attempt?.generation ?? null,
+    lease_id: task.attempt?.lease_id ?? null,
   };
   return [
     renderBrief(task),
@@ -39,6 +39,8 @@ export function buildHostPrompt(task: AgentTask): string {
     '- `payload`: the structured data the return format asks for, or null.',
     '- `scope_requests`: paths you needed to write but were outside your write scope.',
     '- `decision_proposals`: every material choice or true blocker; use [] when none. The core validates evidence, blocker category, confidence, reversibility, consequences and review condition.',
+    '- Copy `workflow_epoch`, `attempt_id`, `generation`, and `lease_id` exactly from the response contract.',
+    '- Do not omit, infer, replace, or shorten an attempt identity field.',
   ].join('\n');
 }
 

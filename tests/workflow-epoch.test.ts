@@ -3,7 +3,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { AgentTaskSchema, type AgentResult } from '../src/agents/protocol.js';
-import { FakeAgentRunner } from '../src/agents/runner.js';
+import {
+  FakeAgentRunner,
+  type AgentRunner,
+} from '../src/agents/runner.js';
 import { NativeResultRunner } from '../src/agents/native-results.js';
 import { RijoPaths } from '../src/core/paths.js';
 import {
@@ -12,6 +15,7 @@ import {
 } from '../src/core/schemas/index.js';
 import {
   createWorkflowEpoch,
+  LEGACY_WORKFLOW_EPOCH,
   markWorkflowOperationTerminal,
   openWorkflowOperation,
   readWorkflowOperation,
@@ -19,6 +23,7 @@ import {
 import { InProcessController } from '../src/supervisor/runnerController.js';
 import { Supervisor } from '../src/supervisor/supervisor.js';
 import { TaskStore } from '../src/supervisor/store.js';
+import { reconcileSupervisedTasks } from '../src/supervisor/recover.js';
 import { defaultExecutor } from '../src/workflows/executor.js';
 
 function fixture(): { root: string; paths: RijoPaths } {
@@ -53,10 +58,6 @@ describe('workflow epoch supervision', () => {
       files_written: [],
       payload: null,
       scope_requests: [],
-      workflow_epoch: null,
-      attempt_id: null,
-      generation: null,
-      lease_id: null,
     }));
     const executor = defaultExecutor(runner, config, paths, epoch);
 
@@ -161,6 +162,170 @@ describe('workflow epoch supervision', () => {
 
     expect(supervisor.ingestResult('repeat-task', late)).toBe('discarded');
     expect(new TaskStore(paths).read('repeat-task')?.workflow_epoch).toBe(secondEpoch);
+  });
+
+  it('normalizes disposable workspace roots for exact task replay', async () => {
+    const { root, paths } = fixture();
+    const firstRoot = path.join(root, '.rijo', 'runtime', 'workspaces', 'writer-one');
+    const secondRoot = path.join(root, '.rijo', 'runtime', 'workspaces', 'writer-two');
+    fs.mkdirSync(firstRoot, { recursive: true });
+    fs.mkdirSync(secondRoot, { recursive: true });
+    let replay: ReturnType<NonNullable<AgentRunner['replayAttempt']>> = null;
+    const executed: string[] = [];
+    const runner: AgentRunner = {
+      capabilities: { subagents: true, parallelism: false, browser: false },
+      replayAttempt: () => replay,
+      async runTask(input) {
+        replay = input.attempt;
+        executed.push(input.workspace!.root);
+        return {
+          task_id: input.id,
+          ok: true,
+          summary: 'Exact writer result.',
+          files_written: [],
+          payload: null,
+          scope_requests: [],
+          workflow_epoch: input.attempt!.workflow_epoch,
+          attempt_id: input.attempt!.attempt_id,
+          generation: input.attempt!.generation,
+          lease_id: input.attempt!.lease_id,
+        };
+      },
+    };
+    const epoch = createWorkflowEpoch();
+    const executor = defaultExecutor(runner, config, paths, epoch);
+    const writer = (workspaceRoot: string, workspaceId: string) =>
+      AgentTaskSchema.parse({
+        id: 'writer-replay',
+        role: 'worker',
+        objective: `Edit ${workspaceRoot}/src/feature.ts.`,
+        canonical_files: [`${workspaceRoot}/.rijo/STATE.md`],
+        code_files: [`${workspaceRoot}/src/feature.ts`],
+        verification_commands: [`node ${workspaceRoot}/scripts/check.mjs`],
+        notes: `Use ${workspaceRoot} as the isolated checkout.`,
+        workspace: { id: workspaceId, root: workspaceRoot },
+        return_format: 'Return the changed file.',
+      });
+
+    const first = await executor.run({
+      task: writer(firstRoot, 'writer-one'),
+      role: 'worker',
+    });
+    const second = await executor.run({
+      task: writer(secondRoot, 'writer-two'),
+      role: 'worker',
+    });
+    const store = new TaskStore(paths);
+    const final = store.read('writer-replay');
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(second.attempt_id).toBe(first.attempt_id);
+    expect(second.lease_id).toBe(first.lease_id);
+    expect(executed).toEqual([firstRoot, secondRoot]);
+    expect(final).toMatchObject({
+      workflow_epoch: epoch,
+      generation: 1,
+      attempt_id: first.attempt_id,
+      lease_id: first.lease_id,
+      state: 'SUCCEEDED',
+    });
+    expect(
+      store
+        .readEvents('writer-replay')
+        .some(
+          (event) =>
+            event.data['reason'] ===
+            'same workflow epoch started a new semantic occurrence',
+        ),
+    ).toBe(false);
+  });
+
+  it('fences and archives a legacy nonterminal task before epoch rollover', async () => {
+    const { paths } = fixture();
+    const raw = {
+      logical_task_id: 'repeat-task',
+      attempt_id: 'legacy-attempt',
+      generation: 4,
+      lease_id: 'legacy-lease',
+      idempotency_key: 'legacy-idem',
+      role: 'worker',
+      host: 'legacy',
+      workspace_id: 'legacy-workspace',
+      workspace_path: '/tmp/legacy-workspace',
+      state: 'RUNNING',
+      created_at: new Date().toISOString(),
+      revoked_leases: [],
+    };
+    fs.mkdirSync(path.join(paths.runtimeDir, 'tasks'), { recursive: true });
+    fs.writeFileSync(
+      path.join(paths.runtimeDir, 'tasks', 'repeat-task.json'),
+      JSON.stringify(raw),
+    );
+    const epoch = createWorkflowEpoch();
+    const result = await defaultExecutor(
+      new FakeAgentRunner(),
+      config,
+      paths,
+      epoch,
+    ).run({ task: task(), role: 'worker' });
+    const store = new TaskStore(paths);
+    const archived = store.readArchived('repeat-task', LEGACY_WORKFLOW_EPOCH);
+
+    expect(result.ok).toBe(true);
+    expect(archived).toMatchObject({
+      state: 'EXHAUSTED',
+      workflow_epoch: LEGACY_WORKFLOW_EPOCH,
+      workspace_id: null,
+      workspace_path: null,
+    });
+    expect(archived?.revoked_leases).toContain('legacy-lease');
+    expect(store.read('repeat-task')).toMatchObject({
+      workflow_epoch: epoch,
+      generation: 1,
+      state: 'SUCCEEDED',
+    });
+  });
+
+  it('recovers an epochless native pause by fencing it to a safe terminal state', async () => {
+    const { paths } = fixture();
+    fs.mkdirSync(path.join(paths.runtimeDir, 'tasks'), { recursive: true });
+    fs.writeFileSync(
+      path.join(paths.runtimeDir, 'tasks', 'legacy-pause.json'),
+      JSON.stringify({
+        logical_task_id: 'legacy-pause',
+        attempt_id: 'legacy-attempt',
+        generation: 1,
+        lease_id: 'legacy-lease',
+        idempotency_key: 'legacy-idem',
+        role: 'worker',
+        host: 'legacy',
+        workspace_id: 'legacy-workspace',
+        workspace_path: '/tmp/legacy-workspace',
+        state: 'AWAITING_NATIVE_RESULT',
+        created_at: new Date().toISOString(),
+        revoked_leases: [],
+      }),
+    );
+
+    const report = await reconcileSupervisedTasks(paths);
+    const record = new TaskStore(paths).read('legacy-pause');
+
+    expect(report.entries).toEqual([
+      expect.objectContaining({
+        logical_task_id: 'legacy-pause',
+        classification: 'legacy_workflow_epoch',
+        action: 'exhausted',
+        fenced: true,
+      }),
+    ]);
+    expect(record).toMatchObject({
+      workflow_epoch: LEGACY_WORKFLOW_EPOCH,
+      state: 'EXHAUSTED',
+      workspace_id: null,
+      workspace_path: null,
+    });
+    expect(record?.revoked_leases).toContain('legacy-lease');
   });
 });
 

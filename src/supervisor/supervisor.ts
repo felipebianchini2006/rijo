@@ -10,6 +10,7 @@ import type { HostAgentController, HostAttemptHandle } from '../hosts/controller
 import { SystemClock, type Clock, type TimerHandle } from './clock.js';
 import { TaskStore } from './store.js';
 import {
+  LEGACY_WORKFLOW_EPOCH,
   WorkflowEpochSchema,
   createWorkflowEpoch,
   type WorkflowEpoch,
@@ -246,7 +247,25 @@ export class Supervisor {
   }
 
   private taskHash(task: AgentTask): string {
-    const notes = task.notes
+    const disposableRoots = [
+      task.workspace?.root,
+      task.workspace?.replay_source?.root,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .map((value) => path.resolve(value))
+      .sort((left, right) => right.length - left.length);
+    const semanticString = (value: string): string => {
+      let normalized = value;
+      for (const root of disposableRoots) {
+        normalized = normalized.split(root).join('$WORKSPACE');
+        const portableRoot = root.split(path.sep).join('/');
+        normalized = normalized.split(portableRoot).join('$WORKSPACE');
+      }
+      return normalized;
+    };
+    const semanticStrings = (values: string[]): string[] =>
+      values.map(semanticString);
+    const notes = semanticString(task.notes)
       .split(/\r?\n/)
       .filter((line) => !line.startsWith('[supervisor] previous attempt '))
       .join('\n');
@@ -254,15 +273,15 @@ export class Supervisor {
       id: task.id,
       role: task.role,
       tier: task.tier ?? null,
-      objective: task.objective,
-      canonical_files: task.canonical_files,
-      code_files: task.code_files,
-      write_scope: task.write_scope,
-      acceptance_criteria: task.acceptance_criteria,
-      verification_commands: task.verification_commands,
-      return_format: task.return_format,
+      objective: semanticString(task.objective),
+      canonical_files: semanticStrings(task.canonical_files),
+      code_files: semanticStrings(task.code_files),
+      write_scope: semanticStrings(task.write_scope),
+      acceptance_criteria: semanticStrings(task.acceptance_criteria),
+      verification_commands: semanticStrings(task.verification_commands),
+      return_format: semanticString(task.return_format),
       notes,
-      expert_profiles: task.expert_profiles,
+      expert_profiles: semanticStrings(task.expert_profiles),
       canonical_baseline: task.canonical_baseline,
     }));
   }
@@ -389,7 +408,17 @@ export class Supervisor {
     const taskHash = this.taskHash(task);
     const idempotencyKey = sha256(`${this.workflowEpoch}:${logicalId}`).slice(0, 32);
 
-    const prior = this.store.read(logicalId);
+    let prior = this.store.read(logicalId);
+    if (
+      prior?.workflow_epoch === LEGACY_WORKFLOW_EPOCH &&
+      prior.state !== 'SUCCEEDED' &&
+      prior.state !== 'EXHAUSTED'
+    ) {
+      prior = this.store.terminateLegacyNonterminal(
+        prior,
+        'Legacy task identity cannot be resumed by a native workflow epoch.',
+      );
+    }
     const sameEpochPrior =
       prior?.workflow_epoch === this.workflowEpoch ? prior : null;
     const crossEpochPrior =

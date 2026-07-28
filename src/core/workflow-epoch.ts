@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { RijoPaths } from './paths.js';
@@ -14,6 +15,7 @@ export const WorkflowOperationSchema = z.object({
   workflow_epoch: WorkflowEpochSchema,
   operation: z.string().min(1),
   operation_key: z.string().min(1),
+  operation_args: z.array(z.string()).default([]),
   status: z.enum(['ACTIVE', 'TERMINAL']),
   opened_at: z.string().datetime(),
   updated_at: z.string().datetime(),
@@ -26,6 +28,50 @@ export type WorkflowOperation = z.infer<typeof WorkflowOperationSchema>;
 
 export function createWorkflowEpoch(): WorkflowEpoch {
   return WorkflowEpochSchema.parse(`wep_${sha256(randomUUID())}`);
+}
+
+/**
+ * Hash only the immutable public command inputs. The operation marker stores
+ * the original arguments so resume can select the exact workflow again.
+ */
+export function workflowOperationKey(
+  projectRoot: string,
+  operation: string,
+  operationArgs: string[],
+): string {
+  const content = operationArgs.map((argument) => {
+    if (!argument.startsWith('@')) {
+      return { kind: 'literal', value: argument };
+    }
+    const value = argument.slice(1);
+    const candidate = path.resolve(projectRoot, value);
+    if (!fs.existsSync(candidate)) return { kind: 'path', value, sha256: null };
+    const stat = fs.statSync(candidate);
+    if (stat.isFile()) {
+      return { kind: 'path', value, sha256: sha256(fs.readFileSync(candidate)) };
+    }
+    if (stat.isDirectory()) {
+      const files: Array<{ path: string; sha256: string }> = [];
+      const visit = (directory: string): void => {
+        for (const name of fs.readdirSync(directory).sort()) {
+          const absolute = path.join(directory, name);
+          const entry = fs.lstatSync(absolute);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory()) visit(absolute);
+          else if (entry.isFile()) {
+            files.push({
+              path: path.relative(candidate, absolute).split(path.sep).join('/'),
+              sha256: sha256(fs.readFileSync(absolute)),
+            });
+          }
+        }
+      };
+      visit(candidate);
+      return { kind: 'path', value, sha256: sha256(JSON.stringify(files)) };
+    }
+    return { kind: 'path', value, sha256: null };
+  });
+  return sha256(JSON.stringify({ operation, content }));
 }
 
 export function workflowOperationPath(paths: RijoPaths): string {
@@ -55,6 +101,7 @@ export function openWorkflowOperation(
   paths: RijoPaths,
   operation: string,
   operationKey: string,
+  operationArgs: string[] = [],
   now: () => Date = () => new Date(),
 ): WorkflowOperation {
   const current = readWorkflowOperation(paths);
@@ -89,6 +136,7 @@ export function openWorkflowOperation(
     workflow_epoch: createWorkflowEpoch(),
     operation,
     operation_key: operationKey,
+    operation_args: operationArgs,
     status: 'ACTIVE',
     opened_at: timestamp,
     updated_at: timestamp,

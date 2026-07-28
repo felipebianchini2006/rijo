@@ -26,16 +26,6 @@ interface Entry {
   error: unknown;
 }
 
-function stampIdentity(task: AgentTask, result: AgentResult): AgentResult {
-  return {
-    ...result,
-    workflow_epoch: task.attempt?.workflow_epoch ?? result.workflow_epoch,
-    attempt_id: task.attempt?.attempt_id ?? result.attempt_id,
-    generation: task.attempt?.generation ?? result.generation,
-    lease_id: task.attempt?.lease_id ?? result.lease_id,
-  };
-}
-
 export class InProcessController implements HostAgentController {
   readonly host: string;
   private readonly entries = new Map<string, Entry>();
@@ -63,7 +53,7 @@ export class InProcessController implements HostAgentController {
         (r) => {
           entry.settled = true;
           entry.ok = r.ok;
-          return stampIdentity(task, r);
+          return r;
         },
         (err) => {
           entry.settled = true;
