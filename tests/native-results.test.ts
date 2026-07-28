@@ -175,6 +175,7 @@ describe('native result ingestion', () => {
     const workspaceA = path.join(paths.runtimeDir, 'workspaces', 'ws-writer-a');
     const workspaceB = path.join(paths.runtimeDir, 'workspaces', 'ws-writer-b');
     fs.mkdirSync(workspaceA, { recursive: true });
+    seedWorkspaceBaseline(workspaceA);
     const writerTask = (workspace: string, id: string) =>
       AgentTaskSchema.parse({
         id: 'exec-01-T01',
@@ -253,6 +254,7 @@ describe('native result ingestion', () => {
     const makeTask = (workspaceId: string) => {
       const workspace = path.join(paths.runtimeDir, 'workspaces', workspaceId);
       fs.mkdirSync(workspace, { recursive: true });
+      seedWorkspaceBaseline(workspace);
       return AgentTaskSchema.parse({
         id: 'exec-materialization',
         role: 'worker',
@@ -410,6 +412,197 @@ describe('native result ingestion', () => {
     expect(currentWorkspace.validate().changed).toEqual(['src/feature.ts']);
     expect(currentWorkspace.applyVerifiedPatch().applied).toEqual(['src/feature.ts']);
     expect(fs.readFileSync(path.join(root, 'src', 'feature.ts'), 'utf8')).toBe(changed);
+  });
+
+  it('fences delayed output when the checkout preimage changed after dispatch', async () => {
+    const root = tmpProject('rijo-native-preimage-conflict-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    const original = 'export const feature = "A";\n';
+    const userEdit = 'export const feature = "B";\n';
+    const delayed = 'export const feature = "C";\n';
+    fs.writeFileSync(path.join(root, 'src', 'feature.ts'), original);
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const makeWorkspace = () =>
+      AttemptWorkspace.create(root, {
+        taskId: 'exec-preimage-conflict',
+        writeScope: ['src/feature.ts'],
+        baselineCanonicalHash: 'baseline-01',
+      });
+    const makeTask = (workspace: AttemptWorkspace) =>
+      AgentTaskSchema.parse({
+        id: 'exec-preimage-conflict',
+        role: 'worker',
+        objective: 'Change the feature.',
+        canonical_files: [],
+        code_files: [path.join(workspace.root, 'src', 'feature.ts')],
+        write_scope: ['src/feature.ts'],
+        acceptance_criteria: ['The feature changes without overwriting concurrent work.'],
+        verification_commands: [],
+        return_format: 'JSON result.',
+        workspace: { id: workspace.id, root: workspace.root },
+        canonical_baseline: 'baseline-01',
+      });
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 0,
+      replacement_backoff_ms: [],
+    };
+    const originalWorkspace = makeWorkspace();
+    const originalTask = makeTask(originalWorkspace);
+    const pending = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: originalTask, role: 'worker' });
+    expect(pending.ok).toBe(false);
+    const request = JSON.parse(
+      fs.readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8').trim(),
+    );
+
+    fs.writeFileSync(path.join(originalWorkspace.root, 'src', 'feature.ts'), delayed);
+    fs.writeFileSync(path.join(root, 'src', 'feature.ts'), userEdit);
+    fs.writeFileSync(bundle, JSON.stringify({
+      version: 2,
+      results: [{
+        ...request,
+        ok: true,
+        summary: 'Completed the delayed feature change.',
+        payload: { done: true },
+        files_written: ['src/feature.ts'],
+        preserved_files: [{
+          target_path: 'src/feature.ts',
+          sha256: sha256(delayed),
+          workspace_id: originalWorkspace.id,
+          baseline_sha256: sha256(original),
+        }],
+      }],
+    }));
+
+    const currentWorkspace = makeWorkspace();
+    const currentTask = makeTask(currentWorkspace);
+    const rejected = await defaultExecutor(
+      new NativeResultRunner(bundle),
+      config,
+      paths,
+    ).run({ task: currentTask, role: 'worker' });
+
+    expect(rejected.ok).toBe(false);
+    expect(rejected.summary).toContain('preimage conflict');
+    expect(fs.readFileSync(path.join(currentWorkspace.root, 'src', 'feature.ts'), 'utf8'))
+      .toBe(userEdit);
+    expect(fs.readFileSync(path.join(root, 'src', 'feature.ts'), 'utf8')).toBe(userEdit);
+    expect(fs.existsSync(originalWorkspace.root)).toBe(true);
+    expect(new TaskStore(paths).read(originalTask.id)?.state).toBe('EXHAUSTED');
+  });
+
+  it('checks delayed preimages for each portable file operation', async () => {
+    const cases = ['inline', 'artifact', 'delete', 'rename-source', 'rename-target'] as const;
+    for (const operation of cases) {
+      const root = tmpProject(`rijo-native-preimage-${operation}-`);
+      roots.push(root);
+      const workspaces = path.join(root, '.rijo', 'runtime', 'workspaces');
+      const sourceRoot = path.join(workspaces, `ws-source-${operation}`);
+      const currentRoot = path.join(workspaces, `ws-current-${operation}`);
+      fs.mkdirSync(path.join(sourceRoot, 'src'), { recursive: true });
+      fs.mkdirSync(path.join(currentRoot, 'src'), { recursive: true });
+      const original = 'export const feature = "A";\n';
+      const userEdit = 'export const feature = "B";\n';
+      const delayed = Buffer.from('export const feature = "C";\n');
+      fs.writeFileSync(path.join(sourceRoot, 'src', 'feature.ts'), original);
+      seedWorkspaceBaseline(sourceRoot);
+      fs.writeFileSync(
+        path.join(currentRoot, 'src', 'feature.ts'),
+        operation === 'rename-target' ? original : userEdit,
+      );
+      if (operation === 'rename-target') {
+        fs.writeFileSync(path.join(currentRoot, 'src', 'renamed.ts'), userEdit);
+      }
+      const logicalTaskId = `exec-preimage-${operation}`;
+      const makeTask = (
+        workspace: { id: string; root: string; replay_source?: { id: string; root: string } },
+        workspaceId: string,
+      ) =>
+        AgentTaskSchema.parse({
+          id: logicalTaskId,
+          role: 'worker',
+          objective: 'Apply one delayed portable operation.',
+          canonical_files: [],
+          code_files: [path.join(workspace.root, 'src', 'feature.ts')],
+          write_scope: ['src/feature.ts', 'src/renamed.ts'],
+          acceptance_criteria: ['Concurrent edits remain intact.'],
+          verification_commands: [],
+          return_format: 'JSON result.',
+          workspace,
+          canonical_baseline: 'baseline-01',
+          attempt: {
+            ...attempt,
+            logical_task_id: logicalTaskId,
+            workspace_id: workspaceId,
+          },
+        });
+      const originalTask = makeTask(
+        { id: `ws-source-${operation}`, root: sourceRoot },
+        `ws-source-${operation}`,
+      );
+      const request = createNativeRequestV2(originalTask);
+      const resultEntry: Record<string, unknown> = {
+        ...request,
+        ok: true,
+        summary: 'Completed one delayed operation.',
+        payload: { done: true },
+      };
+      if (operation === 'inline') {
+        resultEntry.files = { 'src/feature.ts': delayed.toString('utf8') };
+        resultEntry.files_written = ['src/feature.ts'];
+      } else if (operation === 'artifact') {
+        const staging = path.join(root, 'staging');
+        fs.mkdirSync(staging, { recursive: true });
+        fs.writeFileSync(path.join(staging, 'feature.ts'), delayed);
+        resultEntry.files_written = ['src/feature.ts'];
+        resultEntry.artifacts = [{
+          target_path: 'src/feature.ts',
+          staged_path: 'staging/feature.ts',
+          sha256: sha256(delayed),
+          size: delayed.length,
+          media_type: 'text/plain',
+        }];
+      } else if (operation === 'delete') {
+        resultEntry.files_written = ['src/feature.ts'];
+        resultEntry.deleted_paths = [{ path: 'src/feature.ts', sha256: sha256(original) }];
+      } else {
+        resultEntry.files_written = ['src/feature.ts', 'src/renamed.ts'];
+        resultEntry.renames = [{
+          source_path: 'src/feature.ts',
+          target_path: 'src/renamed.ts',
+          source_sha256: sha256(original),
+        }];
+      }
+      const bundle = path.join(root, 'results.json');
+      fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [resultEntry] }));
+      const currentTask = makeTask(
+        {
+          id: `ws-current-${operation}`,
+          root: currentRoot,
+          replay_source: { id: `ws-source-${operation}`, root: sourceRoot },
+        },
+        `ws-current-${operation}`,
+      );
+
+      const result = await new NativeResultRunner(bundle).runTask(currentTask);
+
+      expect(result.ok, operation).toBe(false);
+      expect(result.summary, operation).toContain('preimage conflict');
+      expect(fs.readFileSync(path.join(currentRoot, 'src', 'feature.ts'), 'utf8'))
+        .toBe(operation === 'rename-target' ? original : userEdit);
+      if (operation === 'rename-target') {
+        expect(fs.readFileSync(path.join(currentRoot, 'src', 'renamed.ts'), 'utf8')).toBe(userEdit);
+      } else {
+        expect(fs.existsSync(path.join(currentRoot, 'src', 'renamed.ts'))).toBe(false);
+      }
+    }
   });
 
   it('replaces a native writer result rejected by deterministic validation with a new fenced identity', async () => {

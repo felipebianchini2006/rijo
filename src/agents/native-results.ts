@@ -360,6 +360,14 @@ export class NativeResultRunner implements AgentRunner {
         scope_requests: [],
         decision_proposals: [],
       });
+    const fence = (summary: string): AgentResult =>
+      this.result(task, {
+        ok: false,
+        summary,
+        payload: null,
+        scope_requests: [],
+        decision_proposals: [],
+      });
     const inlinePaths = Object.keys(entry.files);
     const artifactPaths = entry.artifacts.map((artifact) => artifact.target_path);
     const preservedPaths = entry.preserved_files.map((file) => file.target_path);
@@ -430,6 +438,42 @@ export class NativeResultRunner implements AgentRunner {
         return target;
       };
       const absolute = (relative: string): string => absoluteAt(task.workspace!.root, relative);
+      const replaySource = task.workspace.replay_source;
+      if (replaySource) {
+        const workspacesRoot = path.resolve(path.dirname(task.workspace.root));
+        const sourceRoot = path.resolve(replaySource.root);
+        const relativeSource = path.relative(workspacesRoot, sourceRoot);
+        if (
+          relativeSource === '' ||
+          path.isAbsolute(relativeSource) ||
+          relativeSource.split(path.sep).includes('..') ||
+          path.basename(sourceRoot) !== replaySource.id ||
+          !exists(sourceRoot) ||
+          fs.lstatSync(sourceRoot).isSymbolicLink()
+        ) {
+          return reject('Native result replay workspace is invalid.');
+        }
+        for (const relative of reported) {
+          const baseline = workspaceBaselineHash(sourceRoot, relative);
+          if (!baseline.available) {
+            return reject(`Native delayed result baseline is unavailable: ${relative}.`);
+          }
+          const currentTarget = absolute(relative);
+          let currentHash: string | null = null;
+          if (exists(currentTarget)) {
+            if (!fs.lstatSync(currentTarget).isFile()) {
+              return fence(`Native delayed result preimage conflict: ${relative} is not a regular file.`);
+            }
+            currentHash = sha256File(currentTarget);
+          }
+          if (currentHash !== baseline.hash) {
+            return fence(
+              `Native delayed result preimage conflict at ${relative}. ` +
+                'The current workspace does not match the original attempt baseline.',
+            );
+          }
+        }
+      }
       const verifiedFileHash = (relative: string, purpose: string): string | AgentResult => {
         const target = absolute(relative);
         if (!exists(target) || !fs.lstatSync(target).isFile()) {
@@ -458,7 +502,6 @@ export class NativeResultRunner implements AgentRunner {
         if (task.attempt?.workspace_id !== task.workspace.id) {
           return reject(`Native result target workspace identity is invalid: ${file.target_path}.`);
         }
-        const replaySource = task.workspace.replay_source;
         const source =
           file.workspace_id === task.workspace.id
             ? { id: task.workspace.id, root: task.workspace.root }
@@ -469,21 +512,6 @@ export class NativeResultRunner implements AgentRunner {
           return reject(
             `Native result preserved file belongs to a different attempt workspace: ${file.target_path}.`,
           );
-        }
-        if (source.id !== task.workspace.id) {
-          const workspacesRoot = path.resolve(path.dirname(task.workspace.root));
-          const sourceRoot = path.resolve(source.root);
-          const relativeSource = path.relative(workspacesRoot, sourceRoot);
-          if (
-            relativeSource === '' ||
-            path.isAbsolute(relativeSource) ||
-            relativeSource.split(path.sep).includes('..') ||
-            path.basename(sourceRoot) !== source.id ||
-            !exists(sourceRoot) ||
-            fs.lstatSync(sourceRoot).isSymbolicLink()
-          ) {
-            return reject(`Native result replay workspace is invalid: ${file.target_path}.`);
-          }
         }
         const sourceTarget = absoluteAt(source.root, file.target_path);
         if (!exists(sourceTarget) || !fs.lstatSync(sourceTarget).isFile()) {
