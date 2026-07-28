@@ -77,6 +77,22 @@ describe('rijo run', () => {
     expect(planner.return_format).toContain('package.json as the existing project-root bootstrap contract');
     const planReviewer = d.runner.executed.find((task) => task.id === 'plan-review-01-r0')!;
     expect(planReviewer.return_format).toContain('type MUST be exactly one of intent_gap|spec_gap');
+    expect(planReviewer.canonical_files).toEqual(
+      expect.arrayContaining([
+        path.join(mdir, 'SCOPE.md'),
+        path.join(mdir, 'REQUIREMENTS.md'),
+        path.join(mdir, 'ROADMAP.md'),
+      ]),
+    );
+    expect(planReviewer.objective).toContain(
+      'REQUIREMENTS.md and ROADMAP.md are authoritative for phase allocation',
+    );
+    expect(planReviewer.objective).toContain(
+      'Do not pull requirements assigned to a later phase into this plan',
+    );
+    expect(planReviewer.notes).toContain('Active phase: 01 — Catalog');
+    expect(planReviewer.notes).toContain('Later phase allocations:');
+    expect(planReviewer.notes).toMatch(/02 — Checkout: M001-REQ-\d+/);
     const codeReviewer = d.runner.executed.find((task) => task.id.startsWith('code-review-01-'))!;
     expect(codeReviewer.objective).toContain(
       'RIJO runs framework-owned UI smoke after this review.',
@@ -249,6 +265,19 @@ describe('rijo run', () => {
     expect(outcome.status).toBe('blocked');
     expect(outcome.message).toContain('not approved after 2 revisions');
     expect(d.runner.executed.filter((t) => t.id.startsWith('plan-01-r')).length).toBe(3);
+    const revisedPlan = d.runner.executed.find((t) => t.id === 'plan-01-r1')!;
+    expect(revisedPlan.canonical_files).toEqual(
+      expect.arrayContaining([
+        path.join(milestoneDir(root), 'REQUIREMENTS.md'),
+        path.join(milestoneDir(root), 'ROADMAP.md'),
+      ]),
+    );
+    expect(revisedPlan.notes).toContain(
+      'Previous review issues to address within the active phase boundary:',
+    );
+    expect(revisedPlan.notes).toContain(
+      'A reviewer finding does not expand the phase.',
+    );
   });
 
   it('repairs a high code finding even when the reviewer sets approved', async () => {

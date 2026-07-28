@@ -749,6 +749,22 @@ async function executePhase(
     ].join('\n'),
     config.context_budget_bytes,
   );
+  const activePhaseRequirementIds = reqDoc.requirements
+    .filter((requirement) => requirement.phase === phase.id)
+    .map((requirement) => requirement.id);
+  const laterPhaseAllocations = roadmap.phases
+    .slice(phaseIndex)
+    .map(
+      (laterPhase) =>
+        `${laterPhase.id} — ${laterPhase.name}: ${laterPhase.requirements.join(', ') || 'no requirements (technical)'}`,
+    );
+  const phaseBoundaryContext = [
+    `Active phase: ${phase.id} — ${phase.name}`,
+    `Active phase requirement IDs: ${activePhaseRequirementIds.join(', ') || 'none (technical)'}`,
+    'Later phase allocations:',
+    ...(laterPhaseAllocations.length > 0 ? laterPhaseAllocations : ['None.']),
+    'Boundary rule: REQUIREMENTS.md and ROADMAP.md own phase allocation. Apply milestone-wide RULES.md constraints to behavior changed now, but do not treat an outcome allocated to a later phase as missing from the active plan.',
+  ].join('\n');
   const hasPlanningMap = readMapState(paths) !== null;
   let plan: PhasePlan | null = exists(pp.plan) && !forceReplan ? readPlan(pp.plan) : null;
   let revisions = 0;
@@ -764,8 +780,10 @@ async function executePhase(
         objective: `Produce the execution plan for phase ${phase.id}: between 3 and 6 tasks, exact files or code regions, dependencies, per-worker write scope, executable test commands and expected evidence, parallel flag only for independent tasks with disjoint write scopes. Do not create artificial tasks. Use the simplest design that supports this milestone and the next likely milestone. Reject abstractions without a consumer, duplicate layers, and speculative infrastructure. Set tdd=true for testable behavior. EVERY task must CREATE or EDIT at least one concrete source/test file — its "files" and "write_scope" arrays must each name at least one real path. Each tests[] entry must be an executable verification command such as "npm test", never a prose scenario or expected result. Do NOT emit a verification-only, evidence-only, or "run the tests" task: the framework runs verification and records evidence itself; a task that writes no file is invalid.`,
         canonical_files: [
           paths.rules,
+          milestone.paths.scope,
           pp.research,
           milestone.paths.requirements,
+          milestone.paths.roadmap,
         ].filter(exists),
         code_files: [],
         write_scope: [],
@@ -778,8 +796,15 @@ async function executePhase(
             : 'This is a greenfield phase with no codebase map: every task file is intent:"new", parent_module:"project-root", and placement_evidence must cite package.json as the existing project-root bootstrap contract.') +
           ' Never omit mapped_references. Put behavioral scenarios in evidence_expected, not tests[].',
         notes: [
+          phaseBoundaryContext,
           planningMapContext.text,
-          reviewNotes.length ? `Previous review issues to address:\n${reviewNotes.join('\n')}` : '',
+          reviewNotes.length
+            ? [
+                'Previous review issues to address within the active phase boundary:',
+                ...reviewNotes,
+                'A reviewer finding does not expand the phase. If it asks for an outcome assigned to a later phase, preserve the roadmap boundary instead of adding that work.',
+              ].join('\n')
+            : '',
         ]
           .filter(Boolean)
           .join('\n\n'),
@@ -906,15 +931,25 @@ async function executePhase(
     const reviewTask: AgentTaskDraft = {
       id: `plan-review-${phase.id}-r${revisions}`,
       role: 'reviewer',
-      objective: `Independent brief review of the phase plan: completeness, coherence, risk, requirement coverage, adherence to rules. You receive the plan, never the author's reasoning.`,
-      canonical_files: [paths.rules, pp.plan].filter(exists),
+      objective:
+        'Independent brief review of the active phase plan: completeness, coherence, risk, requirement coverage, and adherence to applicable rules. ' +
+        "You receive the plan, never the author's reasoning. REQUIREMENTS.md and ROADMAP.md are authoritative for phase allocation; RULES.md contains milestone-wide constraints and outcomes. " +
+        'Apply rules to behavior changed by this phase, but do not report a missing feature as a spec_gap when REQUIREMENTS.md or ROADMAP.md assigns it to a later phase. ' +
+        'Do not pull requirements assigned to a later phase into this plan. Reject feature coverage only when it belongs to the active phase or is a necessary prerequisite for its acceptance criteria.',
+      canonical_files: [
+        paths.rules,
+        milestone.paths.scope,
+        milestone.paths.requirements,
+        milestone.paths.roadmap,
+        pp.plan,
+      ].filter(exists),
       code_files: [],
       write_scope: [],
       acceptance_criteria: [],
       verification_commands: [],
       return_format:
         'JSON payload: {approved: boolean, findings: [{type, severity, description, file}]}. type MUST be exactly one of intent_gap|spec_gap|implementation_bug|test_gap|security_risk|quality_issue|defer|reject; severity MUST be blocker|critical|high|medium|low.',
-      notes: '',
+      notes: phaseBoundaryContext,
       workspace: null,
       canonical_baseline: null,
     };
