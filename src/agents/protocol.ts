@@ -1,5 +1,9 @@
 import { z } from 'zod';
 import { ModelRoleSchema } from '../core/schemas/index.js';
+import {
+  LEGACY_WORKFLOW_EPOCH,
+  WorkflowEpochSchema,
+} from '../core/workflow-epoch.js';
 
 /**
  * Identity of ONE supervised attempt at a logical task. The core only accepts
@@ -8,6 +12,7 @@ import { ModelRoleSchema } from '../core/schemas/index.js';
  * belongs to this attempt. Everything else is LATE_OR_STALE_RESULT.
  */
 export const AgentAttemptIdentitySchema = z.object({
+  workflow_epoch: WorkflowEpochSchema.default(LEGACY_WORKFLOW_EPOCH),
   logical_task_id: z.string(),
   attempt_id: z.string(),
   generation: z.number().int().min(1),
@@ -85,6 +90,7 @@ export const AgentResultSchema = z.object({
   /** material choices and true blockers proposed for deterministic core validation */
   decision_proposals: z.array(z.unknown()).optional(),
   /** echo of the attempt identity — required for a supervised result to be accepted */
+  workflow_epoch: WorkflowEpochSchema.nullable().default(null),
   attempt_id: z.string().nullable().default(null),
   generation: z.number().int().nullable().default(null),
   lease_id: z.string().nullable().default(null),

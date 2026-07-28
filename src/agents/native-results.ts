@@ -13,12 +13,23 @@ import {
   ensureDir,
   writeBufferAtomic,
   writeFileAtomic,
+  writeJsonAtomic,
 } from '../core/fsx.js';
 import { pathInScope } from '../core/scope.js';
-import type { AgentResult, AgentTask } from './protocol.js';
+import {
+  AgentTaskSchema,
+  type AgentResult,
+  type AgentTask,
+} from './protocol.js';
 import type { AgentRunner, ReplayAttemptIdentity, RunnerCapabilities } from './runner.js';
+import {
+  WorkflowEpochSchema,
+  createWorkflowEpoch,
+  type WorkflowEpoch,
+} from '../core/workflow-epoch.js';
 
 const NativeIdentitySchema = z.object({
+  workflow_epoch: WorkflowEpochSchema,
   request_id: z.string().regex(/^nreq_[a-f0-9]{64}$/),
   request_hash: z.string().regex(/^[a-f0-9]{64}$/),
   logical_task_id: z.string().min(1),
@@ -120,6 +131,7 @@ export type NativeResultV2 = z.infer<typeof NativeResultV2Schema>;
 
 export const NativeResultBundleV2Schema = z.object({
   version: z.literal(2),
+  active_workflow_epoch: WorkflowEpochSchema.optional(),
   request_file: z.string().default('native-requests.jsonl'),
   capabilities: z
     .object({
@@ -134,6 +146,7 @@ export const NativeResultBundleV2Schema = z.object({
 export type NativeResultBundleV2 = z.infer<typeof NativeResultBundleV2Schema>;
 
 const identityFields = [
+  'workflow_epoch',
   'request_id',
   'request_hash',
   'logical_task_id',
@@ -155,6 +168,7 @@ function requestHashInput(task: AgentTask): Omit<NativeRequestV2, 'request_id' |
     throw new Error(`Native protocol v2 requires a supervised attempt for task ${task.id}.`);
   }
   return {
+    workflow_epoch: task.attempt.workflow_epoch,
     logical_task_id: task.attempt.logical_task_id,
     attempt_id: task.attempt.attempt_id,
     generation: task.attempt.generation,
@@ -242,6 +256,7 @@ function semanticRequestPath(value: string, workspaceId: string | null): string 
 
 function semanticRequest(request: NativeRequestV2): string {
   const {
+    workflow_epoch: _workflowEpoch,
     request_id: _requestId,
     request_hash: _requestHash,
     attempt_id: _attemptId,
@@ -264,17 +279,19 @@ function semanticRequest(request: NativeRequestV2): string {
 }
 
 export function createNativeRequestV2(task: AgentTask): NativeRequestV2 {
-  const body = requestHashInput(task);
+  const normalizedTask = AgentTaskSchema.parse(task);
+  const body = requestHashInput(normalizedTask);
   // A native helper turn can create a fresh workspace with a different
   // absolute root. Hash the semantic task paths, not that random root, so the
   // exact supervised identity can resume while the request contains real paths.
   const hashBody = {
     ...body,
     workspace_id: body.workspace_id === null ? null : '$WORKSPACE',
-    canonical_files: body.canonical_files.map((value) => stableWorkspacePath(task, value)),
-    code_files: body.code_files.map((value) => stableWorkspacePath(task, value)),
+    canonical_files: body.canonical_files.map((value) => stableWorkspacePath(normalizedTask, value)),
+    code_files: body.code_files.map((value) => stableWorkspacePath(normalizedTask, value)),
   };
   const identity = JSON.stringify({
+    workflow_epoch: body.workflow_epoch,
     logical_task_id: body.logical_task_id,
     attempt_id: body.attempt_id,
     generation: body.generation,
@@ -303,20 +320,119 @@ export class NativeProtocolUpgradeError extends Error {
  */
 export class NativeResultRunner implements AgentRunner {
   readonly capabilities: RunnerCapabilities;
+  readonly workflowEpoch: WorkflowEpoch;
   private readonly entries: NativeResultV2[];
   private readonly used = new Set<number>();
   private readonly requestFile: string;
   private readonly bundleDirectory: string;
 
-  constructor(bundleFile: string) {
-    const raw = readJson<{ version?: unknown }>(bundleFile);
+  constructor(bundleFile: string, expectedWorkflowEpoch?: WorkflowEpoch) {
+    const raw = readJson<{
+      version?: unknown;
+      active_workflow_epoch?: unknown;
+      results?: unknown[];
+    }>(bundleFile);
     if (raw.version === 1) throw new NativeProtocolUpgradeError();
-    const bundle = NativeResultBundleV2Schema.parse(raw);
+    const priorEpoch = WorkflowEpochSchema.safeParse(raw.active_workflow_epoch);
+    const rawResults = Array.isArray(raw.results) ? raw.results : [];
+    const exactResultEpochs = [
+      ...new Set(
+        rawResults.flatMap((entry) => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+          const parsed = WorkflowEpochSchema.safeParse(
+            (entry as Record<string, unknown>)['workflow_epoch'],
+          );
+          return parsed.success ? [parsed.data] : [];
+        }),
+      ),
+    ];
+    const inferredExactEpoch =
+      !priorEpoch.success &&
+      expectedWorkflowEpoch === undefined &&
+      exactResultEpochs.length === 1 &&
+      rawResults.every(
+        (entry) =>
+          entry !== null &&
+          typeof entry === 'object' &&
+          !Array.isArray(entry) &&
+          (entry as Record<string, unknown>)['workflow_epoch'] === exactResultEpochs[0],
+      )
+        ? exactResultEpochs[0]
+        : null;
+    const workflowEpoch = WorkflowEpochSchema.parse(
+      expectedWorkflowEpoch ??
+        (priorEpoch.success
+          ? priorEpoch.data
+          : inferredExactEpoch ?? createWorkflowEpoch()),
+    );
+    const rotateForWorkflow =
+      expectedWorkflowEpoch !== undefined &&
+      (!priorEpoch.success || priorEpoch.data !== workflowEpoch);
+    const hasEpochlessResult = rawResults.some(
+      (entry) =>
+        entry !== null &&
+        typeof entry === 'object' &&
+        !Array.isArray(entry) &&
+        !('workflow_epoch' in entry),
+    );
+    if (hasEpochlessResult || rotateForWorkflow) {
+      const archiveDir = path.join(
+        path.dirname(path.resolve(bundleFile)),
+        'native-v2-epochless-archive',
+      );
+      ensureDir(archiveDir);
+      writeJsonAtomic(
+        path.join(archiveDir, `${Date.now()}-${path.basename(bundleFile)}`),
+        raw,
+      );
+    }
+    const normalizedResults =
+      hasEpochlessResult || rotateForWorkflow ? [] : rawResults;
+    const normalizedRaw = {
+      ...raw,
+      active_workflow_epoch: workflowEpoch,
+      results: normalizedResults,
+    };
+    if (
+      !priorEpoch.success ||
+      priorEpoch.data !== workflowEpoch ||
+      hasEpochlessResult ||
+      rotateForWorkflow
+    ) {
+      writeJsonAtomic(bundleFile, normalizedRaw);
+    }
+    const bundle = NativeResultBundleV2Schema.parse(normalizedRaw);
+    this.workflowEpoch = workflowEpoch;
     this.capabilities = bundle.capabilities;
     this.entries = bundle.results;
     this.bundleDirectory = path.dirname(path.resolve(bundleFile));
     this.requestFile = path.resolve(this.bundleDirectory, bundle.request_file);
     assertContainedWithoutSymlinks(this.bundleDirectory, this.requestFile);
+    this.rejectStaleStoredRequests(rotateForWorkflow);
+  }
+
+  private rejectStaleStoredRequests(rotateForWorkflow: boolean): void {
+    if (!exists(this.requestFile)) return;
+    const lines = readText(this.requestFile).split(/\r?\n/).filter(Boolean);
+    const hasEpochlessRequest = lines.some((line) => {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>;
+        return value['workflow_epoch'] === undefined;
+      } catch {
+        return false;
+      }
+    });
+    if (!hasEpochlessRequest && !rotateForWorkflow) return;
+    const archiveDir = path.join(
+      this.bundleDirectory,
+      'native-v2-epochless-archive',
+    );
+    ensureDir(archiveDir);
+    writeFileAtomic(
+      path.join(archiveDir, `${Date.now()}-${path.basename(this.requestFile)}`),
+      readText(this.requestFile),
+    );
+    writeFileAtomic(this.requestFile, '');
   }
 
   private storedRequests(): NativeRequestV2[] {
@@ -346,6 +462,7 @@ export class NativeResultRunner implements AgentRunner {
     for (let index = requests.length - 1; index >= 0; index--) {
       const request = requests[index]!;
       if (
+        request.workflow_epoch === attempt.workflow_epoch &&
         request.logical_task_id === attempt.logical_task_id &&
         request.attempt_id === attempt.attempt_id &&
         request.generation === attempt.generation &&
@@ -374,8 +491,10 @@ export class NativeResultRunner implements AgentRunner {
     }
 
     for (const entry of candidates.reverse()) {
+      if (entry.workflow_epoch !== this.workflowEpoch) continue;
       if (entry.logical_task_id !== task.id) continue;
       const attempt = {
+        workflow_epoch: entry.workflow_epoch,
         logical_task_id: entry.logical_task_id,
         attempt_id: entry.attempt_id,
         generation: entry.generation,
@@ -387,6 +506,7 @@ export class NativeResultRunner implements AgentRunner {
       const stored = this.storedRequestForTask(task, attempt);
       if (stored && identityFields.every((field) => entry[field] === stored[field])) {
         return {
+          workflow_epoch: entry.workflow_epoch,
           logical_task_id: entry.logical_task_id,
           attempt_id: entry.attempt_id,
           generation: entry.generation,
@@ -402,6 +522,7 @@ export class NativeResultRunner implements AgentRunner {
     const generatedRequest = createNativeRequestV2(task);
     const storedRequest = task.attempt
       ? this.storedRequestForTask(task, {
+          workflow_epoch: task.attempt.workflow_epoch,
           logical_task_id: task.attempt.logical_task_id,
           attempt_id: task.attempt.attempt_id,
           generation: task.attempt.generation,
@@ -739,6 +860,7 @@ export class NativeResultRunner implements AgentRunner {
       files_written: filesWritten,
       scope_requests: entry.scope_requests,
       decision_proposals: entry.decision_proposals,
+      workflow_epoch: task.attempt?.workflow_epoch ?? this.workflowEpoch,
       attempt_id: task.attempt?.attempt_id ?? null,
       generation: task.attempt?.generation ?? null,
       lease_id: task.attempt?.lease_id ?? null,

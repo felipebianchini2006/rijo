@@ -78,6 +78,16 @@ export {
   type InstallReport,
 } from './install/index.js';
 export { AttemptWorkspace, snapshotTree, diffTrees } from './core/workspace.js';
+export {
+  WorkflowEpochSchema,
+  WorkflowOperationSchema,
+  createWorkflowEpoch,
+  openWorkflowOperation,
+  readWorkflowOperation,
+  requireWorkflowOperation,
+  type WorkflowEpoch,
+  type WorkflowOperation,
+} from './core/workflow-epoch.js';
 export { planCommand, buildEnv, nativeSandboxAvailable } from './security/execpolicy.js';
 export { isSensitivePath, SENSITIVE_PATH_PATTERNS } from './security/sensitive.js';
 export { buildInventory, MapPreflightError } from './codebase/inventory.js';

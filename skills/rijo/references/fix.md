@@ -14,6 +14,7 @@ Run these stages in order:
 8. Document the fix in `.rijo/fixes/`.
 9. Read `native-results.md`.
 10. Record the reproduction and repair in a result bundle.
-11. Run `node .rijo/bin/rijo.cjs internal fix-open "<description>" --results @.rijo/runtime/native-results.json`.
+11. Run `node .rijo/bin/rijo.cjs internal workflow-open fix "<description>" <evidence>` once for this public command.
+12. Run `node .rijo/bin/rijo.cjs internal fix-open "<description>" <evidence> --results @.rijo/runtime/native-results.json`.
 
 Create a new phase only for an architectural, destructive, security-wide, or business-intent change.

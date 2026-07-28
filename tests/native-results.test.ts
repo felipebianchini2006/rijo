@@ -82,6 +82,7 @@ describe('native result ingestion', () => {
     expect(request.result_contract.preserved_files).toContain('baseline SHA-256');
     expect(fs.statSync(path.join(root, 'native-dispatch')).isDirectory()).toBe(true);
     expect(request.result_contract.identity_fields).toEqual([
+      'workflow_epoch',
       'request_id',
       'request_hash',
       'logical_task_id',
@@ -286,6 +287,7 @@ describe('native result ingestion', () => {
     );
     fs.writeFileSync(bundle, JSON.stringify({
       version: 2,
+      active_workflow_epoch: request.workflow_epoch,
       results: [{
         ...request,
         ok: true,
@@ -656,6 +658,7 @@ describe('native result ingestion', () => {
     fs.writeFileSync(path.join(root, 'src', 'feature.ts'), userEdit);
     fs.writeFileSync(bundle, JSON.stringify({
       version: 2,
+      active_workflow_epoch: generation1Request.workflow_epoch,
       results: [{
         ...generation1Request,
         ok: true,
@@ -992,6 +995,13 @@ describe('native result ingestion', () => {
     writePlanFile(root, 'PLAN.md', '# Plan\n\nCreate one local TypeScript file.\n');
     const bundle = path.join(root, 'results.json');
     fs.writeFileSync(bundle, JSON.stringify({ version: 1, results: [] }));
+    expect(
+      await runCli(
+        ['internal', 'workflow-open', 'new', '@PLAN.md'],
+        deps(root),
+        root,
+      ),
+    ).toBe(0);
 
     await expect(
       runCli(
@@ -1052,11 +1062,19 @@ describe('native result ingestion', () => {
       '--results',
       '@.rijo/runtime/native-results.json',
     ];
+    expect(
+      await runCli(
+        ['internal', 'workflow-open', 'new', '@PLAN.md'],
+        runtime,
+        root,
+      ),
+    ).toBe(0);
 
     await expect(runCli(helperArgs, runtime, root)).rejects.toThrow('NATIVE_RESULT_REQUIRED');
     const generation1Request = JSON.parse(fs.readFileSync(requestFile, 'utf8').trim());
     fs.writeFileSync(bundle, JSON.stringify({
       version: 2,
+      active_workflow_epoch: generation1Request.workflow_epoch,
       results: [{
         ...generation1Request,
         ok: false,
@@ -1067,6 +1085,11 @@ describe('native result ingestion', () => {
 
     await expect(runCli(helperArgs, runtime, root)).rejects.toThrow('NATIVE_RESULT_REQUIRED');
     const requestsAfterFence = fs.readFileSync(requestFile, 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    expect(
+      new Set(
+        requestsAfterFence.map((request) => request.workflow_epoch),
+      ),
+    ).toEqual(new Set([generation1Request.workflow_epoch]));
     const generation2Request = requestsAfterFence.find(
       (request) => request.logical_task_id === 'new-extract' && request.generation === 2,
     );

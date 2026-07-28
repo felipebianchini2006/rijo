@@ -6,6 +6,10 @@ import type { HostAgentController } from '../hosts/controller.js';
 import { InProcessController } from '../supervisor/runnerController.js';
 import { Supervisor, type PreparedAttempt } from '../supervisor/supervisor.js';
 import type { Clock } from '../supervisor/clock.js';
+import {
+  createWorkflowEpoch,
+  type WorkflowEpoch,
+} from '../core/workflow-epoch.js';
 
 /**
  * One supervised dispatch: the gen-1 task (already carrying its isolated
@@ -60,6 +64,7 @@ export interface SupervisedExecutorOptions {
   paths: RijoPaths;
   capabilities: RunnerCapabilities;
   clock?: Clock;
+  workflowEpoch: WorkflowEpoch;
 }
 
 /**
@@ -77,6 +82,7 @@ export class SupervisedExecutor implements TaskExecutor {
       config: opts.config,
       paths: opts.paths,
       clock: opts.clock,
+      workflowEpoch: opts.workflowEpoch,
     });
   }
 
@@ -148,13 +154,26 @@ export function defaultExecutor(
   runner: AgentRunner,
   config: SupervisorConfig,
   paths: RijoPaths,
+  workflowEpochOrClock?: WorkflowEpoch | Clock,
   clock?: Clock,
 ): TaskExecutor {
+  const workflowEpoch =
+    typeof workflowEpochOrClock === 'string'
+      ? workflowEpochOrClock
+      : (
+          (runner as AgentRunner & { workflowEpoch?: WorkflowEpoch }).workflowEpoch ??
+          createWorkflowEpoch()
+        );
+  const effectiveClock =
+    typeof workflowEpochOrClock === 'string'
+      ? clock
+      : workflowEpochOrClock;
   return new SupervisedExecutor({
     controller: new InProcessController(runner),
     config,
     paths,
+    workflowEpoch,
     capabilities: runner.capabilities,
-    ...(clock ? { clock } : {}),
+    ...(effectiveClock ? { clock: effectiveClock } : {}),
   });
 }

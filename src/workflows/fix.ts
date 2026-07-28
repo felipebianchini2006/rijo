@@ -63,22 +63,34 @@ export async function fixWorkflow(
 
   return withLock(ctx, async () => {
     const ts = now();
-    const stamp = ts.toISOString().replace(/[-:]/g, '').slice(0, 13).replace('T', '-');
     const slug = opts.description
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 40);
-    const fixPath = path.join(paths.fixesDir, `${stamp}-${slug || 'fix'}.md`);
+    const fixId = ctx.workflowEpoch.slice('wep_'.length, 'wep_'.length + 12);
+    const fixPath = path.join(paths.fixesDir, `${fixId}-${slug || 'fix'}.md`);
 
-    bus.emit('fix.start', { status: 'running', stage: 'REPRODUCE', message: `reproduzindo: ${opts.description.slice(0, 60)}` });
-    writeFileAtomic(
-      fixPath,
-      serializeFrontmatter(
-        { description: opts.description, status: 'IN_PROGRESS', created_at: ts.toISOString(), evidence_files: opts.evidenceFiles ?? [] },
-        `# Fix — ${opts.description}\n\n## Log\n`,
-      ),
-    );
+    bus.emit('fix.start', {
+      status: 'running',
+      stage: 'REPRODUCE',
+      message: `Reproduce: ${opts.description.slice(0, 60)}`,
+    });
+    if (!exists(fixPath)) {
+      writeFileAtomic(
+        fixPath,
+        serializeFrontmatter(
+          {
+            workflow_epoch: ctx.workflowEpoch,
+            description: opts.description,
+            status: 'IN_PROGRESS',
+            created_at: ts.toISOString(),
+            evidence_files: opts.evidenceFiles ?? [],
+          },
+          `# Fix — ${opts.description}\n\n## Log\n`,
+        ),
+      );
+    }
     const appendLog = (line: string) => {
       const current = readText(fixPath);
       writeFileAtomic(fixPath, `${current.trimEnd()}\n- ${now().toISOString()} ${line}\n`);

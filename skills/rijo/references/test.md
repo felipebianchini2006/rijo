@@ -26,7 +26,8 @@ Repair defects by default.
 20. Write `.rijo/qa/FINDINGS.md`, `.rijo/qa/TEST-REPORT.md`, and `.rijo/qa/READINESS.md`.
 21. Read `native-results.md`.
 22. Record the native Quality Assurance results in a result bundle.
-23. Run `node .rijo/bin/rijo.cjs internal qa-record --results @.rijo/runtime/native-results.json`.
+23. Run `node .rijo/bin/rijo.cjs internal workflow-open test` once for this public command.
+24. Run `node .rijo/bin/rijo.cjs internal qa-record --results @.rijo/runtime/native-results.json`.
 
 Return only `READY`, `NOT_READY`, or `BLOCKED`.
 Return `BLOCKED` when a required browser, simulator, or emulator is unavailable.

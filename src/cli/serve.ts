@@ -8,6 +8,7 @@ import { uiWorkflow } from '../workflows/ui.js';
 import { fixWorkflow } from '../workflows/fix.js';
 import { checkWorkflow } from '../workflows/check.js';
 import { mapWorkflow } from '../workflows/map.js';
+import { createWorkflowEpoch } from '../core/workflow-epoch.js';
 
 const DEFAULT_CAPABILITIES: RunnerCapabilities = { subagents: true, parallelism: false, browser: false };
 
@@ -257,7 +258,11 @@ async function handleWorkflowRequest(
     },
   };
   // shell/git default to the real ones inside createContext.
-  const deps: WorkflowDeps = { runner, sink };
+  const deps: WorkflowDeps = {
+    runner,
+    sink,
+    workflowEpoch: createWorkflowEpoch(),
+  };
 
   // Exactly one response per workflow id — whichever of {completion, deadline,
   // unwind-timeout} wins.

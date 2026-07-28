@@ -180,6 +180,7 @@ export async function finishWorkflow(
         ctx.paths,
         {
           ...previousState,
+          workflow_epoch: ctx.workflowEpoch,
           phase: null,
           task: null,
           stage: 'READY',

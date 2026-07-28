@@ -7,6 +7,7 @@ export interface RunnerCapabilities {
 }
 
 export interface ReplayAttemptIdentity {
+  workflow_epoch: string;
   logical_task_id: string;
   attempt_id: string;
   generation: number;
@@ -89,6 +90,7 @@ export class FakeAgentRunner implements AgentRunner {
       files_written: [],
       payload: null,
       scope_requests: [],
+      workflow_epoch: null,
       attempt_id: null,
       generation: null,
       lease_id: null,
@@ -112,6 +114,7 @@ export class UnboundAgentRunner implements AgentRunner {
       files_written: [],
       payload: null,
       scope_requests: [],
+      workflow_epoch: null,
       attempt_id: null,
       generation: null,
       lease_id: null,

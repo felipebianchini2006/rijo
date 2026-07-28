@@ -87,6 +87,7 @@ interface Proc {
 function stampIdentity(task: AgentTask, result: AgentResult): AgentResult {
   return {
     ...result,
+    workflow_epoch: task.attempt?.workflow_epoch ?? result.workflow_epoch,
     attempt_id: task.attempt?.attempt_id ?? result.attempt_id,
     generation: task.attempt?.generation ?? result.generation,
     lease_id: task.attempt?.lease_id ?? result.lease_id,

@@ -27,6 +27,25 @@ function seedV1Project(root: string): RijoPaths {
     ),
   );
   fs.writeFileSync(paths.config, 'schema_version: 1\n');
+  fs.writeFileSync(
+    paths.state,
+    [
+      '---',
+      'milestone: M001',
+      'phase: null',
+      'task: null',
+      'stage: null',
+      'last_verified: null',
+      'last_commit: null',
+      'next_step: "$rijo start"',
+      'blocked: false',
+      'blocked_reason: null',
+      'updated_at: "2026-07-01T00:00:00.000Z"',
+      '---',
+      '',
+      '# STATE',
+    ].join('\n'),
+  );
   const planPath = path.join(root, '.rijo', 'milestones', 'M001-store', 'phases', '01-catalog', 'PLAN.md');
   fs.writeFileSync(
     planPath,
@@ -78,6 +97,7 @@ describe('schema migration from prior versions to the current schema', () => {
     const manifest = JSON.parse(fs.readFileSync(paths.manifest, 'utf8'));
     expect(manifest.schema_version).toBe(SCHEMA_VERSION);
     expect(fs.readFileSync(paths.config, 'utf8')).toContain(`schema_version: ${SCHEMA_VERSION}`);
+    expect(fs.readFileSync(paths.state, 'utf8')).toContain('workflow_epoch: null');
     // hashes were refreshed: the migration's own writes are not drift
     const drift = detectDrift(paths);
     expect(drift.drifted).toEqual([]);

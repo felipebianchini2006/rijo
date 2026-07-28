@@ -1,13 +1,14 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { RijoPaths } from '../core/paths.js';
-import { writeJsonAtomic, appendLine, readJsonIfExists, ensureDir } from '../core/fsx.js';
+import { writeJsonAtomic, appendLine, readJsonIfExists, ensureDir, sha256 } from '../core/fsx.js';
 import {
   TaskRecordSchema,
   assertSupervisedTransition,
   type TaskRecord,
   type SupervisedTaskState,
 } from '../core/schemas/index.js';
+import { LEGACY_WORKFLOW_EPOCH } from '../core/workflow-epoch.js';
 
 /**
  * Durable supervision state. Every task has one JSON projection under
@@ -21,12 +22,22 @@ import {
 export interface TaskEvent {
   ts: string;
   logical_task_id: string;
+  workflow_epoch?: string;
   type: string;
   data: Record<string, unknown>;
 }
 
 /** States from which no further supervision action is ever needed. */
-const TERMINAL: ReadonlySet<SupervisedTaskState> = new Set<SupervisedTaskState>(['SUCCEEDED', 'EXHAUSTED']);
+const TERMINAL: ReadonlySet<SupervisedTaskState> = new Set<SupervisedTaskState>([
+  'SUCCEEDED',
+  'EXHAUSTED',
+]);
+const ARCHIVABLE: ReadonlySet<SupervisedTaskState> = new Set<SupervisedTaskState>([
+  'SUCCEEDED',
+  'FAILED',
+  'EXHAUSTED',
+  'CANCELLED',
+]);
 
 /** Filesystem-safe form of a logical task id (read/write use the same mapping). */
 function fileId(id: string): string {
@@ -44,13 +55,36 @@ export class TaskStore {
     return path.join(this.paths.runtimeDir, 'task-events.jsonl');
   }
 
+  get archiveDir(): string {
+    return path.join(this.tasksDir, 'archive');
+  }
+
   private recordPath(id: string): string {
     return path.join(this.tasksDir, `${fileId(id)}.json`);
   }
 
+  private archivePath(id: string, workflowEpoch: string): string {
+    return path.join(
+      this.archiveDir,
+      `${fileId(id)}-${sha256(id).slice(0, 16)}`,
+      `${fileId(workflowEpoch)}.json`,
+    );
+  }
+
   /** Append one event to the durable log. Always called before a projection write. */
-  emit(logicalTaskId: string, type: string, data: Record<string, unknown> = {}): TaskEvent {
-    const ev: TaskEvent = { ts: new Date().toISOString(), logical_task_id: logicalTaskId, type, data };
+  emit(
+    logicalTaskId: string,
+    type: string,
+    data: Record<string, unknown> = {},
+    workflowEpoch?: string,
+  ): TaskEvent {
+    const ev: TaskEvent = {
+      ts: new Date().toISOString(),
+      logical_task_id: logicalTaskId,
+      ...(workflowEpoch ? { workflow_epoch: workflowEpoch } : {}),
+      type,
+      data,
+    };
     ensureDir(path.dirname(this.eventsFile));
     appendLine(this.eventsFile, JSON.stringify(ev));
     return ev;
@@ -59,6 +93,26 @@ export class TaskStore {
   /** Tolerant read: missing or corrupt records return null instead of throwing. */
   read(logicalTaskId: string): TaskRecord | null {
     const raw = readJsonIfExists(this.recordPath(logicalTaskId));
+    if (raw === null) return null;
+    const candidate =
+      raw &&
+      typeof raw === 'object' &&
+      !Array.isArray(raw) &&
+      !('workflow_epoch' in raw)
+        ? { ...(raw as Record<string, unknown>), workflow_epoch: LEGACY_WORKFLOW_EPOCH }
+        : raw;
+    const parsed = TaskRecordSchema.safeParse(candidate);
+    if (!parsed.success) return null;
+    if (parsed.data.logical_task_id !== logicalTaskId) {
+      throw new Error(
+        `Supervised task projection key collision between ${logicalTaskId} and ${parsed.data.logical_task_id}.`,
+      );
+    }
+    return parsed.data;
+  }
+
+  readArchived(logicalTaskId: string, workflowEpoch: string): TaskRecord | null {
+    const raw = readJsonIfExists(this.archivePath(logicalTaskId, workflowEpoch));
     if (raw === null) return null;
     const parsed = TaskRecordSchema.safeParse(raw);
     return parsed.success ? parsed.data : null;
@@ -74,9 +128,69 @@ export class TaskStore {
     if (this.read(valid.logical_task_id) !== null) {
       throw new Error(`Supervised task ${valid.logical_task_id} already has a durable record.`);
     }
-    this.emit(valid.logical_task_id, 'task_created', { state: valid.state, role: valid.role });
+    this.emit(
+      valid.logical_task_id,
+      'task_created',
+      { state: valid.state, role: valid.role },
+      valid.workflow_epoch,
+    );
     this.write(valid);
     return valid;
+  }
+
+  /**
+   * Archive a terminal projection and create generation 1 for a new workflow
+   * epoch. The active projection is never overwritten until the archive is
+   * durable. A different non-terminal epoch is always a closed conflict.
+   */
+  rolloverTerminal(prior: TaskRecord, nextRecord: TaskRecord): TaskRecord {
+    const next = TaskRecordSchema.parse(nextRecord);
+    const current = this.read(prior.logical_task_id);
+    if (!current || current.workflow_epoch !== prior.workflow_epoch) {
+      throw new Error(
+        `Supervised task ${prior.logical_task_id} changed before workflow epoch rollover.`,
+      );
+    }
+    if (!ARCHIVABLE.has(current.state)) {
+      throw new Error(
+        `Supervised task ${prior.logical_task_id} is ${current.state}; cross-epoch rollover is refused.`,
+      );
+    }
+    if (current.workflow_epoch === next.workflow_epoch) {
+      throw new Error(
+        `Supervised task ${prior.logical_task_id} cannot roll over inside the same workflow epoch.`,
+      );
+    }
+    if (next.generation !== 1 || next.replacement_count !== 0) {
+      throw new Error(
+        `Supervised task ${prior.logical_task_id} must start the new workflow epoch at generation 1.`,
+      );
+    }
+    const archivePath = this.archivePath(current.logical_task_id, current.workflow_epoch);
+    const archived = readJsonIfExists(archivePath);
+    if (archived !== null) {
+      const parsed = TaskRecordSchema.safeParse(archived);
+      if (!parsed.success || JSON.stringify(parsed.data) !== JSON.stringify(current)) {
+        throw new Error(
+          `Supervised task ${prior.logical_task_id} has a conflicting immutable epoch archive.`,
+        );
+      }
+    } else {
+      writeJsonAtomic(archivePath, current);
+    }
+    this.emit(
+      current.logical_task_id,
+      'workflow_epoch_rolled_over',
+      {
+        prior_workflow_epoch: current.workflow_epoch,
+        workflow_epoch: next.workflow_epoch,
+        prior_state: current.state,
+        revoked_lease_id: current.lease_id,
+      },
+      next.workflow_epoch,
+    );
+    this.write(next);
+    return next;
   }
 
   /**
@@ -96,7 +210,7 @@ export class TaskStore {
     this.emit(record.logical_task_id, 'task_requeued', {
       from: record.state,
       ...eventData,
-    });
+    }, record.workflow_epoch);
     const next = TaskRecordSchema.parse({ ...record, ...patch, state: 'QUEUED' });
     this.write(next);
     return next;
@@ -114,7 +228,12 @@ export class TaskStore {
     eventData: Record<string, unknown> = {},
   ): TaskRecord {
     assertSupervisedTransition(record.logical_task_id, record.state, to);
-    this.emit(record.logical_task_id, 'state_transition', { from: record.state, to, ...eventData });
+    this.emit(
+      record.logical_task_id,
+      'state_transition',
+      { from: record.state, to, ...eventData },
+      record.workflow_epoch,
+    );
     const next = TaskRecordSchema.parse({ ...record, ...patch, state: to });
     this.write(next);
     return next;
@@ -130,7 +249,7 @@ export class TaskStore {
     eventType: string,
     eventData: Record<string, unknown> = {},
   ): TaskRecord {
-    this.emit(record.logical_task_id, eventType, eventData);
+    this.emit(record.logical_task_id, eventType, eventData, record.workflow_epoch);
     const next = TaskRecordSchema.parse({ ...record, ...patch });
     this.write(next);
     return next;

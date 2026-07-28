@@ -98,7 +98,7 @@ describe('runCli', () => {
     fs.writeFileSync(
       paths.status,
       JSON.stringify({
-        schema_version: 5,
+        schema_version: 6,
         run_id: 'run-native-pending',
         status: 'running',
         milestone: { id: milestone.id, name: milestone.slug },

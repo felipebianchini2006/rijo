@@ -41,6 +41,7 @@ Copy these identity fields from the request into the result:
 
 ```json
 {
+  "workflow_epoch": "wep_<64 hexadecimal characters>",
   "request_id": "nreq_<64 hexadecimal characters>",
   "request_hash": "<64 hexadecimal characters>",
   "logical_task_id": "exact logical task identifier",
@@ -52,6 +53,7 @@ Copy these identity fields from the request into the result:
 ```
 
 Do not use a prefix match.
+Do not reuse an epoch from a terminal public command.
 Do not infer a missing identity.
 Do not use the current attempt to complete a partial identity.
 RIJO rejects stale, reused, altered, and revoked results.
@@ -60,6 +62,7 @@ Add the task result with this shape:
 
 ```json
 {
+  "workflow_epoch": "wep_<64 hexadecimal characters>",
   "request_id": "nreq_<64 hexadecimal characters>",
   "request_hash": "<64 hexadecimal characters>",
   "logical_task_id": "exact logical task identifier",
@@ -164,6 +167,7 @@ RIJO validates these decisions before it applies the patch.
 Do not apply a decision proposal directly.
 
 Preserve every validated result entry.
+Preserve `active_workflow_epoch` after the helper adds it.
 Do not replace a prior result entry.
 Do not reorder a prior result entry.
 Stage the complete result bundle.

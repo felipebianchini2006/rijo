@@ -767,6 +767,7 @@ export async function newWorkflow(
     const stateContent = renderState(
       {
         ...initialState(now),
+        workflow_epoch: ctx.workflowEpoch,
         milestone: milestone.id,
         next_step: opts.ui
           ? `$rijo ui @${opts.ui.replace(/^@/, '')}`

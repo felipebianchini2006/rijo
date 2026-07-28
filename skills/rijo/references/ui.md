@@ -25,5 +25,6 @@ Accept one or more inputs in the same command.
 19. Update the roadmap and project context.
 20. Read `native-results.md`.
 21. Record mapping, conversion, and visual validation in a result bundle.
-22. Run `node .rijo/bin/rijo.cjs internal ui-import <inputs> --results @.rijo/runtime/native-results.json`.
+22. Run `node .rijo/bin/rijo.cjs internal workflow-open ui <inputs>` once for this public command.
+23. Run `node .rijo/bin/rijo.cjs internal ui-import <inputs> --results @.rijo/runtime/native-results.json`.
 23. Store import evidence in `.rijo/ui/`.

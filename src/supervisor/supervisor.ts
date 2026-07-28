@@ -9,6 +9,11 @@ import { isNativeResultPendingSummary } from '../agents/native-results.js';
 import type { HostAgentController, HostAttemptHandle } from '../hosts/controller.js';
 import { SystemClock, type Clock, type TimerHandle } from './clock.js';
 import { TaskStore } from './store.js';
+import {
+  WorkflowEpochSchema,
+  createWorkflowEpoch,
+  type WorkflowEpoch,
+} from '../core/workflow-epoch.js';
 
 /** A fresh, isolated attempt supplied by the caller for each generation. */
 export interface PreparedAttempt {
@@ -88,14 +93,24 @@ export class Supervisor {
   private readonly clock: Clock;
   private readonly store: TaskStore;
   private readonly paths: RijoPaths;
+  private readonly workflowEpoch: WorkflowEpoch;
   private readonly active = new Map<string, ActiveTask>();
   private disposed = false;
 
-  constructor(opts: { controller: HostAgentController; config: SupervisorConfig; paths: RijoPaths; clock?: Clock }) {
+  constructor(opts: {
+    controller: HostAgentController;
+    config: SupervisorConfig;
+    paths: RijoPaths;
+    clock?: Clock;
+    workflowEpoch?: WorkflowEpoch;
+  }) {
     this.controller = opts.controller;
     this.config = opts.config;
     this.clock = opts.clock ?? new SystemClock();
     this.paths = opts.paths;
+    this.workflowEpoch = WorkflowEpochSchema.parse(
+      opts.workflowEpoch ?? createWorkflowEpoch(),
+    );
     this.store = new TaskStore(opts.paths);
   }
 
@@ -187,9 +202,11 @@ export class Supervisor {
       disposition: 'LATE_OR_STALE_RESULT',
       reason,
       result_attempt_id: result.attempt_id,
+      result_workflow_epoch: result.workflow_epoch,
       result_generation: result.generation,
       result_lease_id: result.lease_id,
       expected_attempt_id: cur?.attempt_id ?? null,
+      expected_workflow_epoch: cur?.workflow_epoch ?? null,
       expected_generation: cur?.generation ?? null,
       expected_lease_id: cur?.lease_id ?? null,
     });
@@ -210,6 +227,7 @@ export class Supervisor {
     return {
       ...task,
       attempt: {
+        workflow_epoch: this.workflowEpoch,
         logical_task_id: task.id,
         attempt_id: id.attempt_id,
         generation: id.generation,
@@ -225,6 +243,28 @@ export class Supervisor {
     const reason = previousFailure.slice(0, 200);
     const note = `[supervisor] previous attempt ${generation - 1} failed: ${reason}`;
     return { ...task, notes: task.notes ? `${task.notes}\n${note}` : note };
+  }
+
+  private taskHash(task: AgentTask): string {
+    const notes = task.notes
+      .split(/\r?\n/)
+      .filter((line) => !line.startsWith('[supervisor] previous attempt '))
+      .join('\n');
+    return sha256(JSON.stringify({
+      id: task.id,
+      role: task.role,
+      tier: task.tier ?? null,
+      objective: task.objective,
+      canonical_files: task.canonical_files,
+      code_files: task.code_files,
+      write_scope: task.write_scope,
+      acceptance_criteria: task.acceptance_criteria,
+      verification_commands: task.verification_commands,
+      return_format: task.return_format,
+      notes,
+      expert_profiles: task.expert_profiles,
+      canonical_baseline: task.canonical_baseline,
+    }));
   }
 
   private blockedResult(
@@ -254,6 +294,7 @@ export class Supervisor {
           },
         },
         scope_requests: [],
+        workflow_epoch: record.workflow_epoch,
         attempt_id: record.attempt_id,
         generation: record.generation,
         lease_id: record.lease_id,
@@ -277,6 +318,7 @@ export class Supervisor {
         },
       },
       scope_requests: [],
+      workflow_epoch: record.workflow_epoch,
       attempt_id: record.attempt_id,
       generation: record.generation,
       lease_id: record.lease_id,
@@ -302,6 +344,7 @@ export class Supervisor {
         },
       },
       scope_requests: [],
+      workflow_epoch: record.workflow_epoch,
       attempt_id: record.attempt_id,
       generation: record.generation,
       lease_id: record.lease_id,
@@ -343,96 +386,155 @@ export class Supervisor {
     const role: ModelRole = opts.role ?? task.role;
     const logicalId = task.id;
     const startedWall = this.clock.now();
-    const idempotencyKey = sha256(logicalId).slice(0, 32);
+    const taskHash = this.taskHash(task);
+    const idempotencyKey = sha256(`${this.workflowEpoch}:${logicalId}`).slice(0, 32);
 
     const prior = this.store.read(logicalId);
-    if (prior?.state === 'EXHAUSTED') {
+    const sameEpochPrior =
+      prior?.workflow_epoch === this.workflowEpoch ? prior : null;
+    const crossEpochPrior =
+      prior && prior.workflow_epoch !== this.workflowEpoch ? prior : null;
+    if (
+      crossEpochPrior &&
+      crossEpochPrior.state !== 'SUCCEEDED' &&
+      crossEpochPrior.state !== 'FAILED' &&
+      crossEpochPrior.state !== 'CANCELLED' &&
+      crossEpochPrior.state !== 'EXHAUSTED'
+    ) {
+      const fenced = crossEpochPrior.revoked_leases.includes(crossEpochPrior.lease_id)
+        ? crossEpochPrior
+        : this.store.patch(
+            crossEpochPrior,
+            {
+              revoked_leases: [
+                ...new Set([
+                  ...crossEpochPrior.revoked_leases,
+                  crossEpochPrior.lease_id,
+                ]),
+              ],
+              workspace_id: null,
+              workspace_path: null,
+            },
+            'cross_epoch_refused',
+            {
+              requested_workflow_epoch: this.workflowEpoch,
+              revoked_lease_id: crossEpochPrior.lease_id,
+            },
+          );
+      return this.durableConflictResult(fenced);
+    }
+    if (sameEpochPrior?.state === 'EXHAUSTED') {
       return this.blockedResult(
-        prior,
-        prior.last_error ? [prior.last_error] : [],
-        prior.replacement_count,
+        sameEpochPrior,
+        sameEpochPrior.last_error ? [sameEpochPrior.last_error] : [],
+        sameEpochPrior.replacement_count,
         'replacement budget already exhausted',
       );
     }
+    const repeatedCompletedTask =
+      sameEpochPrior?.state === 'SUCCEEDED' &&
+      sameEpochPrior.task_hash !== taskHash &&
+      !opts.replaceAfterValidationFailure
+        ? sameEpochPrior
+        : null;
     const validationPrior =
-      prior?.state === 'SUCCEEDED' && opts.replaceAfterValidationFailure
-        ? prior
+      sameEpochPrior?.state === 'SUCCEEDED' && opts.replaceAfterValidationFailure
+        ? sameEpochPrior
         : null;
     const validationReplacement = validationPrior
       ? opts.replaceAfterValidationFailure!
       : null;
     const replay = this.controller.replayAttempt?.(task) ?? null;
     const replayMatchesPrior =
-      prior !== null &&
+      sameEpochPrior !== null &&
       replay !== null &&
-      replay.logical_task_id === prior.logical_task_id &&
-      replay.attempt_id === prior.attempt_id &&
-      replay.generation === prior.generation &&
-      replay.lease_id === prior.lease_id &&
-      replay.idempotency_key === prior.idempotency_key;
+      replay.workflow_epoch === sameEpochPrior.workflow_epoch &&
+      replay.logical_task_id === sameEpochPrior.logical_task_id &&
+      replay.attempt_id === sameEpochPrior.attempt_id &&
+      replay.generation === sameEpochPrior.generation &&
+      replay.lease_id === sameEpochPrior.lease_id &&
+      replay.idempotency_key === sameEpochPrior.idempotency_key;
     const resumesNativeRequest =
-      prior?.state === 'AWAITING_NATIVE_RESULT' &&
+      sameEpochPrior?.state === 'AWAITING_NATIVE_RESULT' &&
       replayMatchesPrior &&
-      !prior.revoked_leases.includes(prior.lease_id);
+      !sameEpochPrior.revoked_leases.includes(sameEpochPrior.lease_id);
     const replaysValidatedNativeResult =
-      prior?.state === 'SUCCEEDED' &&
+      sameEpochPrior?.state === 'SUCCEEDED' &&
       replayMatchesPrior &&
-      !prior.revoked_leases.includes(prior.lease_id);
+      !sameEpochPrior.revoked_leases.includes(sameEpochPrior.lease_id);
     const supersedesAwaitingNativeRequest =
-      prior?.state === 'AWAITING_NATIVE_RESULT' && !resumesNativeRequest;
+      sameEpochPrior?.state === 'AWAITING_NATIVE_RESULT' && !resumesNativeRequest;
     const reusesNativeIdentity =
-      !validationReplacement && (resumesNativeRequest || replaysValidatedNativeResult);
+      !validationReplacement &&
+      !repeatedCompletedTask &&
+      (resumesNativeRequest || replaysValidatedNativeResult);
     const resumesRecoveredReplacement =
-      prior?.state === 'REPLACING' &&
-      prior.workspace_id === null &&
-      prior.revoked_leases.includes(prior.lease_id);
+      sameEpochPrior?.state === 'REPLACING' &&
+      sameEpochPrior.workspace_id === null &&
+      sameEpochPrior.revoked_leases.includes(sameEpochPrior.lease_id);
     let generation = validationPrior
       ? validationPrior.generation + 1
+      : repeatedCompletedTask
+        ? repeatedCompletedTask.generation + 1
       : resumesRecoveredReplacement
-        ? prior.generation + 1
+        ? sameEpochPrior!.generation + 1
       : supersedesAwaitingNativeRequest
-        ? prior.generation + 1
+        ? sameEpochPrior!.generation + 1
       : reusesNativeIdentity
-        ? prior.generation
+        ? sameEpochPrior!.generation
         : 1;
     let identity: AttemptIdentity = reusesNativeIdentity
       ? {
-          attempt_id: prior.attempt_id,
-          generation: prior.generation,
-          lease_id: prior.lease_id,
+          attempt_id: sameEpochPrior!.attempt_id,
+          generation: sameEpochPrior!.generation,
+          lease_id: sameEpochPrior!.lease_id,
         }
       : this.mkIdentity(logicalId, generation);
 
     const supersededLeases = validationPrior
       ? [...new Set([...validationPrior.revoked_leases, validationPrior.lease_id])]
+      : repeatedCompletedTask
+        ? [
+            ...new Set([
+              ...repeatedCompletedTask.revoked_leases,
+              repeatedCompletedTask.lease_id,
+            ]),
+          ]
       : resumesRecoveredReplacement
-        ? prior.revoked_leases
+        ? sameEpochPrior!.revoked_leases
       : supersedesAwaitingNativeRequest
-        ? [...new Set([...prior.revoked_leases, prior.lease_id])]
-        : [];
+        ? [...new Set([...sameEpochPrior!.revoked_leases, sameEpochPrior!.lease_id])]
+        : crossEpochPrior
+          ? [...new Set([
+              ...crossEpochPrior.revoked_leases,
+              crossEpochPrior.lease_id,
+            ])]
+          : [];
     if (supersededLeases.length > 0) {
       this.store.emit(logicalId, 'native_identity_superseded', {
-        attempt_id: prior?.attempt_id,
-        generation: prior?.generation,
-        lease_id: prior?.lease_id,
+        attempt_id: sameEpochPrior?.attempt_id ?? crossEpochPrior?.attempt_id,
+        generation: sameEpochPrior?.generation ?? crossEpochPrior?.generation,
+        lease_id: sameEpochPrior?.lease_id ?? crossEpochPrior?.lease_id,
         reason: validationReplacement
           ? `Deterministic validation rejected the result: ${validationReplacement.reason.slice(0, 400)}`
           : 'The task content changed before native result validation.',
       });
     }
     let deferredNativeWorkspace =
-      prior && reusesNativeIdentity && task.workspace?.id !== prior.workspace_id
-        ? this.managedWorkspace(prior)
+      sameEpochPrior && reusesNativeIdentity && task.workspace?.id !== sameEpochPrior.workspace_id
+        ? this.managedWorkspace(sameEpochPrior)
         : null;
-    if (prior && supersedesAwaitingNativeRequest) {
-      this.discardSupersededWorkspace(prior, task);
+    if (sameEpochPrior && supersedesAwaitingNativeRequest) {
+      this.discardSupersededWorkspace(sameEpochPrior, task);
     }
     const initial = TaskRecordSchema.parse({
+      workflow_epoch: this.workflowEpoch,
       logical_task_id: logicalId,
       attempt_id: identity.attempt_id,
       generation,
       lease_id: identity.lease_id,
       idempotency_key: idempotencyKey,
+      task_hash: taskHash,
       role,
       expert_profiles: opts.expertProfiles ?? task.expert_profiles ?? [],
       host: this.controller.host,
@@ -474,7 +576,7 @@ export class Supervisor {
       attempt_id: identity.attempt_id,
       generation,
       lease_id: identity.lease_id,
-      replacement_count: (prior?.replacement_count ?? 0) + 1,
+      replacement_count: (sameEpochPrior?.replacement_count ?? 0) + 1,
       finished_at: null,
       revoked_leases: supersededLeases,
       role,
@@ -482,6 +584,7 @@ export class Supervisor {
       workspace_id: task.workspace?.id ?? null,
       workspace_path: task.workspace?.root ?? null,
       canonical_baseline_hash: task.canonical_baseline ?? null,
+      task_hash: taskHash,
       host_session_id: null,
       host_thread_id: null,
       host_turn_id: null,
@@ -502,48 +605,66 @@ export class Supervisor {
             revoked_lease_id: validationPrior.lease_id,
           },
         )
+      : repeatedCompletedTask
+        ? this.store.transition(
+            repeatedCompletedTask,
+            'REPLACING',
+            {
+              ...replacementPatch,
+              replacement_count: 0,
+              last_error: null,
+            },
+            {
+              reason: 'same workflow epoch started a new semantic occurrence',
+              prior_task_hash: repeatedCompletedTask.task_hash,
+              task_hash: taskHash,
+              revoked_lease_id: repeatedCompletedTask.lease_id,
+            },
+          )
       : resumesRecoveredReplacement
         ? this.store.patch(
-            prior,
+            sameEpochPrior!,
             replacementPatch,
             'recovery_replacement_prepared',
             {
-              prior_attempt_id: prior.attempt_id,
-              prior_generation: prior.generation,
-              prior_lease_id: prior.lease_id,
-              replacement_count: prior.replacement_count + 1,
+              prior_attempt_id: sameEpochPrior!.attempt_id,
+              prior_generation: sameEpochPrior!.generation,
+              prior_lease_id: sameEpochPrior!.lease_id,
+              replacement_count: sameEpochPrior!.replacement_count + 1,
             },
           )
       : supersedesAwaitingNativeRequest
         ? this.store.patch(
-            prior,
+            sameEpochPrior!,
             {
               ...replacementPatch,
-              replacement_count: prior.replacement_count,
+              replacement_count: sameEpochPrior!.replacement_count,
             },
             'native_identity_replaced',
             {
-              prior_attempt_id: prior.attempt_id,
-              prior_generation: prior.generation,
-              prior_lease_id: prior.lease_id,
+              prior_attempt_id: sameEpochPrior!.attempt_id,
+              prior_generation: sameEpochPrior!.generation,
+              prior_lease_id: sameEpochPrior!.lease_id,
               reason: 'task content changed before native result validation',
             },
           )
       : resumesNativeRequest
-        ? prior
+        ? sameEpochPrior!
       : replaysValidatedNativeResult
         ? this.store.requeueExisting(
-            prior,
+            sameEpochPrior!,
             {},
             {
-              attempt_id: prior.attempt_id,
-              generation: prior.generation,
-              lease_id: prior.lease_id,
+              attempt_id: sameEpochPrior!.attempt_id,
+              generation: sameEpochPrior!.generation,
+              lease_id: sameEpochPrior!.lease_id,
               reason: 'exact validated native result replay',
             },
           )
-      : prior
-        ? this.durableConflictResult(prior)
+      : crossEpochPrior
+        ? this.store.rolloverTerminal(crossEpochPrior, initial)
+      : sameEpochPrior
+        ? this.durableConflictResult(sameEpochPrior)
         : this.store.create(initial);
 
     if (!('state' in activeRecord)) return activeRecord;
@@ -693,6 +814,7 @@ export class Supervisor {
             files_written: [],
             payload: { diagnostic: { logical_task_id: logicalId, final_state: st.record.state, cause: reason } },
             scope_requests: [],
+            workflow_epoch: st.record.workflow_epoch,
             attempt_id: st.record.attempt_id,
             generation: st.record.generation,
             lease_id: st.record.lease_id,
@@ -760,6 +882,7 @@ export class Supervisor {
         files_written: [],
         payload: { diagnostic: { logical_task_id: logicalId, error: errMsg(err), final_state: cur?.state ?? 'unknown' } },
         scope_requests: [],
+        workflow_epoch: cur?.workflow_epoch ?? this.workflowEpoch,
         attempt_id: cur?.attempt_id ?? null,
         generation: cur?.generation ?? null,
         lease_id: cur?.lease_id ?? null,
@@ -810,7 +933,11 @@ export class Supervisor {
       // Result evaluation (used by both the host result promise and out-of-band ingestion).
       const evaluate = (r: AgentResult): { accept: boolean; ok: boolean; reason: string } => {
         const cur = st.record;
-        const matches = r.attempt_id === cur.attempt_id && r.generation === cur.generation && r.lease_id === cur.lease_id;
+        const matches =
+          r.workflow_epoch === cur.workflow_epoch &&
+          r.attempt_id === cur.attempt_id &&
+          r.generation === cur.generation &&
+          r.lease_id === cur.lease_id;
         const admits = cur.state === 'RUNNING' || cur.state === 'SUSPECT';
         const notRevoked = r.lease_id != null && !cur.revoked_leases.includes(r.lease_id);
         if (!matches) return { accept: false, ok: r.ok, reason: 'identity mismatch (stale generation/lease/attempt)' };

@@ -23,6 +23,7 @@ const NativeLifecycleEventNameSchema = z.enum([
 ]);
 
 export const NativeLifecycleEventSchema = NativeRequestV2Schema.pick({
+  workflow_epoch: true,
   request_id: true,
   request_hash: true,
   logical_task_id: true,
@@ -52,6 +53,7 @@ export function createNativeLifecycleEvent(
   options: LifecycleOptions,
 ): NativeLifecycleEvent {
   return NativeLifecycleEventSchema.parse({
+    workflow_epoch: request.workflow_epoch,
     request_id: request.request_id,
     request_hash: request.request_hash,
     logical_task_id: request.logical_task_id,
@@ -74,6 +76,7 @@ function fileId(value: string): string {
 
 function sameRequest(event: NativeLifecycleEvent, request: NativeRequestV2): boolean {
   return (
+    event.workflow_epoch === request.workflow_epoch &&
     event.request_id === request.request_id &&
     event.request_hash === request.request_hash &&
     event.logical_task_id === request.logical_task_id &&
@@ -95,11 +98,13 @@ export class NativeLifecycleLedger {
     return path.join(this.paths.runtimeDir, 'native-lifecycle.jsonl');
   }
 
-  private requestFile(request: Pick<NativeRequestV2, 'logical_task_id' | 'attempt_id'>): string {
+  private requestFile(
+    request: Pick<NativeRequestV2, 'workflow_epoch' | 'logical_task_id' | 'attempt_id'>,
+  ): string {
     return path.join(
       this.paths.runtimeDir,
       'native-requests',
-      `${fileId(request.logical_task_id)}.${fileId(request.attempt_id)}.json`,
+      `${fileId(request.workflow_epoch)}.${fileId(request.logical_task_id)}.${fileId(request.attempt_id)}.json`,
     );
   }
 
@@ -108,6 +113,7 @@ export class NativeLifecycleLedger {
     const record = this.store.read(request.logical_task_id);
     if (!record) throw new Error(`No supervised task record exists for ${request.logical_task_id}.`);
     if (
+      record.workflow_epoch !== request.workflow_epoch ||
       record.attempt_id !== request.attempt_id ||
       record.generation !== request.generation ||
       record.lease_id !== request.lease_id ||
@@ -136,6 +142,7 @@ export class NativeLifecycleLedger {
     const record = this.store.read(event.logical_task_id);
     if (
       !record ||
+      record.workflow_epoch !== event.workflow_epoch ||
       record.attempt_id !== event.attempt_id ||
       record.generation !== event.generation ||
       record.lease_id !== event.lease_id ||

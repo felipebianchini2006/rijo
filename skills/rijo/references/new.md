@@ -30,7 +30,8 @@ It does not execute roadmap phases.
 24. Validate the new project context.
 25. Read `native-results.md`.
 26. Record the native research and planning results in a result bundle.
-27. Run `node .rijo/bin/rijo.cjs internal project-init @PLAN.md --results @.rijo/runtime/native-results.json`.
+27. Run `node .rijo/bin/rijo.cjs internal workflow-open new @PLAN.md` once for this public command.
+28. Run `node .rijo/bin/rijo.cjs internal project-init @PLAN.md --results @.rijo/runtime/native-results.json`.
 
 Publish `[RIJO M001] SCOPE_PARSE` before scope extraction.
 Publish `[RIJO M001] PROJECT_RESEARCH` before research.

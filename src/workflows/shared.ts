@@ -38,6 +38,11 @@ import {
   type PendingDecision,
 } from '../core/decisions.js';
 import { TaskStore } from '../supervisor/store.js';
+import {
+  createWorkflowEpoch,
+  WorkflowEpochSchema,
+  type WorkflowEpoch,
+} from '../core/workflow-epoch.js';
 
 export type { DispatchRouting } from './routing.js';
 
@@ -93,6 +98,8 @@ export interface WorkflowContext {
   hostProvider: RijoConfig['host']['provider'];
   durable: DurableWorkflowEngine | null;
   durableRun: DurableRunBinding | null;
+  /** One durable identity for the complete authorized workflow operation. */
+  workflowEpoch: WorkflowEpoch;
   /** Same-context production gate used by autonomous run completion. */
   finalCheck?: (ctx: WorkflowContext, opts: { production?: boolean; fix?: boolean }) => Promise<WorkflowOutcome>;
   /** Crash-injection and durability hooks shared by canonical transactions, including codebase-map promotion. */
@@ -141,6 +148,8 @@ export interface WorkflowDeps {
   planHooks?: WorkflowContext['planHooks'];
   /** test seam: fault injection between task patch apply and task projection. */
   taskPatchHooks?: WorkflowContext['taskPatchHooks'];
+  /** Authorized workflow identity. Native helpers and resume must reuse it. */
+  workflowEpoch?: WorkflowEpoch;
 }
 
 export function createContext(projectRoot: string, deps: WorkflowDeps = {}): WorkflowContext {
@@ -148,6 +157,11 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
   const now = deps.now ?? (() => new Date());
   const config = loadConfig(paths);
   const runner = deps.runner ?? new UnboundAgentRunner();
+  const workflowEpoch = WorkflowEpochSchema.parse(
+    deps.workflowEpoch ??
+      (runner as AgentRunner & { workflowEpoch?: WorkflowEpoch }).workflowEpoch ??
+      createWorkflowEpoch(),
+  );
   // The executor is the ONLY path to an agent: dispatch/dispatchBatch never
   // touch the runner directly. The default supervises the in-process runner;
   // a real host controller can be injected (deps.executor) unchanged.
@@ -163,7 +177,15 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     max_replacements_per_task: 0,
     replacement_backoff_ms: [],
   };
-  const executor = deps.executor ?? defaultExecutorFor(runner, supervisorConfig, paths, deps.clock);
+  const executor =
+    deps.executor ??
+    defaultExecutorFor(
+      runner,
+      supervisorConfig,
+      paths,
+      workflowEpoch,
+      deps.clock,
+    );
   return {
     projectRoot,
     paths,
@@ -177,6 +199,7 @@ export function createContext(projectRoot: string, deps: WorkflowDeps = {}): Wor
     hostProvider: deps.hostProvider ?? config.host.provider,
     durable: deps.durable ?? null,
     durableRun: null,
+    workflowEpoch,
     ...(deps.finalCheck ? { finalCheck: deps.finalCheck } : {}),
     txnHooks: deps.txnHooks ?? {},
     finalizeHooks: deps.finalizeHooks ?? {},
@@ -192,9 +215,10 @@ function defaultExecutorFor(
   runner: AgentRunner,
   supervisorConfig: SupervisorConfig,
   paths: RijoPaths,
+  workflowEpoch: WorkflowEpoch,
   clock?: Clock,
 ): TaskExecutor {
-  return defaultExecutor(runner, supervisorConfig, paths, clock);
+  return defaultExecutor(runner, supervisorConfig, paths, workflowEpoch, clock);
 }
 
 export class BlockedError extends Error {

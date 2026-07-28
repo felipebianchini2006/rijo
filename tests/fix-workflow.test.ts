@@ -56,7 +56,7 @@ describe('rijo fix', () => {
 
     const fixes = fs.readdirSync(new RijoPaths(root).fixesDir);
     expect(fixes).toHaveLength(1);
-    expect(fixes[0]).toMatch(/^\d{8}-\d{4}-checkout-quebra/);
+    expect(fixes[0]).toMatch(/^[a-f0-9]{12}-checkout-quebra/);
     const record = fs.readFileSync(path.join(new RijoPaths(root).fixesDir, fixes[0]!), 'utf8');
     expect(record).toContain('status: DONE');
     expect(record).toContain('Root cause');

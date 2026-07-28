@@ -8,7 +8,8 @@ Continue until all phases are complete or a true blocker occurs.
 2. Resume an interrupted phase when a valid checkpoint exists.
 3. Select the first incomplete roadmap phase.
 4. Delegate the bounded phase work with native subagents.
-5. Run `node .rijo/bin/rijo.cjs internal phase-open [NN] --results @.rijo/runtime/native-results.json`.
+5. Run `node .rijo/bin/rijo.cjs internal workflow-open start` once for this public command.
+6. Run `node .rijo/bin/rijo.cjs internal phase-open [NN] --results @.rijo/runtime/native-results.json`.
 6. Refresh a stale brownfield map incrementally after verified changes.
 7. Select the next incomplete phase.
 8. Repeat the cycle.

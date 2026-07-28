@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { parseArgs } from 'node:util';
 import { RijoPaths } from '../core/paths.js';
-import { appendLine, ensureDir, readJson, writeFileAtomic, writeJsonAtomic } from '../core/fsx.js';
+import { appendLine, ensureDir, readJson, sha256, writeFileAtomic, writeJsonAtomic } from '../core/fsx.js';
 import { TaskRecordSchema, type TaskRecord } from '../core/schemas/index.js';
 import { readStatus, renderStatusLine, stderrSink } from '../core/progress.js';
 import { readState } from '../core/state.js';
@@ -13,7 +13,11 @@ import { readManifest, RIJO_VERSION } from '../core/manifest.js';
 import { lintPlan, readPlan } from '../core/plan.js';
 import { newWorkflow } from '../workflows/new.js';
 import { runWorkflow } from '../workflows/run.js';
-import { recoverNativeState, resumeWorkflow } from '../workflows/resume.js';
+import {
+  recoverNativeState,
+  resumeWorkflow,
+  selectResumeRoute,
+} from '../workflows/resume.js';
 import { startWorkflow } from '../workflows/run.js';
 import { uiWorkflow } from '../workflows/ui.js';
 import { fixWorkflow } from '../workflows/fix.js';
@@ -44,6 +48,15 @@ import { activeMilestone } from '../core/milestones.js';
 import { readRequirements, readRoadmap } from '../core/roadmap.js';
 import { SystemShellRunner } from '../core/commands.js';
 import { openQaCheckpoint } from '../workflows/qa-checkpoint.js';
+import { acquireLock } from '../core/locks.js';
+import {
+  createWorkflowEpoch,
+  markWorkflowOperationTerminal,
+  openWorkflowOperation,
+  readWorkflowOperation,
+  requireWorkflowOperation,
+  type WorkflowEpoch,
+} from '../core/workflow-epoch.js';
 
 /**
  * Workflow commands: map-codebase, new, ui, start, test, fix, finish, next, and resume.
@@ -186,12 +199,76 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       return statusCli(rest, cwd);
     case 'resume': {
       if (rest.length > 0) return usage('rijo resume');
-      return withNative(cwd, deps, (d) => resumeWorkflow(cwd, d));
+      const paths = new RijoPaths(cwd);
+      let operation = readWorkflowOperation(paths);
+      if (!operation || operation.status !== 'ACTIVE') {
+        const route = selectResumeRoute(cwd);
+        const operationName = route.route === 'complete' ? 'finish' : route.route;
+        const anchor =
+          route.route === 'fix'
+            ? [
+                route.options.description,
+                ...(route.options.evidenceFiles ?? []).map((value) => `@${value}`),
+              ]
+            : [];
+        const lock = acquireLock(
+          paths.lock,
+          `workflow-resume-${createWorkflowEpoch()}`,
+          () => new Date(),
+        );
+        try {
+          operation = openWorkflowOperation(
+            paths,
+            operationName,
+            workflowOperationKey(cwd, operationName, anchor),
+          );
+        } finally {
+          lock.release();
+        }
+      }
+      const workflowEpoch = operation.workflow_epoch;
+      return withNative(
+        cwd,
+        { ...deps, workflowEpoch },
+        (d) => resumeWorkflow(cwd, d),
+        {
+          workflowEpoch,
+          onOutcome: (outcome) => {
+            markWorkflowOperationTerminal(paths, workflowEpoch, outcome.status);
+          },
+        },
+      );
     }
     case 'internal': {
       const { resultFile, args: internalArgs } = extractNativeResultsFlag(rest);
       const [helper, ...helperArgs] = internalArgs;
       if (helper === 'status') return statusCli(helperArgs, cwd);
+      if (helper === 'workflow-open') {
+        const operation = helperArgs[0];
+        if (!operation || helperArgs.length < 1) {
+          return usage('rijo internal workflow-open OPERATION [ANCHOR...]');
+        }
+        try {
+          const operationKey = workflowOperationKey(cwd, operation, helperArgs.slice(1));
+          const paths = new RijoPaths(cwd);
+          const lock = acquireLock(
+            paths.lock,
+            `workflow-open-${createWorkflowEpoch()}`,
+            () => new Date(),
+          );
+          let opened;
+          try {
+            opened = openWorkflowOperation(paths, operation, operationKey);
+          } finally {
+            lock.release();
+          }
+          console.log(JSON.stringify(opened));
+          return 0;
+        } catch (error) {
+          console.error(`rijo: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
       if (
         [
           'task-dispatch',
@@ -325,7 +402,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       if (helper === 'map-codebase') {
         if (!resultFile) return usage('rijo internal map-codebase --results @.rijo/runtime/native-results.json');
         if (helperArgs.length > 0) return usage('rijo internal map-codebase --results @.rijo/runtime/native-results.json');
-        return withNativeResults(cwd, resultFile, deps, (d) => mapWorkflow(cwd, {}, d));
+        return withNativeResults(cwd, resultFile, deps, 'map-codebase', [], (d) => mapWorkflow(cwd, {}, d));
       }
       if (helper === 'project-init') {
         const plan = helperArgs[0];
@@ -335,7 +412,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         if (!resultFile) {
           return usage('rijo internal project-init @PLAN.md --results @.rijo/runtime/native-results.json');
         }
-        return withNativeResults(cwd, resultFile, deps, (d) => newWorkflow(cwd, { planFile: plan }, d));
+        return withNativeResults(cwd, resultFile, deps, 'new', [plan], (d) => newWorkflow(cwd, { planFile: plan }, d));
       }
       if (helper === 'ui-import') {
         if (helperArgs.length === 0) {
@@ -344,7 +421,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         if (!resultFile) {
           return usage('rijo internal ui-import @index.html [@design.zip] --results @.rijo/runtime/native-results.json');
         }
-        return withNativeResults(cwd, resultFile, deps, (d) =>
+        return withNativeResults(cwd, resultFile, deps, 'ui', helperArgs, (d) =>
           uiWorkflow(cwd, { inputs: helperArgs }, d),
         );
       }
@@ -357,7 +434,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         if (!resultFile) {
           return usage('rijo internal fix-open "issue description" [@evidence] --results @.rijo/runtime/native-results.json');
         }
-        return withNativeResults(cwd, resultFile, deps, (d) =>
+        return withNativeResults(cwd, resultFile, deps, 'fix', helperArgs, (d) =>
           fixWorkflow(cwd, { description, evidenceFiles }, d),
         );
       }
@@ -367,7 +444,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         if (!resultFile) {
           return usage('rijo internal next-init @NEXT-PLAN.md --results @.rijo/runtime/native-results.json');
         }
-        return withNativeResults(cwd, resultFile, deps, (d) => nextWorkflow(cwd, plan, d));
+        return withNativeResults(cwd, resultFile, deps, 'next', [plan], (d) => nextWorkflow(cwd, plan, d));
       }
       if (helper === 'phase-open') {
         const phase = helperArgs[0];
@@ -377,7 +454,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         if (!resultFile) {
           return usage('rijo internal phase-open [NN] --results @.rijo/runtime/native-results.json');
         }
-        return withNativeResults(cwd, resultFile, deps, (d) =>
+        return withNativeResults(cwd, resultFile, deps, 'start', [], (d) =>
           runWorkflow(cwd, { target: phase, finalCheck: false }, d),
         );
       }
@@ -426,7 +503,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
       if (helper === 'qa-record') {
         if (helperArgs.length > 0) return usage('rijo internal qa-record');
         if (!resultFile) return usage('rijo internal qa-record --results @.rijo/runtime/native-results.json');
-        return withNativeResults(cwd, resultFile, deps, (d) => testWorkflow(cwd, {}, d));
+        return withNativeResults(cwd, resultFile, deps, 'test', [], (d) => testWorkflow(cwd, {}, d));
       }
       if (helper === 'milestone-finish') {
         if (helperArgs.length > 0) return usage('rijo internal milestone-finish');
@@ -437,7 +514,7 @@ export async function runCli(argv: string[], deps: WorkflowDeps = {}, cwd = proc
         return withDeterministic(cwd, deps, (d) => recoverNativeState(cwd, d));
       }
       return usage(
-        'rijo internal status|task-dispatch|task-start|task-observe|task-complete|task-fail|task-timeout|task-cancelled|task-cancel-unavailable|safe-command|map-codebase|project-init|ui-import|fix-open|next-init|phase-open|plan-validate|qa-open|qa-record|milestone-finish|recovery',
+        'rijo internal status|workflow-open|task-dispatch|task-start|task-observe|task-complete|task-fail|task-timeout|task-cancelled|task-cancel-unavailable|safe-command|map-codebase|project-init|ui-import|fix-open|next-init|phase-open|plan-validate|qa-open|qa-record|milestone-finish|recovery',
       );
     }
     case 'install': {
@@ -509,6 +586,10 @@ async function withNative(
   cwd: string,
   deps: WorkflowDeps,
   body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
+  options: {
+    workflowEpoch?: WorkflowEpoch;
+    onOutcome?: (outcome: WorkflowOutcome) => void;
+  } = {},
 ): Promise<number> {
   if (!deps.runner && !deps.executor) {
     return report({
@@ -519,7 +600,17 @@ async function withNative(
   }
   const durableBinding = await attachProductionDurableEngine(cwd, deps);
   try {
-    return report(await body({ ...durableBinding.deps, hostProvider: 'none' }));
+    const workflowEpoch =
+      options.workflowEpoch ??
+      deps.workflowEpoch ??
+      createWorkflowEpoch();
+    const outcome = await body({
+      ...durableBinding.deps,
+      hostProvider: 'none',
+      workflowEpoch,
+    });
+    options.onOutcome?.(outcome);
+    return report(outcome);
   } finally {
     await closeOwnedDurable(durableBinding);
   }
@@ -543,16 +634,28 @@ async function withNativeResults(
   cwd: string,
   resultFile: string,
   deps: WorkflowDeps,
+  operation: string,
+  operationAnchor: string[],
   body: (deps: WorkflowDeps) => Promise<WorkflowOutcome>,
 ): Promise<number> {
   const file = path.resolve(cwd, resultFile.replace(/^@/, ''));
   if (!fs.existsSync(file)) return usage(`native result bundle not found: ${resultFile}`);
+  const paths = new RijoPaths(cwd);
+  let workflowEpoch: WorkflowEpoch;
+  try {
+    workflowEpoch = requireWorkflowOperation(
+      paths,
+      operation,
+      workflowOperationKey(cwd, operation, operationAnchor),
+    ).workflow_epoch;
+  } catch (error) {
+    return usage(error instanceof Error ? error.message : String(error));
+  }
   let runner: NativeResultRunner;
   try {
-    runner = new NativeResultRunner(file);
+    runner = new NativeResultRunner(file, workflowEpoch);
   } catch (error) {
     if (!(error instanceof NativeProtocolUpgradeError)) throw error;
-    const paths = new RijoPaths(cwd);
     const archiveDir = path.join(paths.runtimeDir, 'native-v1-archive');
     ensureDir(archiveDir);
     const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '');
@@ -565,10 +668,53 @@ async function withNativeResults(
       results: [],
     });
     console.error(`rijo: archived a native v1 bundle at ${path.relative(cwd, archive)} and created a v2 bundle.`);
-    runner = new NativeResultRunner(file);
+    runner = new NativeResultRunner(file, workflowEpoch);
   }
   const supervisorConfig = deps.supervisorConfig ?? loadConfig(new RijoPaths(cwd)).supervisor;
-  return withNative(cwd, { ...deps, runner, supervisorConfig }, body);
+  return withNative(
+    cwd,
+    { ...deps, runner, supervisorConfig, workflowEpoch },
+    body,
+    {
+      workflowEpoch,
+      onOutcome: (outcome) => {
+        markWorkflowOperationTerminal(paths, workflowEpoch, outcome.status);
+      },
+    },
+  );
+}
+
+function workflowOperationKey(cwd: string, operation: string, anchor: string[]): string {
+  const normalized = anchor.map((value) => value.replace(/^@/, ''));
+  const content = normalized.map((value) => {
+    const candidate = path.resolve(cwd, value);
+    if (!fs.existsSync(candidate)) return { value, sha256: null };
+    const stat = fs.statSync(candidate);
+    if (stat.isFile()) {
+      return { value, sha256: sha256(fs.readFileSync(candidate)) };
+    }
+    if (stat.isDirectory()) {
+      const files: Array<{ path: string; sha256: string }> = [];
+      const visit = (directory: string): void => {
+        for (const name of fs.readdirSync(directory).sort()) {
+          const absolute = path.join(directory, name);
+          const entry = fs.lstatSync(absolute);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory()) visit(absolute);
+          else if (entry.isFile()) {
+            files.push({
+              path: path.relative(candidate, absolute).split(path.sep).join('/'),
+              sha256: sha256(fs.readFileSync(absolute)),
+            });
+          }
+        }
+      };
+      visit(candidate);
+      return { value, sha256: sha256(JSON.stringify(files)) };
+    }
+    return { value, sha256: null };
+  });
+  return sha256(JSON.stringify({ operation, content }));
 }
 
 function readHookInput(): Record<string, unknown> {
@@ -615,6 +761,7 @@ async function withHost(
   const durableBinding = await attachProductionDurableEngine(cwd, deps);
   const durableDeps = durableBinding.deps;
   const config = loadConfig(new RijoPaths(cwd));
+  const workflowEpoch = deps.workflowEpoch ?? createWorkflowEpoch();
   const provider = resolveHostProvider(hostFlag, config);
   if (typeof provider === 'object') {
     await closeOwnedDurable(durableBinding);
@@ -628,7 +775,13 @@ async function withHost(
     }
   }
 
-  const boot = await buildHostExecutor({ provider, projectRoot: cwd, config, paths: new RijoPaths(cwd) });
+  const boot = await buildHostExecutor({
+    provider,
+    projectRoot: cwd,
+    config,
+    paths: new RijoPaths(cwd),
+    workflowEpoch,
+  });
   if (!boot.ok) {
     await closeOwnedDurable(durableBinding);
     return report({ ok: false, status: 'blocked', message: boot.message, details: boot.details });
@@ -640,6 +793,7 @@ async function withHost(
         hostProvider: provider,
         executor: boot.executor,
         sink: durableDeps.sink ?? stderrSink,
+        workflowEpoch,
       }),
     );
   } finally {

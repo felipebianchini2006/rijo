@@ -318,7 +318,15 @@ export async function runFinalization(ctx: WorkflowContext, marker: FinalizeMark
     const prev = readState(paths) ?? initialState(now);
     writeState(
       paths,
-      { ...prev, milestone: milestone.id, phase: phase.id, stage: 'DONE', updated_at: now().toISOString(), ...extra },
+      {
+        ...prev,
+        workflow_epoch: ctx.workflowEpoch,
+        milestone: milestone.id,
+        phase: phase.id,
+        stage: 'DONE',
+        updated_at: now().toISOString(),
+        ...extra,
+      },
       narrative,
     );
     touchManifest(paths, () => {}, now);

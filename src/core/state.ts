@@ -40,6 +40,7 @@ export function writeState(
 
 export function initialState(now: () => Date = () => new Date()): StateFrontmatter {
   return {
+    workflow_epoch: null,
     milestone: null,
     phase: null,
     task: null,

@@ -1,6 +1,10 @@
 import { z } from 'zod';
+import {
+  LEGACY_WORKFLOW_EPOCH,
+  WorkflowEpochSchema,
+} from '../workflow-epoch.js';
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /**
  * A boolean field an LLM fills that may arrive as a string ("true"/"false"/
@@ -223,11 +227,13 @@ export function assertSupervisedTransition(taskId: string, from: SupervisedTaskS
 
 /** Durable task record: .rijo/runtime/tasks/<logical-task-id>.json */
 export const TaskRecordSchema = z.object({
+  workflow_epoch: WorkflowEpochSchema.default(LEGACY_WORKFLOW_EPOCH),
   logical_task_id: z.string(),
   attempt_id: z.string(),
   generation: z.number().int().min(1),
   lease_id: z.string(),
   idempotency_key: z.string(),
+  task_hash: z.string().regex(/^[a-f0-9]{64}$/).nullable().default(null),
   role: ModelRoleSchema,
   expert_profiles: z.array(z.string()).default([]),
   host: z.string().default('unbound'),
@@ -678,6 +684,7 @@ export const ReviewFindingTypeSchema = z.preprocess(
 export type ReviewFindingType = z.infer<typeof ReviewFindingTypeSchema>;
 
 export const StateFrontmatterSchema = z.object({
+  workflow_epoch: WorkflowEpochSchema.nullable().default(null),
   milestone: z.string().nullable(),
   phase: z.string().nullable(),
   task: z.string().nullable(),

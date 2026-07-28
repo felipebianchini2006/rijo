@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { serve } from '../src/cli/serve.js';
 import { RpcAgentRunner, type RpcTransport } from '../src/agents/rpc.js';
 import { AgentTaskSchema, type AgentTask } from '../src/agents/protocol.js';
+import { LEGACY_WORKFLOW_EPOCH } from '../src/core/workflow-epoch.js';
 import type { RunnerCapabilities } from '../src/agents/runner.js';
 import { tmpProject, cleanup, writePlanFile } from './helpers.js';
 
@@ -180,11 +181,11 @@ describe('bridge resilience — RpcAgentRunner', () => {
       const id = t.lastRunTaskId();
 
       // stale/misrouted reply with the wrong attempt echo → discarded, pending stays
-      t.deliver({ type: 'response', id, result: { task_id: 'a', ok: true, summary: 'stale', attempt_id: 'WRONG', generation: 1, lease_id: 'lease-A1' } });
+      t.deliver({ type: 'response', id, result: { task_id: 'a', ok: true, summary: 'stale', workflow_epoch: LEGACY_WORKFLOW_EPOCH, attempt_id: 'WRONG', generation: 1, lease_id: 'lease-A1' } });
       expect(runner.listPending()).toHaveLength(1);
 
       // the correct echo resolves it
-      t.deliver({ type: 'response', id, result: { task_id: 'a', ok: true, summary: 'right', attempt_id: 'A1', generation: 1, lease_id: 'lease-A1' } });
+      t.deliver({ type: 'response', id, result: { task_id: 'a', ok: true, summary: 'right', workflow_epoch: LEGACY_WORKFLOW_EPOCH, attempt_id: 'A1', generation: 1, lease_id: 'lease-A1' } });
       const r = await p;
       expect(r.ok).toBe(true);
       expect(r.summary).toBe('right');
@@ -290,6 +291,7 @@ describe('bridge resilience — serve workflow deadline', () => {
     const t = new MemoryTransport();
     const responses = new Map<number, any>();
     const startedTasks: string[] = [];
+    const workflowEpochs: string[] = [];
     const waiters = new Map<number, () => void>();
 
     // A host that NEVER answers agent.runTask → every workflow wedges on its
@@ -299,7 +301,10 @@ describe('bridge resilience — serve workflow deadline', () => {
     const originalSend = t.send.bind(t);
     t.send = (msg: any) => {
       originalSend(msg);
-      if (msg?.type === 'request' && msg.method === 'agent.runTask') startedTasks.push(msg.params.id);
+      if (msg?.type === 'request' && msg.method === 'agent.runTask') {
+        startedTasks.push(msg.params.id);
+        workflowEpochs.push(msg.params.attempt.workflow_epoch);
+      }
       if (msg?.type === 'response' && typeof msg.id === 'number') {
         responses.set(msg.id, msg);
         waiters.get(msg.id)?.();
@@ -329,6 +334,7 @@ describe('bridge resilience — serve workflow deadline', () => {
 
     // Both workflows actually reached the host (dispatched agent tasks).
     expect(startedTasks.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(workflowEpochs).size).toBeGreaterThanOrEqual(2);
 
     // Let any trailing background settlement flush before the test ends.
     await new Promise((res) => setTimeout(res, 50));

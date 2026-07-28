@@ -119,7 +119,7 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
   const inputNames = inputPaths.map((inputPath) => path.basename(inputPath));
 
   {
-    const importId = now().toISOString().replace(/[-:.TZ]/g, '').slice(0, 12);
+    const importId = ctx.workflowEpoch.slice('wep_'.length, 'wep_'.length + 12);
     const importDir = path.join(paths.importsDir, importId);
     const stagingDir = path.join(importDir, 'staging');
     ensureDir(importDir);
@@ -489,7 +489,13 @@ export async function uiCore(ctx: WorkflowContext, opts: UiOptions): Promise<Wor
     const prev = readState(paths) ?? initialState(now);
     writeState(
       paths,
-      { ...prev, milestone: milestone?.id ?? prev.milestone, next_step: '$rijo start', updated_at: now().toISOString() },
+      {
+        ...prev,
+        workflow_epoch: ctx.workflowEpoch,
+        milestone: milestone?.id ?? prev.milestone,
+        next_step: '$rijo start',
+        updated_at: now().toISOString(),
+      },
       `UI import ${importId} completed: ${conv.data.components_created.length} components, ${conv.data.routes_mapped.length} routes mapped. ${validationNote}`,
     );
     // STATE.md is hash-tracked: refresh the manifest so the next run does not

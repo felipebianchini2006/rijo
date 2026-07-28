@@ -6,6 +6,7 @@ import { ClaudeProcessController, CodexProcessController } from '../hosts/proces
 import { detectClaudeCli, detectCodexCli, type HostAvailability } from '../hosts/detect.js';
 import { nodeSpawner, type Spawner } from '../hosts/spawn.js';
 import type { Clock } from '../supervisor/clock.js';
+import { createWorkflowEpoch, type WorkflowEpoch } from '../core/workflow-epoch.js';
 
 /** Provider the operator (or config) selected. `none` means host-agnostic. */
 export type HostProvider = 'claude' | 'codex' | 'none';
@@ -30,6 +31,7 @@ export interface HostExecutorOptions {
   clock?: Clock;
   /** Legible progress/heartbeat lines (host availability, per-attempt spawn). Defaults to stderr. */
   onProgress?: (line: string) => void;
+  workflowEpoch?: WorkflowEpoch;
 }
 
 export type HostBootstrap =
@@ -78,6 +80,7 @@ export async function buildHostExecutor(opts: HostExecutorOptions): Promise<Host
     config: opts.config.supervisor,
     paths: opts.paths,
     capabilities: HOST_CAPABILITIES,
+    workflowEpoch: opts.workflowEpoch ?? createWorkflowEpoch(),
     ...(opts.clock ? { clock: opts.clock } : {}),
   });
 

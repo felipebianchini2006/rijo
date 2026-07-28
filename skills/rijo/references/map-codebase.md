@@ -12,7 +12,8 @@ Do not create a project milestone.
 7. Write or refresh `.rijo/codebase/`.
 8. Read `native-results.md`.
 9. Record each native subagent response in a result bundle.
-10. Run `node .rijo/bin/rijo.cjs internal map-codebase --results @.rijo/runtime/native-results.json`.
+10. Run `node .rijo/bin/rijo.cjs internal workflow-open map-codebase` once for this public command.
+11. Run `node .rijo/bin/rijo.cjs internal map-codebase --results @.rijo/runtime/native-results.json`.
 
 Fence stale subagent results.
 Do not infer facts that the repository does not prove.

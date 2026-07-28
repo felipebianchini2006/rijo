@@ -179,6 +179,7 @@ function failure(taskId: string, summary: string): AgentResult {
     files_written: [],
     payload: null,
     scope_requests: [],
+    workflow_epoch: null,
     attempt_id: null,
     generation: null,
     lease_id: null,
@@ -395,7 +396,17 @@ export class RpcAgentRunner implements AgentRunner {
     // Supervised attempt: the echo MUST match, else this is a stale/misrouted
     // reply. Discard it and keep the pending alive until it times out — never
     // let a stale attempt resolve the current one.
-    if (p.attempt && result.attempt_id !== p.attempt.attempt_id) return;
+    if (
+      p.attempt &&
+      (
+        result.workflow_epoch !== p.attempt.workflow_epoch ||
+        result.attempt_id !== p.attempt.attempt_id ||
+        result.generation !== p.attempt.generation ||
+        result.lease_id !== p.attempt.lease_id
+      )
+    ) {
+      return;
+    }
 
     this.settle(p, result);
   }

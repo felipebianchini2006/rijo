@@ -26,7 +26,7 @@ export class MigrationError extends Error {
  * interrupted migration is re-runnable (the version stamp only advances after
  * every artifact has been rewritten).
  *
- * v1/v2/v3/v4 → v5:
+ * v1/v2/v3/v4/v5 → v6:
  *  - PLAN.md tasks gain `status` (derived from the legacy `done` flag);
  *  - legacy task files are explicitly migrated to intent-bearing references;
  *  - legacy plans receive an invalid freshness stamp, forcing safe re-planning;
@@ -34,7 +34,8 @@ export class MigrationError extends Error {
  *    codebase-map defaults materialize deterministically through ConfigSchema;
  *  - every legacy plan receives a new invalid freshness stamp so the workflow
  *    creates a bounded three-to-six-task plan before execution;
- *  - manifest.schema_version becomes 5.
+ *  - STATE.md gains a nullable workflow epoch audit field;
+ *  - manifest.schema_version becomes 6.
  */
 export function migrateProject(paths: RijoPaths, now: () => Date = () => new Date()): MigrationReport {
   const manifest = readJsonIfExists<{ schema_version?: number }>(paths.manifest);
@@ -75,7 +76,19 @@ export function migrateProject(paths: RijoPaths, now: () => Date = () => new Dat
 
   backup(paths.manifest);
   backup(paths.config);
+  backup(paths.state);
   for (const p of planFiles) backup(p);
+
+  if (exists(paths.state)) {
+    const { data, body } = parseFrontmatter<Record<string, unknown>>(
+      readText(paths.state),
+    );
+    if (!Object.prototype.hasOwnProperty.call(data, 'workflow_epoch')) {
+      data['workflow_epoch'] = null;
+      writeFileAtomic(paths.state, serializeFrontmatter(data, body));
+      changed.push(paths.state);
+    }
+  }
 
   // ---- transform plans: done:true → status DONE, else PENDING (v1 had no
   // notion of an implemented-but-unverified task, so `done` was verified-done)
