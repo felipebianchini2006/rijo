@@ -137,4 +137,21 @@ describe('native lifecycle supervision', () => {
     expect(store.read('task-01')?.state).toBe('CANCELLED');
     expect(ledger.read().at(-1)?.termination_confirmed).toBe(true);
   });
+
+  it('waits for deterministic result validation after the native host completes', () => {
+    const { store, ledger, request } = fixture();
+    ledger.dispatch(request);
+    ledger.record(createNativeLifecycleEvent(request, 'start', {
+      host: 'claude',
+      host_handle: 'agent-11',
+    }));
+    ledger.record(createNativeLifecycleEvent(request, 'complete', {
+      host: 'claude',
+      detail: 'The result bundle is ready.',
+    }));
+
+    const record = store.read('task-01');
+    expect(record?.state).toBe('AWAITING_NATIVE_RESULT');
+    expect(record?.last_error).toContain('deterministic core must validate');
+  });
 });

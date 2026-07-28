@@ -10,6 +10,8 @@ import { AgentTaskSchema } from '../src/agents/protocol.js';
 import { detectDrift } from '../src/core/manifest.js';
 import { RijoPaths } from '../src/core/paths.js';
 import { runCli } from '../src/cli/main.js';
+import { defaultExecutor } from '../src/workflows/executor.js';
+import { defaultConfig } from '../src/core/config.js';
 import { newWorkflow } from '../src/workflows/new.js';
 import { startWorkflow } from '../src/workflows/run.js';
 import { cleanup, deps, tmpProject, writePlanFile } from './helpers.js';
@@ -75,6 +77,66 @@ describe('native result ingestion', () => {
       'lease_id',
       'idempotency_key',
     ]);
+  });
+
+  it('reuses the exact pending identity when the native helper resumes', async () => {
+    const root = tmpProject('rijo-native-resume-');
+    roots.push(root);
+    const paths = new RijoPaths(root);
+    const bundle = path.join(root, 'results.json');
+    fs.writeFileSync(bundle, JSON.stringify({ version: 2, results: [] }));
+    const task = AgentTaskSchema.parse({
+      id: 'plan-resume',
+      role: 'planner',
+      objective: 'Create the bounded phase plan.',
+      canonical_files: [],
+      code_files: [],
+      write_scope: [],
+      acceptance_criteria: ['The plan covers the phase.'],
+      verification_commands: [],
+      return_format: 'JSON plan payload.',
+    });
+    const config = {
+      ...defaultConfig().supervisor,
+      max_replacements_per_task: 0,
+      replacement_backoff_ms: [],
+    };
+    const firstExecutor = defaultExecutor(new NativeResultRunner(bundle), config, paths);
+
+    const first = await firstExecutor.run({ task, role: 'planner' });
+    expect(first.ok).toBe(false);
+    expect(new (await import('../src/supervisor/store.js')).TaskStore(paths).read(task.id)?.state)
+      .toBe('AWAITING_NATIVE_RESULT');
+    const request = JSON.parse(
+      fs.readFileSync(path.join(root, 'native-requests.jsonl'), 'utf8').trim(),
+    );
+    fs.writeFileSync(
+      bundle,
+      JSON.stringify({
+        version: 2,
+        results: [{
+          ...request,
+          ok: true,
+          summary: 'Created the plan.',
+          payload: { phases: [] },
+          files: {},
+          files_written: [],
+          scope_requests: [],
+          decision_proposals: [],
+          artifacts: [],
+        }],
+      }),
+    );
+
+    const resumedExecutor = defaultExecutor(new NativeResultRunner(bundle), config, paths);
+    const resumed = await resumedExecutor.run({ task, role: 'planner' });
+
+    expect(resumed.ok).toBe(true);
+    expect(resumed.attempt_id).toBe(request.attempt_id);
+    expect(resumed.generation).toBe(request.generation);
+    expect(resumed.lease_id).toBe(request.lease_id);
+    expect(new (await import('../src/supervisor/store.js')).TaskStore(paths).read(task.id)?.state)
+      .toBe('SUCCEEDED');
   });
 
   it('rejects a v1 bundle in the native workflow', () => {

@@ -3,6 +3,7 @@ import { sha256 } from '../core/fsx.js';
 import { RijoPaths } from '../core/paths.js';
 import { TaskRecordSchema, type SupervisorConfig, type ModelRole, type TaskRecord } from '../core/schemas/index.js';
 import type { AgentTask, AgentResult } from '../agents/protocol.js';
+import { isNativeResultPendingSummary } from '../agents/native-results.js';
 import type { HostAgentController, HostAttemptHandle } from '../hosts/controller.js';
 import { SystemClock, type Clock, type TimerHandle } from './clock.js';
 import { TaskStore } from './store.js';
@@ -40,6 +41,7 @@ interface AttemptIdentity {
 
 type AttemptOutcome =
   | { kind: 'succeeded'; result: AgentResult; record: TaskRecord }
+  | { kind: 'awaiting-native-result'; result: AgentResult; record: TaskRecord }
   | { kind: 'failed'; reason: string; record: TaskRecord }
   | { kind: 'cancelled'; reason: string; record: TaskRecord };
 
@@ -280,8 +282,18 @@ export class Supervisor {
     const startedWall = this.clock.now();
     const idempotencyKey = sha256(logicalId).slice(0, 32);
 
-    let generation = 1;
-    let identity = this.mkIdentity(logicalId, generation);
+    const prior = this.store.read(logicalId);
+    const resumesNativeRequest =
+      prior?.state === 'AWAITING_NATIVE_RESULT' &&
+      !prior.revoked_leases.includes(prior.lease_id);
+    let generation = resumesNativeRequest ? prior.generation : 1;
+    let identity: AttemptIdentity = resumesNativeRequest
+      ? {
+          attempt_id: prior.attempt_id,
+          generation: prior.generation,
+          lease_id: prior.lease_id,
+        }
+      : this.mkIdentity(logicalId, generation);
 
     const initial = TaskRecordSchema.parse({
       logical_task_id: logicalId,
@@ -301,7 +313,7 @@ export class Supervisor {
 
     const st: ActiveTask = {
       logicalId,
-      record: this.store.create(initial),
+      record: resumesNativeRequest ? prior : this.store.create(initial),
       lastProgressAt: startedWall,
       disposing: false,
     };
@@ -393,6 +405,11 @@ export class Supervisor {
           st.record = outcome.record;
 
           if (outcome.kind === 'succeeded') {
+            await this.safeDispose(handle);
+            this.active.delete(logicalId);
+            return outcome.result;
+          }
+          if (outcome.kind === 'awaiting-native-result') {
             await this.safeDispose(handle);
             this.active.delete(logicalId);
             return outcome.result;
@@ -527,6 +544,16 @@ export class Supervisor {
           if (verdict.ok) {
             set(this.store.transition(cur, 'SUCCEEDED', { finished_at: this.toIso() }));
             finish({ kind: 'succeeded', result: r, record: st.record });
+          } else if (isNativeResultPendingSummary(r.summary)) {
+            set(
+              this.store.transition(
+                cur,
+                'AWAITING_NATIVE_RESULT',
+                { finished_at: null, last_error: r.summary },
+                { native_request_pending: true },
+              ),
+            );
+            finish({ kind: 'awaiting-native-result', result: r, record: st.record });
           } else {
             const reason = `agent reported failure: ${r.summary}`;
             set(this.store.transition(cur, 'FAILED', { finished_at: this.toIso(), last_error: r.summary }));

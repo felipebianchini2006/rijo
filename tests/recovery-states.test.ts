@@ -141,6 +141,28 @@ describe('recovery — budget honors replacement_count already spent', () => {
   });
 });
 
+describe('recovery — native result pause', () => {
+  it('preserves the exact pending native identity without fencing it', async () => {
+    const root = tmpProject('rijo-recover-native-');
+    try {
+      const paths = new RijoPaths(root);
+      seed(paths, 'AWAITING_NATIVE_RESULT');
+      const before = new TaskStore(paths).read('exec-01-T01')!;
+
+      const report = await reconcileSupervisedTasks(paths, { maxReplacements: 0 });
+      const after = new TaskStore(paths).read('exec-01-T01')!;
+
+      expect(report.total).toBe(0);
+      expect(after.state).toBe('AWAITING_NATIVE_RESULT');
+      expect(after.attempt_id).toBe(before.attempt_id);
+      expect(after.lease_id).toBe(before.lease_id);
+      expect(after.revoked_leases).not.toContain(before.lease_id);
+    } finally {
+      cleanup(root);
+    }
+  });
+});
+
 describe('recovery — orphan workspace discard runs through withLock', () => {
   let root: string;
   beforeEach(() => {

@@ -178,6 +178,11 @@ async function reconcileRecord(
 ): Promise<RecoveryEntry | null> {
   const from = rec.state;
 
+  // A native helper pause is intentional. The active host writes a result
+  // bundle after this process exits. Keep the exact attempt and lease so the
+  // next helper invocation can validate that result.
+  if (from === 'AWAITING_NATIVE_RESULT') return null;
+
   // Idempotency guard: a previously-reconciled resumable record needs nothing.
   if (isReconciledResumable(rec)) return null;
 

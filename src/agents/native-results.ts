@@ -95,6 +95,12 @@ const identityFields = [
   'idempotency_key',
 ] as const;
 
+const nativeResultPendingText = 'native result bundle has no result for task';
+
+export function isNativeResultPendingSummary(summary: string): boolean {
+  return summary.toLowerCase().includes(nativeResultPendingText);
+}
+
 function requestHashInput(task: AgentTask): Omit<NativeRequestV2, 'request_id' | 'request_hash'> {
   if (!task.attempt) {
     throw new Error(`Native protocol v2 requires a supervised attempt for task ${task.id}.`);
@@ -275,15 +281,21 @@ export class NativeResultRunner implements AgentRunner {
           .trim()
           .split(/\r?\n/)
           .filter(Boolean)
-          .some((line) => {
+          .map((line) => {
             try {
-              return (JSON.parse(line) as { request_id?: string }).request_id === request.request_id;
+              return NativeRequestV2Schema.safeParse(JSON.parse(line));
             } catch {
-              return false;
+              return null;
             }
           })
-      : false;
-    if (prior) return;
+          .find((parsed) => parsed?.success && parsed.data.request_id === request.request_id)
+      : undefined;
+    if (prior?.success) {
+      if (prior.data.request_hash !== request.request_hash) {
+        throw new Error(`Native request identity ${request.request_id} was reused with different task content.`);
+      }
+      return;
+    }
     appendLine(
       this.requestFile,
       JSON.stringify(request),

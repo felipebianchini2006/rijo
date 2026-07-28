@@ -118,7 +118,7 @@ export class NativeLifecycleLedger {
     writeJsonAtomic(this.requestFile(request), request);
     const event = createNativeLifecycleEvent(request, 'dispatch', { host: record.host || 'native' });
     this.append(event);
-    if (record.state === 'QUEUED') {
+    if (record.state === 'QUEUED' || record.state === 'AWAITING_NATIVE_RESULT') {
       this.store.transition(record, 'STARTING', {}, {
         native_request_id: request.request_id,
         native_request_hash: request.request_hash,
@@ -207,9 +207,12 @@ export class NativeLifecycleLedger {
     } else if (event.event === 'complete' && ['RUNNING', 'SUSPECT'].includes(record.state)) {
       this.store.transition(
         record,
-        'SUCCEEDED',
-        { finished_at: now },
-        { native_event: event.event },
+        'AWAITING_NATIVE_RESULT',
+        {
+          finished_at: null,
+          last_error: 'The native host completed the task. The deterministic core must validate its result bundle.',
+        },
+        { native_event: event.event, result_validation_pending: true },
       );
     }
     return event;
