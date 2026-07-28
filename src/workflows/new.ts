@@ -461,25 +461,24 @@ export async function newWorkflow(
     });
     bus.emit('new.research', { stage: 'RESEARCH', message: 'Run focused technical research.' });
     const store = new ResearchStore(paths, now);
-    const researchKey = sha256(planContent).slice(0, 12);
     const requestedTopics = extraction.research_topics.map((topic) => topic.topic).join('; ');
     const topics = [
       {
-        key: `project-stack-${researchKey}`,
+        key: 'project-stack-v1',
         topic: 'Stable stack versions and official implementation practices',
         volatile: true,
         focus:
           'Select stable stack versions. Use official release, support, and implementation guidance.',
       },
       {
-        key: `project-architecture-${researchKey}`,
+        key: 'project-architecture-v1',
         topic: 'Architecture boundaries, integrations, and system limits',
         volatile: true,
         focus:
           'Define simple architecture boundaries. Validate integrations, compatibility, and operational limits.',
       },
       {
-        key: `project-risks-${researchKey}`,
+        key: 'project-risks-v1',
         topic: 'Gaps, pitfalls, data integrity, and security surfaces',
         volatile: true,
         focus:

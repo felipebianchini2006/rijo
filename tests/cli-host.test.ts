@@ -155,7 +155,7 @@ describe('config schema: host block is additive', () => {
   it("defaults host.provider to 'none' and keeps the current schema version", () => {
     const cfg = ConfigSchema.parse({});
     expect(cfg.host.provider).toBe('none');
-    expect(cfg.schema_version).toBe(4);
+    expect(cfg.schema_version).toBe(5);
   });
 
   it('accepts an explicit provider without disturbing other sections', () => {

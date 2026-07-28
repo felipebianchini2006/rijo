@@ -15,6 +15,8 @@ describe('ConfigSchema', () => {
       plan_revisions: 2,
       review_loops: 2,
       qa_fix_loops: 2,
+      qa_defect_attempts: 2,
+      qa_regression_passes: 3,
       fix_attempts: 2,
       max_parallel_agents: 4,
     });

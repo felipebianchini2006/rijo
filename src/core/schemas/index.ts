@@ -569,7 +569,7 @@ export type PlanFreshness = z.infer<typeof PlanFreshnessSchema>;
 /** Planner-authored shape. Freshness is stamped by the deterministic core. */
 export const PhasePlanDraftSchema = z.object({
   phase: z.string(),
-  tasks: z.array(PlanTaskSchema).min(3).max(6),
+  tasks: z.array(PlanTaskSchema).min(1).max(6),
 });
 export type PhasePlanDraft = z.infer<typeof PhasePlanDraftSchema>;
 

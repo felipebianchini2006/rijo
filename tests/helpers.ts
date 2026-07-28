@@ -366,7 +366,21 @@ export function standardRunner(root: string, opts: StandardRunnerOpts = {}): Fak
             Array.isArray((payload as { tasks?: unknown[] }).tasks) &&
             (payload as { tasks: unknown[] }).tasks.length === 2
           ) {
-            (payload as { tasks: unknown[] }).tasks.push(planPayloadFor(phaseId).tasks[2]!);
+            const tasks = (payload as { tasks: Array<Record<string, unknown>> }).tasks;
+            const integrationTarget = tasks[1]!;
+            tasks.push({
+              ...integrationTarget,
+              id: 'T03',
+              name: 'Complete the bounded integration',
+              requirement_ids: [],
+              technical_justification: 'bounded integration',
+              depends_on: ['T02'],
+              parallel: false,
+              tdd: false,
+              tests: [],
+              evidence_expected: 'The integration remains coherent.',
+              done: false,
+            });
           }
           return ok(t, { payload });
         }
